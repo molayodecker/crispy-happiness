@@ -41,11 +41,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Extract hostname safely
+          # Safely extract hostname
           HOST=$(python3 -c "import os, urllib.parse; print(urllib.parse.urlparse(os.environ.get('SUPABASE_DB_URL', '')).hostname or '')")
           echo "Host: $HOST"
-          
-          # Resolve IPv4 to bypass GitHub Runner IPv6 issues
+
+          # Resolve IPv4 to bypass GitHub Runner IPv6 "Network unreachable" errors
           IPV4=$(getent ahostsv4 "$HOST" | awk '/RAW/ {print $1; exit}')
           if [ -z "$IPV4" ]; then
             echo "Error: Could not resolve IPv4 for $HOST" >&2
@@ -53,24 +53,26 @@ jobs:
           fi
           echo "IPv4: $IPV4"
 
-          # Determine connection string separator
+          # Build the connection string with hostaddr override
           [[ "$SUPABASE_DB_URL" == *\?* ]] && SEP="&" || SEP="?"
           echo "SUPABASE_DB_URL_IPV4=${SUPABASE_DB_URL}${SEP}sslmode=require&hostaddr=${IPV4}" >> "$GITHUB_ENV"
 
-      - name: Backup roles and schema
+      - name: Run Dumps and Compress
         run: |
+          # 1. Dump roles and schema (Small files)
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f roles.sql --role-only
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f schema.sql
 
-      - name: Backup data (Compressed)
-        run: |
-          # The pipe to gzip keeps the file size small enough for GitHub
+          # 2. Dump data and compress immediately to bypass GitHub's 100MB limit
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" --data-only --use-copy | gzip > data.sql.gz
+
+          # 3. Explicitly remove any uncompressed data.sql to prevent accidental commits
+          rm -f data.sql
 
       - name: Commit and Push
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore: automated supabase backup [skip ci]"
-          file_pattern: '*.sql *.sql.gz'
+          file_pattern: "roles.sql schema.sql data.sql.gz"
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
