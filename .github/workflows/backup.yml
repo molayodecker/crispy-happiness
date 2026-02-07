@@ -8,31 +8,65 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * *" # Runs every day at midnight
+
 jobs:
   run_db_backup:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      supabase_db_url: ${{ secrets.SUPABASE_DB_URL }} # For example: postgresql://postgres:[YOUR-PASSWORD]@db.<ref>.supabase.co:5432/postgres
-      backup_enabled: ${{ secrets.BACKUP_ENABLED }} # Set to "true" to enable backups
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      BACKUP_ENABLED: ${{ secrets.BACKUP_ENABLED }}
+
     steps:
       - name: Check if backups are enabled
-        if: ${{ env.backup_enabled != 'true' }}
+        if: ${{ env.BACKUP_ENABLED != 'true' }}
         run: echo "Backups are not enabled. Skipping backup." && exit 0
-        id: checkout
+
       - uses: actions/checkout@v3
         with:
           ref: ${{ github.head_ref }}
+
       - uses: supabase/setup-cli@v1
         with:
           version: latest
+
+      - name: Force IPv4 for Supabase host (avoid IPv6 "Network is unreachable")
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Extract hostname from the DB URL: db.<ref>.supabase.co
+          HOST="$(python3 - <<'PY'
+            import os, urllib.parse
+            u = urllib.parse.urlparse(os.environ["SUPABASE_DB_URL"])
+            print(u.hostname)
+            PY
+            )"
+                    echo "Host: $HOST"
+
+          # Resolve IPv4 address (A record)
+          IPV4="$(getent ahostsv4 "$HOST" | awk 'NR==1{print $1}')"
+          if [ -z "${IPV4:-}" ]; then
+            echo "Could not resolve IPv4 for $HOST" >&2
+            exit 1
+          fi
+          echo "IPv4: $IPV4"
+
+          # Append hostaddr so libpq uses IPv4 even if AAAA exists
+          # Also enforce TLS
+          SEP='?'
+          if [[ "$SUPABASE_DB_URL" == *\?* ]]; then SEP='&'; fi
+          echo "SUPABASE_DB_URL_IPV4=${SUPABASE_DB_URL}${SEP}sslmode=require&hostaddr=${IPV4}" >> "$GITHUB_ENV"
+
       - name: Backup roles
-        run: supabase db dump --db-url "$supabase_db_url" -f roles.sql --role-only
+        run: supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f roles.sql --role-only
+
       - name: Backup schema
-        run: supabase db dump --db-url "$supabase_db_url" -f schema.sql
+        run: supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f schema.sql
+
       - name: Backup data
-        run: supabase db dump --db-url "$supabase_db_url" -f data.sql --data-only --use-copy
+        run: supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f data.sql --data-only --use-copy
 
       - uses: stefanzweifel/git-auto-commit-action@v4
         with:
