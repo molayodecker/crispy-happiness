@@ -8,32 +8,71 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * *" # Runs every day at midnight
+
 jobs:
   run_db_backup:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      supabase_db_url: ${{ secrets.SUPABASE_DB_URL }} # For example: postgresql://postgres:[YOUR-PASSWORD]@db.<ref>.supabase.co:5432/postgres
-      backup_enabled: ${{ secrets.BACKUP_ENABLED }} # Set to "true" to enable backups
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      BACKUP_ENABLED: ${{ secrets.BACKUP_ENABLED }}
+
     steps:
       - name: Check if backups are enabled
-        if: ${{ env.backup_enabled != 'true' }}
-        run: echo "Backups are not enabled. Skipping backup." && exit 0
-        id: checkout
-      - uses: actions/checkout@v3
+        shell: bash
+        run: |
+          if [ "$BACKUP_ENABLED" != "true" ]; then
+            echo "Backups are not enabled. Skipping."
+            exit 0
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}
-      - uses: supabase/setup-cli@v1
+          fetch-depth: 0
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
         with:
           version: latest
-      - name: Backup roles
-        run: supabase db dump --db-url "$supabase_db_url" -f roles.sql --role-only
-      - name: Backup schema
-        run: supabase db dump --db-url "$supabase_db_url" -f schema.sql
-      - name: Backup data
-        run: supabase db dump --db-url "$supabase_db_url" -f data.sql --data-only --use-copy
 
-      - uses: stefanzweifel/git-auto-commit-action@v4
+      - name: Force IPv4 for Supabase host
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Safely extract hostname
+          HOST=$(python3 -c "import os, urllib.parse; print(urllib.parse.urlparse(os.environ.get('SUPABASE_DB_URL', '')).hostname or '')")
+          echo "Host: $HOST"
+
+          # Resolve IPv4 to bypass GitHub Runner IPv6 "Network unreachable" errors
+          IPV4=$(getent ahostsv4 "$HOST" | awk '/RAW/ {print $1; exit}')
+          if [ -z "$IPV4" ]; then
+            echo "Error: Could not resolve IPv4 for $HOST" >&2
+            exit 1
+          fi
+          echo "IPv4: $IPV4"
+
+          # Build the connection string with hostaddr override
+          [[ "$SUPABASE_DB_URL" == *\?* ]] && SEP="&" || SEP="?"
+          echo "SUPABASE_DB_URL_IPV4=${SUPABASE_DB_URL}${SEP}sslmode=require&hostaddr=${IPV4}" >> "$GITHUB_ENV"
+
+      - name: Run Dumps and Compress
+        run: |
+          # 1. Dump roles and schema (Small files)
+          supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f roles.sql --role-only
+          supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f schema.sql
+
+          # 2. Dump data and compress immediately to bypass GitHub's 100MB limit
+          supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" --data-only --use-copy | gzip > data.sql.gz
+
+          # 3. Explicitly remove any uncompressed data.sql to prevent accidental commits
+          rm -f data.sql
+
+      - name: Commit and Push
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: Supabase backup
+          commit_message: "chore: automated supabase backup [skip ci]"
+          file_pattern: "roles.sql schema.sql data.sql.gz"
+          commit_user_name: github-actions[bot]
+          commit_user_email: github-actions[bot]@users.noreply.github.com
