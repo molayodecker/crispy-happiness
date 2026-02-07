@@ -8,83 +8,32 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * *" # Runs every day at midnight
-
 jobs:
   run_db_backup:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-      BACKUP_ENABLED: ${{ secrets.BACKUP_ENABLED }}
-
+      supabase_db_url: ${{ secrets.SUPABASE_DB_URL }} # For example: postgresql://postgres:[YOUR-PASSWORD]@db.<ref>.supabase.co:5432/postgres
+      backup_enabled: ${{ secrets.BACKUP_ENABLED }} # Set to "true" to enable backups
     steps:
       - name: Check if backups are enabled
-        shell: bash
-        run: |
-          if [ "$BACKUP_ENABLED" != "true" ]; then
-            echo "Backups are not enabled. Skipping backup."
-            exit 0
-          fi
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
+        if: ${{ env.backup_enabled != 'true' }}
+        run: echo "Backups are not enabled. Skipping backup." && exit 0
+        id: checkout
+      - uses: actions/checkout@v3
         with:
-          # Automatically uses correct ref for push, PR, or schedule
-          fetch-depth: 0
-
-      - name: Setup Supabase CLI
-        uses: supabase/setup-cli@v1
+          ref: ${{ github.head_ref }}
+      - uses: supabase/setup-cli@v1
         with:
           version: latest
-
-      - name: Force IPv4 for Supabase host
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Safely extract hostname from the environment variable using Python
-          HOST=$(python3 -c "import os, urllib.parse; print(urllib.parse.urlparse(os.environ.get('SUPABASE_DB_URL', '')).hostname or '')")
-
-          if [ -z "$HOST" ]; then
-            echo "Error: Could not parse hostname from SUPABASE_DB_URL. Ensure the secret is set." >&2
-            exit 1
-          fi
-          echo "Host: $HOST"
-
-          # Resolve IPv4 address using getent
-          # We filter for the RAW address record to get a clean IP string
-          IPV4=$(getent ahostsv4 "$HOST" | awk '/RAW/ {print $1; exit}')
-
-          if [ -z "$IPV4" ]; then
-            echo "Error: Could not resolve IPv4 for $HOST" >&2
-            exit 1
-          fi
-          echo "IPv4: $IPV4"
-
-          # Determine if we need to append with ? or &
-          [[ "$SUPABASE_DB_URL" == *\?* ]] && SEP="&" || SEP="?"
-
-          # Inject hostaddr and enforce SSL to bypass IPv6 and connection issues
-          echo "SUPABASE_DB_URL_IPV4=${SUPABASE_DB_URL}${SEP}sslmode=require&hostaddr=${IPV4}" >> "$GITHUB_ENV"
-
-      - name: Create backup directory
-        run: mkdir -p backups
-
       - name: Backup roles
-        run: supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f backups/roles.sql --role-only
-
+        run: supabase db dump --db-url "$supabase_db_url" -f roles.sql --role-only
       - name: Backup schema
-        run: supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f backups/schema.sql
-
+        run: supabase db dump --db-url "$supabase_db_url" -f schema.sql
       - name: Backup data
-        run: supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f backups/data.sql --data-only --use-copy
+        run: supabase db dump --db-url "$supabase_db_url" -f data.sql --data-only --use-copy
 
-      - name: Commit and Push
-        uses: stefanzweifel/git-auto-commit-action@v5
+      - uses: stefanzweifel/git-auto-commit-action@v4
         with:
-          commit_message: "chore: automated supabase backup [skip ci]"
-          file_pattern: "backups/*.sql"
-          # This ensures the action works on both PRs and Main branch pushes
-          commit_user_name: github-actions[bot]
-          commit_user_email: github-actions[bot]@users.noreply.github.com
+          commit_message: Supabase backup
