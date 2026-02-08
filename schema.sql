@@ -2505,6 +2505,7 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_applications" (
     "kyc_last_event_at" timestamp with time zone,
     "kyc_completed_at" timestamp with time zone,
     "kyc_provider_event" "text",
+    "admin_feedback" "text",
     CONSTRAINT "cleaner_applications_kyc_status_check" CHECK (("kyc_status" = ANY (ARRAY['not_started'::"text", 'pending'::"text", 'completed'::"text", 'rejected'::"text", 'on_hold'::"text"]))),
     CONSTRAINT "cleaner_applications_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'approved'::"text", 'rejected'::"text"])))
 );
@@ -4114,7 +4115,7 @@ ALTER TABLE ONLY "public"."bookings"
 
 
 ALTER TABLE ONLY "public"."bookings"
-    ADD CONSTRAINT "bookings_customer_id_fkey" FOREIGN KEY ("customer_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "bookings_customer_id_fkey" FOREIGN KEY ("customer_id") REFERENCES "public"."profiles"("id") ON DELETE CASCADE;
 
 
 
@@ -4244,7 +4245,7 @@ ALTER TABLE ONLY "public"."preferred_cleaners"
 
 
 ALTER TABLE ONLY "public"."profiles"
-    ADD CONSTRAINT "profiles_id_fkey" FOREIGN KEY ("id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "profiles_id_fkey" FOREIGN KEY ("id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
