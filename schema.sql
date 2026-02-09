@@ -1573,6 +1573,78 @@ $$;
 ALTER FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleaner" boolean) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."get_user_profile_stats"("p_user_id" "uuid", "p_is_cleaner" boolean DEFAULT false) RETURNS json
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_result json;
+  v_cleaner_rating numeric;
+BEGIN
+  IF p_is_cleaner THEN
+    SELECT rating INTO v_cleaner_rating
+    FROM cleaner_data WHERE user_id = p_user_id;
+
+    SELECT json_build_object(
+      'earnedToday', COALESCE((
+        SELECT SUM(total_price)::numeric / 100
+        FROM bookings
+        WHERE cleaner_id = p_user_id
+          AND status = 'completed'
+          AND (created_at AT TIME ZONE 'UTC')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::date
+      ), 0),
+      'totalTrips', COALESCE((
+        SELECT COUNT(*)::integer FROM bookings WHERE cleaner_id = p_user_id
+      ), 0),
+      'completedJobs', COALESCE((
+        SELECT COUNT(*)::integer FROM bookings
+        WHERE cleaner_id = p_user_id AND status = 'completed'
+      ), 0),
+      'averageRating', COALESCE((
+        SELECT ROUND(AVG(rating)::numeric, 1)
+        FROM reviews WHERE reviewee_id = p_user_id
+      ), COALESCE(v_cleaner_rating, 0)),
+      'reviewCount', COALESCE((
+        SELECT COUNT(*)::integer FROM reviews WHERE reviewee_id = p_user_id
+      ), 0)
+    ) INTO v_result;
+  ELSE
+    SELECT json_build_object(
+      'totalBookings', COALESCE((
+        SELECT COUNT(*)::integer FROM bookings WHERE customer_id = p_user_id
+      ), 0),
+      'activeBookings', COALESCE((
+        SELECT COUNT(*)::integer FROM bookings
+        WHERE customer_id = p_user_id
+          AND status IN ('pending', 'scheduled', 'in_progress')
+      ), 0),
+      'completedBookings', COALESCE((
+        SELECT COUNT(*)::integer FROM bookings
+        WHERE customer_id = p_user_id AND status = 'completed'
+      ), 0),
+      'totalSpent', COALESCE((
+        SELECT SUM(total_price)::numeric / 100
+        FROM bookings
+        WHERE customer_id = p_user_id AND status = 'completed'
+      ), 0),
+      'averageRating', COALESCE((
+        SELECT ROUND(AVG(rating)::numeric, 1)
+        FROM reviews WHERE reviewer_id = p_user_id
+      ), 0),
+      'reviewCount', COALESCE((
+        SELECT COUNT(*)::integer FROM reviews WHERE reviewer_id = p_user_id
+      ), 0)
+    ) INTO v_result;
+  END IF;
+
+  RETURN v_result;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_user_profile_stats"("p_user_id" "uuid", "p_is_cleaner" boolean) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."get_user_role"("p_user_id" "uuid") RETURNS json
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
@@ -7739,6 +7811,12 @@ GRANT ALL ON FUNCTION "public"."get_timezone_from_coordinates"("latitude" numeri
 GRANT ALL ON FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleaner" boolean) TO "anon";
 GRANT ALL ON FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleaner" boolean) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleaner" boolean) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_user_profile_stats"("p_user_id" "uuid", "p_is_cleaner" boolean) TO "anon";
+GRANT ALL ON FUNCTION "public"."get_user_profile_stats"("p_user_id" "uuid", "p_is_cleaner" boolean) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_user_profile_stats"("p_user_id" "uuid", "p_is_cleaner" boolean) TO "service_role";
 
 
 
