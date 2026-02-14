@@ -1711,7 +1711,12 @@ CREATE OR REPLACE FUNCTION "public"."handle_new_google_user"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
-  -- 1. Insert into public.profiles
+  -- 1. Insert into public.users first (profiles.id references users.id)
+  INSERT INTO public.users (id, email, password_hash)
+  VALUES (NEW.id, NEW.email, '')
+  ON CONFLICT (id) DO NOTHING;
+
+  -- 2. Insert into public.profiles
   INSERT INTO public.profiles (id, firstname, lastname, fullname, avatar_url)
   VALUES (
     NEW.id,
@@ -1723,11 +1728,6 @@ BEGIN
   ON CONFLICT (id) DO UPDATE SET
     avatar_url = EXCLUDED.avatar_url,
     fullname = EXCLUDED.fullname;
-
-  -- 2. Insert into public.users
-  INSERT INTO public.users (id, email, password_hash)
-  VALUES (NEW.id, NEW.email, '')
-  ON CONFLICT (id) DO NOTHING;
 
   RETURN NEW;
 END;
@@ -2620,7 +2620,8 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_data" (
     "updated_at" timestamp with time zone DEFAULT "now"(),
     "base_location" "public"."geometry"(Point,4326),
     "max_travel_distance_meters" double precision DEFAULT 30000,
-    "paystack_customer_id" "text"
+    "paystack_customer_id" "text",
+    "bio" "text"
 );
 
 
@@ -2718,7 +2719,8 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "location_wkt" "public"."geography"(Point,4326) DEFAULT "public"."st_geomfromtext"('POINT(-0.186964 5.650562)'::"text", 4326),
     "preferences" "jsonb" DEFAULT '{}'::"jsonb",
     "notification_settings" "jsonb" DEFAULT '{"app": true, "sms": true, "email": true}'::"jsonb",
-    "updated_at" timestamp with time zone DEFAULT "now"()
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "user_id" "uuid" NOT NULL
 );
 
 
@@ -3891,6 +3893,10 @@ CREATE INDEX "idx_bookings_time_decimal" ON "public"."bookings" USING "btree" ("
 
 
 
+CREATE INDEX "idx_cleaner_applications_user_id" ON "public"."cleaner_applications" USING "btree" ("user_id");
+
+
+
 CREATE INDEX "idx_cleaner_availability_exceptions_cleaner_date" ON "public"."cleaner_availability_exceptions" USING "btree" ("cleaner_id", "exception_date");
 
 
@@ -3959,6 +3965,14 @@ CREATE INDEX "idx_discounts_active_service" ON "public"."discounts" USING "btree
 
 
 
+CREATE INDEX "idx_feedback_cleaner_id" ON "public"."feedback" USING "btree" ("cleaner_id");
+
+
+
+CREATE INDEX "idx_feedback_customer_id" ON "public"."feedback" USING "btree" ("customer_id");
+
+
+
 CREATE INDEX "idx_invite_codes_user_role" ON "public"."invite_codes" USING "btree" ("user_role");
 
 
@@ -3980,6 +3994,10 @@ CREATE INDEX "idx_messages_unread" ON "public"."messages" USING "btree" ("conver
 
 
 CREATE INDEX "idx_notifications_read_status" ON "public"."notifications" USING "btree" ("read") WHERE ("read" = false);
+
+
+
+CREATE INDEX "idx_notifications_user_id" ON "public"."notifications" USING "btree" ("user_id");
 
 
 
@@ -4007,6 +4025,10 @@ CREATE UNIQUE INDEX "idx_platform_fees_unique_default" ON "public"."platform_fee
 
 
 
+CREATE INDEX "idx_preferred_cleaners_user_id" ON "public"."preferred_cleaners" USING "btree" ("user_id");
+
+
+
 CREATE INDEX "idx_profiles_id" ON "public"."profiles" USING "btree" ("id");
 
 
@@ -4020,6 +4042,10 @@ CREATE INDEX "idx_psk_booking" ON "public"."psk_transaction" USING "btree" ("boo
 
 
 CREATE INDEX "idx_psk_ref" ON "public"."psk_transaction" USING "btree" ("reference");
+
+
+
+CREATE INDEX "idx_reviews_booking_id" ON "public"."reviews" USING "btree" ("booking_id");
 
 
 
@@ -4079,6 +4105,10 @@ CREATE INDEX "idx_wallet_transactions_wallet_id" ON "public"."wallet_transaction
 
 
 
+CREATE INDEX "idx_wallets_user_id" ON "public"."wallets" USING "btree" ("user_id");
+
+
+
 CREATE INDEX "idx_withdrawal_pending" ON "public"."withdrawal_requests" USING "btree" ("status") WHERE ("status" = 'pending'::"public"."withdrawal_status");
 
 
@@ -4116,6 +4146,10 @@ CREATE INDEX "kyc_profiles_sumsub_applicant_id_idx" ON "public"."kyc_profiles" U
 
 
 CREATE INDEX "kyc_profiles_user_id_idx" ON "public"."kyc_profiles" USING "btree" ("user_id");
+
+
+
+CREATE UNIQUE INDEX "profiles_user_id_key" ON "public"."profiles" USING "btree" ("user_id");
 
 
 
@@ -4317,7 +4351,12 @@ ALTER TABLE ONLY "public"."preferred_cleaners"
 
 
 ALTER TABLE ONLY "public"."profiles"
-    ADD CONSTRAINT "profiles_id_fkey" FOREIGN KEY ("id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "profiles_id_fkey" FOREIGN KEY ("id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."profiles"
+    ADD CONSTRAINT "profiles_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -4548,7 +4587,160 @@ CREATE POLICY "View_Own_Conversations" ON "public"."conversations" FOR SELECT US
 
 
 
+CREATE POLICY "admins_all_booking_settings" ON "public"."booking_settings" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_booking_timeline" ON "public"."booking_timeline" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_cleaner_applications" ON "public"."cleaner_applications" TO "authenticated" USING ("public"."has_role"('admin'::"text")) WITH CHECK ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_cleaner_data" ON "public"."cleaner_data" TO "authenticated" USING ("public"."has_role"('admin'::"text")) WITH CHECK ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_cleaner_verifications" ON "public"."cleaner_verifications" TO "authenticated" USING ("public"."has_role"('admin'::"text")) WITH CHECK ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_deduction_rules" ON "public"."deduction_rules" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_discounts" ON "public"."discounts" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_feedback" ON "public"."feedback" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_feedback_categories" ON "public"."feedback_categories" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_home_size_durations" ON "public"."home_size_durations" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_invite_codes" ON "public"."invite_codes" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_notifications" ON "public"."notifications" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_payout_methods" ON "public"."payout_methods" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_reviews" ON "public"."reviews" TO "authenticated" USING ("public"."has_role"('admin'::"text")) WITH CHECK ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_roles" ON "public"."roles" TO "authenticated" USING ("public"."has_role"('admin'::"text")) WITH CHECK ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_service_categories" ON "public"."service_categories" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_service_types" ON "public"."service_types" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_transactions" ON "public"."transactions" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_wallet_deductions" ON "public"."wallet_deductions" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_wallet_transactions" ON "public"."wallet_transactions" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_wallets" ON "public"."wallets" TO "authenticated" USING ("public"."has_role"('admin'::"text")) WITH CHECK ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_all_withdrawal_requests" ON "public"."withdrawal_requests" TO "authenticated" USING ("public"."has_role"('admin'::"text")) WITH CHECK ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_manage_user_roles" ON "public"."user_roles" TO "authenticated" USING ("public"."has_role"('admin'::"text")) WITH CHECK ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_select_profiles" ON "public"."profiles" FOR SELECT TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_select_users" ON "public"."users" FOR SELECT TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "admins_update_profiles" ON "public"."profiles" FOR UPDATE TO "authenticated" USING ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "allow_insert_own_user" ON "public"."profiles" FOR INSERT TO "authenticated" WITH CHECK (("id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "allow_insert_own_user" ON "public"."users" FOR INSERT TO "authenticated" WITH CHECK (("id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "anyone_read_booking_settings" ON "public"."booking_settings" FOR SELECT USING (true);
+
+
+
+CREATE POLICY "anyone_read_discounts" ON "public"."discounts" FOR SELECT USING (true);
+
+
+
+CREATE POLICY "anyone_read_feedback_categories" ON "public"."feedback_categories" FOR SELECT USING (true);
+
+
+
+CREATE POLICY "anyone_read_home_size_durations" ON "public"."home_size_durations" FOR SELECT USING (true);
+
+
+
+CREATE POLICY "anyone_read_roles" ON "public"."roles" FOR SELECT TO "authenticated" USING (true);
+
+
+
+CREATE POLICY "anyone_read_service_categories" ON "public"."service_categories" FOR SELECT USING (true);
+
+
+
+CREATE POLICY "anyone_read_service_types" ON "public"."service_types" FOR SELECT USING (true);
+
+
+
+CREATE POLICY "authenticated_read_invite_codes" ON "public"."invite_codes" FOR SELECT TO "authenticated" USING (true);
+
+
+
+ALTER TABLE "public"."availability" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."base_durations" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."booking_settings" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."booking_timeline" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."bookings" ENABLE ROW LEVEL SECURITY;
@@ -4562,10 +4754,16 @@ CREATE POLICY "bookings: update own" ON "public"."bookings" FOR UPDATE TO "authe
 
 
 
+ALTER TABLE "public"."cleaner_applications" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."cleaner_availability_exceptions" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."cleaner_data" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."cleaner_schedules" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."cleaner_tracking" ENABLE ROW LEVEL SECURITY;
@@ -4583,10 +4781,59 @@ CREATE POLICY "cleaner_tracking_select_policy" ON "public"."cleaner_tracking" FO
 
 
 
+ALTER TABLE "public"."cleaner_verifications" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "cleaners_all_own_schedules" ON "public"."cleaner_schedules" TO "authenticated" USING ((("cleaner_id" = "auth"."uid"()) OR "public"."has_role"('admin'::"text"))) WITH CHECK ((("cleaner_id" = "auth"."uid"()) OR "public"."has_role"('admin'::"text")));
+
+
+
+CREATE POLICY "cleaners_manage_own_availability" ON "public"."availability" TO "authenticated" USING ((("cleaner_id" = "auth"."uid"()) OR "public"."has_role"('admin'::"text"))) WITH CHECK ((("cleaner_id" = "auth"."uid"()) OR "public"."has_role"('admin'::"text")));
+
+
+
+CREATE POLICY "cleaners_select_own_verification" ON "public"."cleaner_verifications" FOR SELECT TO "authenticated" USING (("id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "cleaners_select_own_withdrawals" ON "public"."withdrawal_requests" FOR SELECT TO "authenticated" USING ((("cleaner_id" = "auth"."uid"()) OR "public"."has_role"('admin'::"text")));
+
+
+
+CREATE POLICY "cleaners_update_own_cleaner_data" ON "public"."cleaner_data" FOR UPDATE TO "authenticated" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
+
+
+
 ALTER TABLE "public"."conversations" ENABLE ROW LEVEL SECURITY;
 
 
+CREATE POLICY "customers_manage_own_preferred" ON "public"."preferred_cleaners" TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_role"('admin'::"text"))) WITH CHECK ((("user_id" = "auth"."uid"()) OR "public"."has_role"('admin'::"text")));
+
+
+
+ALTER TABLE "public"."deduction_rules" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."discounts" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."extra_tasks" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."feedback" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."feedback_categories" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "feedback_select_own" ON "public"."feedback" FOR SELECT TO "authenticated" USING ((("customer_id" = "auth"."uid"()) OR ("cleaner_id" = "auth"."uid"()) OR "public"."has_role"('admin'::"text")));
+
+
+
+ALTER TABLE "public"."home_size_durations" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."invite_codes" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."job_photo_comparisons" ENABLE ROW LEVEL SECURITY;
@@ -4624,13 +4871,49 @@ ALTER TABLE "public"."kyc_profiles" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."messages" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."notifications" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."payout_methods" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."platform_fees" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."preferred_cleaners" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."profiles" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."reviews" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "reviews_insert_own_booking" ON "public"."reviews" FOR INSERT TO "authenticated" WITH CHECK (((EXISTS ( SELECT 1
+   FROM "public"."bookings" "b"
+  WHERE (("b"."id" = "reviews"."booking_id") AND ("b"."customer_id" = "auth"."uid"())))) OR "public"."has_role"('admin'::"text")));
+
+
+
+CREATE POLICY "reviews_select_via_booking" ON "public"."reviews" FOR SELECT TO "authenticated" USING (((EXISTS ( SELECT 1
+   FROM "public"."bookings" "b"
+  WHERE (("b"."id" = "reviews"."booking_id") AND (("b"."customer_id" = "auth"."uid"()) OR ("b"."cleaner_id" = "auth"."uid"()))))) OR "public"."has_role"('admin'::"text")));
+
+
+
+ALTER TABLE "public"."roles" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."service_categories" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."service_types" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."testimonials" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."transactions" ENABLE ROW LEVEL SECURITY;
 
 
 CREATE POLICY "update_own_profile" ON "public"."profiles" FOR UPDATE TO "authenticated" USING (("auth"."uid"() = "id")) WITH CHECK (("auth"."uid"() = "id"));
@@ -4641,6 +4924,22 @@ ALTER TABLE "public"."user_roles" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."users" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "users_insert_own_cleaner_application" ON "public"."cleaner_applications" FOR INSERT TO "authenticated" WITH CHECK (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "users_select_own_cleaner_application" ON "public"."cleaner_applications" FOR SELECT TO "authenticated" USING (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "users_select_own_notifications" ON "public"."notifications" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_role"('admin'::"text")));
+
+
+
+CREATE POLICY "users_select_own_wallet" ON "public"."wallets" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_role"('admin'::"text")));
+
 
 
 CREATE POLICY "users_viewable_via_bookings" ON "public"."users" FOR SELECT TO "authenticated" USING (((( SELECT "auth"."uid"() AS "uid") = "id") OR (EXISTS ( SELECT 1
@@ -4663,6 +4962,18 @@ CREATE POLICY "view_own_bookings" ON "public"."bookings" FOR SELECT TO "authenti
 
 CREATE POLICY "view_profiles" ON "public"."profiles" FOR SELECT TO "authenticated" USING (true);
 
+
+
+ALTER TABLE "public"."wallet_deductions" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."wallet_transactions" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."wallets" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."withdrawal_requests" ENABLE ROW LEVEL SECURITY;
 
 
 
