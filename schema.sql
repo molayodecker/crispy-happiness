@@ -1716,9 +1716,10 @@ BEGIN
   VALUES (NEW.id, NEW.email, '')
   ON CONFLICT (id) DO NOTHING;
 
-  -- 2. Insert into public.profiles
-  INSERT INTO public.profiles (id, firstname, lastname, fullname, avatar_url)
+  -- 2. Insert into public.profiles (include user_id for NOT NULL constraint)
+  INSERT INTO public.profiles (id, user_id, firstname, lastname, fullname, avatar_url)
   VALUES (
+    NEW.id,
     NEW.id,
     NEW.raw_user_meta_data->>'first_name',
     NEW.raw_user_meta_data->>'last_name',
@@ -1739,14 +1740,16 @@ ALTER FUNCTION "public"."handle_new_google_user"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."handle_new_user_multi_role"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    AS $$BEGIN
+    AS $$
+BEGIN
     -- 1. Create entry in public users table
     INSERT INTO public.users (id, email, phone) 
     VALUES (NEW.id, NEW.email, NEW.phone);
 
     -- 2. Create entry in unified profiles table
-    INSERT INTO public.profiles (id, firstname, lastname) 
+    INSERT INTO public.profiles (id, user_id, firstname, lastname) 
     VALUES (
+        NEW.id, 
         NEW.id, 
         NEW.raw_user_meta_data->>'first_name', 
         NEW.raw_user_meta_data->>'last_name'
@@ -1762,7 +1765,8 @@ CREATE OR REPLACE FUNCTION "public"."handle_new_user_multi_role"() RETURNS "trig
     END IF;
 
     RETURN NEW;
-END;$$;
+END;
+$$;
 
 
 ALTER FUNCTION "public"."handle_new_user_multi_role"() OWNER TO "postgres";
@@ -4696,6 +4700,38 @@ CREATE POLICY "allow_insert_own_user" ON "public"."profiles" FOR INSERT TO "auth
 
 
 CREATE POLICY "allow_insert_own_user" ON "public"."users" FOR INSERT TO "authenticated" WITH CHECK (("id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "allow_insert_profiles" ON "public"."profiles" FOR INSERT TO "authenticated", "anon" WITH CHECK (true);
+
+
+
+CREATE POLICY "allow_insert_users" ON "public"."users" FOR INSERT TO "authenticated", "anon" WITH CHECK (true);
+
+
+
+CREATE POLICY "anon_read_booking_settings" ON "public"."booking_settings" FOR SELECT TO "anon" USING (true);
+
+
+
+CREATE POLICY "anon_read_discounts" ON "public"."discounts" FOR SELECT TO "anon" USING (true);
+
+
+
+CREATE POLICY "anon_read_feedback_categories" ON "public"."feedback_categories" FOR SELECT TO "anon" USING (true);
+
+
+
+CREATE POLICY "anon_read_home_size_durations" ON "public"."home_size_durations" FOR SELECT TO "anon" USING (true);
+
+
+
+CREATE POLICY "anon_read_service_categories" ON "public"."service_categories" FOR SELECT TO "anon" USING (true);
+
+
+
+CREATE POLICY "anon_read_service_types" ON "public"."service_types" FOR SELECT TO "anon" USING (true);
 
 
 
