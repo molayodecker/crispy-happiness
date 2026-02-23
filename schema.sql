@@ -104,6 +104,31 @@ CREATE TYPE "public"."cleaner_status" AS ENUM (
 ALTER TYPE "public"."cleaner_status" OWNER TO "postgres";
 
 
+CREATE TYPE "public"."job_offer_status" AS ENUM (
+    'sent',
+    'accepted',
+    'declined',
+    'expired'
+);
+
+
+ALTER TYPE "public"."job_offer_status" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."job_status" AS ENUM (
+    'pending',
+    'offered',
+    'claimed',
+    'canceled',
+    'expired',
+    'in_progress',
+    'completed'
+);
+
+
+ALTER TYPE "public"."job_status" OWNER TO "postgres";
+
+
 CREATE TYPE "public"."notification_type" AS ENUM (
     'booking_confirmation',
     'booking_reminder',
@@ -381,6 +406,64 @@ $$;
 
 
 ALTER FUNCTION "public"."can_view_user_via_bookings"("target_user" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_job jobs%ROWTYPE;
+  v_offer_exists boolean;
+BEGIN
+  IF auth.uid() IS DISTINCT FROM p_cleaner_id THEN
+    RETURN jsonb_build_object('success', false, 'error', 'unauthorized');
+  END IF;
+
+  SELECT * INTO v_job FROM jobs WHERE id = p_job_id FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'job_not_found');
+  END IF;
+
+  IF v_job.status NOT IN ('pending', 'offered') OR v_job.claimed_by IS NOT NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'job_not_available');
+  END IF;
+
+  IF v_job.offer_expires_at IS NOT NULL AND v_job.offer_expires_at < now() THEN
+    RETURN jsonb_build_object('success', false, 'error', 'offer_expired');
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1 FROM job_offers
+    WHERE job_id = p_job_id AND cleaner_id = p_cleaner_id AND status = 'sent'
+  ) INTO v_offer_exists;
+
+  IF NOT v_offer_exists THEN
+    RETURN jsonb_build_object('success', false, 'error', 'no_offer');
+  END IF;
+
+  UPDATE jobs
+  SET status = 'claimed', claimed_by = p_cleaner_id, claimed_at = now()
+  WHERE id = p_job_id;
+
+  UPDATE job_offers
+  SET status = 'accepted', responded_at = now()
+  WHERE job_id = p_job_id AND cleaner_id = p_cleaner_id;
+
+  UPDATE job_offers
+  SET status = 'expired'
+  WHERE job_id = p_job_id AND cleaner_id <> p_cleaner_id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'job', to_jsonb((SELECT j FROM jobs j WHERE j.id = p_job_id))
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."ensure_single_default_platform_fee"() RETURNS "trigger"
@@ -1395,47 +1478,59 @@ $$;
 ALTER FUNCTION "public"."get_my_wallet_balance"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" double precision DEFAULT 50000, "p_scheduled_date" "date" DEFAULT CURRENT_DATE, "p_start_time" time without time zone DEFAULT CURRENT_TIME, "p_duration_hours" double precision DEFAULT 2) RETURNS TABLE("id" "uuid", "fullname" "text", "avatar_url" "text", "distance_meters" double precision, "rating" double precision)
-    LANGUAGE "plpgsql"
+CREATE OR REPLACE FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" integer, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" integer) RETURNS TABLE("id" "uuid", "fullname" "text", "avatar_url" "text", "distance_meters" double precision, "rating" double precision)
+    LANGUAGE "sql" STABLE
     AS $$
-DECLARE
-  v_booking_range tstzrange;
-BEGIN
-  -- 1. Construct the requested booking period
-  v_booking_range := tstzrange(
+with
+origin as (
+  select st_setsrid(st_makepoint(p_longitude, p_latitude), 4326)::geography as g
+),
+booking as (
+  select tstzrange(
     (p_scheduled_date + p_start_time)::timestamptz,
     (p_scheduled_date + p_start_time + (p_duration_hours || ' hours')::interval)::timestamptz,
     '[)'
-  );
-
-  RETURN QUERY
-  SELECT 
-    p.id,
-    p.fullname,
-    p.avatar_url,
-    ST_Distance(
-      p.location, 
-      ST_SetSRID(ST_MakePoint(p_longitude, p_latitude), 4326)::geography
-    ) AS distance_meters,
-    p.rating
-  FROM profiles p
-  WHERE p.role = 'cleaner'
-    AND ST_DWithin(
-      p.location, 
-      ST_SetSRID(ST_MakePoint(p_longitude, p_latitude), 4326)::geography, 
-      p_radius_meters
-    )
-    -- 2. Exclusion logic: Ensure cleaner has no overlapping bookings
-    AND NOT EXISTS (
-      SELECT 1 FROM bookings b
-      WHERE b.cleaner_id = p.id
-      AND b.booking_slot && v_booking_range
-    );
-END;
+  ) as r
+)
+select
+  p.id,
+  p.fullname,
+  p.avatar_url,
+  d.distance_meters,
+  cd.rating::double precision as rating
+from public.profiles p
+join public.cleaner_data cd
+  on cd.user_id = p.id
+cross join origin o
+cross join booking bk
+cross join lateral (
+  select st_distance(p.location_wkt, o.g) as distance_meters
+) d
+where
+  p.location_wkt is not null
+  and exists (
+    select 1
+    from public.user_roles ur
+    where ur.user_id = p.id
+      and ur.role_id = 'cleaner'
+  )
+  and cd.status = 'active'::public.cleaner_status
+  and coalesce(cd.is_online, false) = true
+  and st_dwithin(p.location_wkt, o.g, p_radius_meters)
+  and d.distance_meters <= coalesce(cd.max_travel_distance_meters, 30000)
+  and not exists (
+    select 1
+    from public.bookings b
+    where b.cleaner_id = p.id
+      and b.status <> 'cancelled'::public.booking_status
+      and b.booking_period && bk.r
+  )
+order by d.distance_meters asc
+limit 200;
 $$;
 
 
-ALTER FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" double precision, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" double precision) OWNER TO "postgres";
+ALTER FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" integer, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" integer) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_payout_system_logs"() RETURNS TABLE("id" bigint, "status_code" integer, "content" "text", "url" "text", "created_at" timestamp with time zone, "delivery_status" "text")
@@ -2632,6 +2727,19 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_data" (
 ALTER TABLE "public"."cleaner_data" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."cleaner_devices" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "cleaner_id" "uuid" NOT NULL,
+    "expo_push_token" "text" NOT NULL,
+    "platform" "text" NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "cleaner_devices_platform_check" CHECK (("platform" = ANY (ARRAY['ios'::"text", 'android'::"text"])))
+);
+
+
+ALTER TABLE "public"."cleaner_devices" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."cleaner_schedules" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "cleaner_id" "uuid",
@@ -3126,6 +3234,20 @@ COMMENT ON COLUMN "public"."invite_codes"."user_role" IS 'The user role this inv
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."job_offers" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "job_id" "uuid" NOT NULL,
+    "cleaner_id" "uuid" NOT NULL,
+    "status" "text" DEFAULT 'sent'::"text" NOT NULL,
+    "sent_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "responded_at" timestamp with time zone,
+    CONSTRAINT "job_offers_status_check" CHECK (("status" = ANY (ARRAY['sent'::"text", 'accepted'::"text", 'declined'::"text", 'expired'::"text"])))
+);
+
+
+ALTER TABLE "public"."job_offers" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."job_photo_comparisons" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "booking_id" "uuid" NOT NULL,
@@ -3147,6 +3269,25 @@ COMMENT ON TABLE "public"."job_photo_comparisons" IS 'Before/after photo compari
 
 COMMENT ON COLUMN "public"."job_photo_comparisons"."composite_photo_url" IS 'Public URL of the generated before/after composite image for sharing';
 
+
+
+CREATE TABLE IF NOT EXISTS "public"."jobs" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "customer_id" "uuid" NOT NULL,
+    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "address_text" "text",
+    "lat" double precision,
+    "lng" double precision,
+    "price" numeric NOT NULL,
+    "requested_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "claimed_by" "uuid",
+    "claimed_at" timestamp with time zone,
+    "offer_expires_at" timestamp with time zone,
+    CONSTRAINT "jobs_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'offered'::"text", 'claimed'::"text", 'canceled'::"text", 'expired'::"text", 'in_progress'::"text", 'completed'::"text"])))
+);
+
+
+ALTER TABLE "public"."jobs" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."kyc_profiles" (
@@ -3550,6 +3691,16 @@ ALTER TABLE ONLY "public"."cleaner_data"
 
 
 
+ALTER TABLE ONLY "public"."cleaner_devices"
+    ADD CONSTRAINT "cleaner_devices_cleaner_id_expo_push_token_key" UNIQUE ("cleaner_id", "expo_push_token");
+
+
+
+ALTER TABLE ONLY "public"."cleaner_devices"
+    ADD CONSTRAINT "cleaner_devices_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."cleaner_schedules"
     ADD CONSTRAINT "cleaner_schedules_pkey" PRIMARY KEY ("id");
 
@@ -3640,8 +3791,23 @@ ALTER TABLE ONLY "public"."invite_codes"
 
 
 
+ALTER TABLE ONLY "public"."job_offers"
+    ADD CONSTRAINT "job_offers_job_id_cleaner_id_key" UNIQUE ("job_id", "cleaner_id");
+
+
+
+ALTER TABLE ONLY "public"."job_offers"
+    ADD CONSTRAINT "job_offers_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."job_photo_comparisons"
     ADD CONSTRAINT "job_photo_comparisons_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."jobs"
+    ADD CONSTRAINT "jobs_pkey" PRIMARY KEY ("id");
 
 
 
@@ -3933,6 +4099,10 @@ CREATE INDEX "idx_cleaner_data_user_status" ON "public"."cleaner_data" USING "bt
 
 
 
+CREATE INDEX "idx_cleaner_devices_cleaner_id" ON "public"."cleaner_devices" USING "btree" ("cleaner_id");
+
+
+
 CREATE INDEX "idx_cleaner_paystack_id" ON "public"."cleaner_data" USING "btree" ("paystack_customer_id");
 
 
@@ -3981,7 +4151,35 @@ CREATE INDEX "idx_invite_codes_user_role" ON "public"."invite_codes" USING "btre
 
 
 
+CREATE INDEX "idx_job_offers_cleaner_id" ON "public"."job_offers" USING "btree" ("cleaner_id");
+
+
+
+CREATE INDEX "idx_job_offers_cleaner_status" ON "public"."job_offers" USING "btree" ("cleaner_id", "status");
+
+
+
+CREATE INDEX "idx_job_offers_job_id" ON "public"."job_offers" USING "btree" ("job_id");
+
+
+
 CREATE INDEX "idx_job_photo_comparisons_booking_id" ON "public"."job_photo_comparisons" USING "btree" ("booking_id");
+
+
+
+CREATE INDEX "idx_jobs_claimed_by" ON "public"."jobs" USING "btree" ("claimed_by");
+
+
+
+CREATE INDEX "idx_jobs_customer_id" ON "public"."jobs" USING "btree" ("customer_id");
+
+
+
+CREATE INDEX "idx_jobs_requested_at" ON "public"."jobs" USING "btree" ("requested_at" DESC);
+
+
+
+CREATE INDEX "idx_jobs_status" ON "public"."jobs" USING "btree" ("status");
 
 
 
@@ -4249,6 +4447,11 @@ ALTER TABLE ONLY "public"."cleaner_data"
 
 
 
+ALTER TABLE ONLY "public"."cleaner_devices"
+    ADD CONSTRAINT "cleaner_devices_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."cleaner_schedules"
     ADD CONSTRAINT "cleaner_schedules_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
 
@@ -4304,8 +4507,28 @@ ALTER TABLE ONLY "public"."feedback"
 
 
 
+ALTER TABLE ONLY "public"."job_offers"
+    ADD CONSTRAINT "job_offers_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."job_offers"
+    ADD CONSTRAINT "job_offers_job_id_fkey" FOREIGN KEY ("job_id") REFERENCES "public"."jobs"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."job_photo_comparisons"
     ADD CONSTRAINT "job_photo_comparisons_booking_id_fkey" FOREIGN KEY ("booking_id") REFERENCES "public"."bookings"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."jobs"
+    ADD CONSTRAINT "jobs_claimed_by_fkey" FOREIGN KEY ("claimed_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."jobs"
+    ADD CONSTRAINT "jobs_customer_id_fkey" FOREIGN KEY ("customer_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -4799,6 +5022,13 @@ ALTER TABLE "public"."cleaner_availability_exceptions" ENABLE ROW LEVEL SECURITY
 ALTER TABLE "public"."cleaner_data" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."cleaner_devices" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "cleaner_devices_cleaner_all" ON "public"."cleaner_devices" USING (("cleaner_id" = "auth"."uid"())) WITH CHECK (("cleaner_id" = "auth"."uid"()));
+
+
+
 ALTER TABLE "public"."cleaner_schedules" ENABLE ROW LEVEL SECURITY;
 
 
@@ -4872,6 +5102,13 @@ ALTER TABLE "public"."home_size_durations" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."invite_codes" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."job_offers" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "job_offers_cleaner_select" ON "public"."job_offers" FOR SELECT USING (("cleaner_id" = "auth"."uid"()));
+
+
+
 ALTER TABLE "public"."job_photo_comparisons" ENABLE ROW LEVEL SECURITY;
 
 
@@ -4898,6 +5135,27 @@ CREATE POLICY "job_photo_comparisons_update" ON "public"."job_photo_comparisons"
   WHERE (("b"."id" = "job_photo_comparisons"."booking_id") AND ("b"."cleaner_id" = "auth"."uid"()))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."bookings" "b"
   WHERE (("b"."id" = "job_photo_comparisons"."booking_id") AND ("b"."cleaner_id" = "auth"."uid"())))));
+
+
+
+ALTER TABLE "public"."jobs" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "jobs_cleaner_select_claimed" ON "public"."jobs" FOR SELECT USING (("claimed_by" = "auth"."uid"()));
+
+
+
+CREATE POLICY "jobs_cleaner_select_with_offer" ON "public"."jobs" FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "public"."job_offers" "o"
+  WHERE (("o"."job_id" = "jobs"."id") AND ("o"."cleaner_id" = "auth"."uid"())))));
+
+
+
+CREATE POLICY "jobs_customer_insert" ON "public"."jobs" FOR INSERT WITH CHECK (("customer_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "jobs_customer_select" ON "public"."jobs" FOR SELECT USING (("customer_id" = "auth"."uid"()));
 
 
 
@@ -6062,6 +6320,12 @@ GRANT ALL ON FUNCTION "public"."checkauthtrigger"() TO "postgres";
 GRANT ALL ON FUNCTION "public"."checkauthtrigger"() TO "anon";
 GRANT ALL ON FUNCTION "public"."checkauthtrigger"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."checkauthtrigger"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") TO "service_role";
 
 
 
@@ -8124,9 +8388,9 @@ GRANT ALL ON FUNCTION "public"."get_my_wallet_balance"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" double precision, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" double precision) TO "anon";
-GRANT ALL ON FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" double precision, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" double precision) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" double precision, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" double precision) TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" integer, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" integer, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" integer, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" integer) TO "service_role";
 
 
 
@@ -12159,6 +12423,12 @@ GRANT ALL ON TABLE "public"."cleaner_data" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."cleaner_devices" TO "anon";
+GRANT ALL ON TABLE "public"."cleaner_devices" TO "authenticated";
+GRANT ALL ON TABLE "public"."cleaner_devices" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."cleaner_schedules" TO "anon";
 GRANT ALL ON TABLE "public"."cleaner_schedules" TO "authenticated";
 GRANT ALL ON TABLE "public"."cleaner_schedules" TO "service_role";
@@ -12297,9 +12567,21 @@ GRANT ALL ON TABLE "public"."invite_codes" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."job_offers" TO "anon";
+GRANT ALL ON TABLE "public"."job_offers" TO "authenticated";
+GRANT ALL ON TABLE "public"."job_offers" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."job_photo_comparisons" TO "anon";
 GRANT ALL ON TABLE "public"."job_photo_comparisons" TO "authenticated";
 GRANT ALL ON TABLE "public"."job_photo_comparisons" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."jobs" TO "anon";
+GRANT ALL ON TABLE "public"."jobs" TO "authenticated";
+GRANT ALL ON TABLE "public"."jobs" TO "service_role";
 
 
 
