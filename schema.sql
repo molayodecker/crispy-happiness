@@ -4950,6 +4950,10 @@ CREATE POLICY "anon_read_home_size_durations" ON "public"."home_size_durations" 
 
 
 
+CREATE POLICY "anon_read_invite_codes" ON "public"."invite_codes" FOR SELECT TO "anon" USING (true);
+
+
+
 CREATE POLICY "anon_read_service_categories" ON "public"."service_categories" FOR SELECT TO "anon" USING (true);
 
 
