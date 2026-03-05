@@ -2611,7 +2611,7 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "address" "text" NOT NULL,
     "special_instructions" "text",
     "status" "public"."booking_status" DEFAULT 'pending'::"public"."booking_status",
-    "total_price" integer NOT NULL,
+    "total_price" numeric NOT NULL,
     "platform_fee" numeric,
     "tax_amount" numeric,
     "payment_status" "text" DEFAULT 'pending'::"text",
@@ -2871,19 +2871,19 @@ ALTER VIEW "public"."conversation_list" OWNER TO "postgres";
 CREATE OR REPLACE VIEW "public"."customer_bookings_view" AS
  SELECT "b"."id" AS "booking_id",
     "b"."customer_id",
-    "b"."status",
+    "b"."address",
     "b"."scheduled_date",
     "b"."scheduled_time",
+    "b"."status",
     "b"."total_price",
-    "b"."address",
-    "cd"."user_id" AS "cleaner_id",
+    "b"."cleaner_id",
+    COALESCE("p"."fullname", "concat_ws"(' '::"text", "p"."firstname", "p"."lastname")) AS "cleaner_name",
+    "p"."avatar_url" AS "cleaner_avatar",
     "cd"."rating" AS "cleaner_rating",
-    "cd"."completed_jobs" AS "cleaner_jobs",
-    "p"."fullname" AS "cleaner_name",
-    "p"."avatar_url" AS "cleaner_avatar"
+    "cd"."completed_jobs" AS "cleaner_jobs"
    FROM (("public"."bookings" "b"
-     LEFT JOIN "public"."cleaner_data" "cd" ON (("b"."cleaner_id" = "cd"."user_id")))
-     LEFT JOIN "public"."profiles" "p" ON (("cd"."user_id" = "p"."id")));
+     LEFT JOIN "public"."profiles" "p" ON (("p"."id" = "b"."cleaner_id")))
+     LEFT JOIN "public"."cleaner_data" "cd" ON (("cd"."user_id" = "b"."cleaner_id")));
 
 
 ALTER VIEW "public"."customer_bookings_view" OWNER TO "postgres";
