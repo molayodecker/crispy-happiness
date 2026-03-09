@@ -1533,6 +1533,19 @@ $$;
 ALTER FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" integer, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" integer) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."get_payment_split_config"() RETURNS "jsonb"
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT jsonb_object_agg(key, value)
+  FROM payment_split_config
+  WHERE key IN ('tax_percentage', 'vendor_percentage');
+$$;
+
+
+ALTER FUNCTION "public"."get_payment_split_config"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."get_payout_system_logs"() RETURNS TABLE("id" bigint, "status_code" integer, "content" "text", "url" "text", "created_at" timestamp with time zone, "delivery_status" "text")
     LANGUAGE "sql" SECURITY DEFINER
     SET "search_path" TO 'public', 'net'
@@ -2634,8 +2647,11 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "timezone" "text" DEFAULT 'UTC'::"text",
     "completion_notes" "text",
     "customer_rating" smallint,
+    "subscription_id" "uuid",
+    "recurrence_interval" "text",
     CONSTRAINT "bookings_customer_rating_range" CHECK ((("customer_rating" IS NULL) OR (("customer_rating" >= 1) AND ("customer_rating" <= 5)))),
-    CONSTRAINT "bookings_duration_hours_valid" CHECK ((("duration_hours" > (0)::numeric) AND ("duration_hours" <= (24)::numeric)))
+    CONSTRAINT "bookings_duration_hours_valid" CHECK ((("duration_hours" > (0)::numeric) AND ("duration_hours" <= (24)::numeric))),
+    CONSTRAINT "bookings_recurrence_interval_check" CHECK ((("recurrence_interval" IS NULL) OR ("recurrence_interval" = ANY (ARRAY['weekly'::"text", 'monthly'::"text"]))))
 );
 
 
@@ -3334,6 +3350,17 @@ CREATE TABLE IF NOT EXISTS "public"."notifications" (
 ALTER TABLE "public"."notifications" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."payment_split_config" (
+    "key" "text" NOT NULL,
+    "value" numeric NOT NULL,
+    "description" "text",
+    "updated_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."payment_split_config" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."payout_methods" (
     "id" "uuid" DEFAULT "extensions"."uuid_generate_v4"() NOT NULL,
     "user_id" "uuid" NOT NULL,
@@ -3470,6 +3497,38 @@ ALTER SEQUENCE "public"."service_types_id_seq" OWNER TO "postgres";
 
 
 ALTER SEQUENCE "public"."service_types_id_seq" OWNED BY "public"."service_types"."id";
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."subscriptions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "customer_id" "uuid" NOT NULL,
+    "cleaner_id" "uuid",
+    "service_id" integer NOT NULL,
+    "address" "text" NOT NULL,
+    "location_coordinates" "point",
+    "duration_hours" integer DEFAULT 2 NOT NULL,
+    "recurrence_interval" "text" NOT NULL,
+    "paystack_subscription_code" "text",
+    "paystack_plan_code" "text",
+    "amount" integer NOT NULL,
+    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "next_occurrence_date" "date",
+    "scheduled_time" time without time zone,
+    "home_size" "text",
+    "extra_task_ids" "text"[] DEFAULT '{}'::"text"[],
+    "special_instructions" "text",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    CONSTRAINT "subscriptions_recurrence_interval_check" CHECK (("recurrence_interval" = ANY (ARRAY['weekly'::"text", 'monthly'::"text"]))),
+    CONSTRAINT "subscriptions_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'active'::"text", 'cancelled'::"text", 'completed'::"text"])))
+);
+
+
+ALTER TABLE "public"."subscriptions" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."subscriptions" IS 'Recurring cleaning plans; each occurrence is a row in bookings with subscription_id set.';
 
 
 
@@ -3836,6 +3895,11 @@ ALTER TABLE ONLY "public"."notifications"
 
 
 
+ALTER TABLE ONLY "public"."payment_split_config"
+    ADD CONSTRAINT "payment_split_config_pkey" PRIMARY KEY ("key");
+
+
+
 ALTER TABLE ONLY "public"."payout_methods"
     ADD CONSTRAINT "payout_methods_pkey" PRIMARY KEY ("id");
 
@@ -3898,6 +3962,11 @@ ALTER TABLE ONLY "public"."service_categories"
 
 ALTER TABLE ONLY "public"."service_types"
     ADD CONSTRAINT "service_types_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."subscriptions"
+    ADD CONSTRAINT "subscriptions_pkey" PRIMARY KEY ("id");
 
 
 
@@ -4056,6 +4125,10 @@ CREATE INDEX "idx_bookings_scheduled_date" ON "public"."bookings" USING "btree" 
 
 
 CREATE INDEX "idx_bookings_status" ON "public"."bookings" USING "btree" ("status");
+
+
+
+CREATE INDEX "idx_bookings_subscription_id" ON "public"."bookings" USING "btree" ("subscription_id") WHERE ("subscription_id" IS NOT NULL);
 
 
 
@@ -4263,6 +4336,18 @@ CREATE INDEX "idx_service_types_category_id" ON "public"."service_types" USING "
 
 
 
+CREATE INDEX "idx_subscriptions_customer" ON "public"."subscriptions" USING "btree" ("customer_id");
+
+
+
+CREATE INDEX "idx_subscriptions_paystack_code" ON "public"."subscriptions" USING "btree" ("paystack_subscription_code") WHERE ("paystack_subscription_code" IS NOT NULL);
+
+
+
+CREATE INDEX "idx_subscriptions_status" ON "public"."subscriptions" USING "btree" ("status");
+
+
+
 CREATE INDEX "idx_testimonials_created_at" ON "public"."testimonials" USING "btree" ("created_at" DESC);
 
 
@@ -4429,6 +4514,11 @@ ALTER TABLE ONLY "public"."bookings"
 
 ALTER TABLE ONLY "public"."bookings"
     ADD CONSTRAINT "bookings_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."service_types"("id");
+
+
+
+ALTER TABLE ONLY "public"."bookings"
+    ADD CONSTRAINT "bookings_subscription_id_fkey" FOREIGN KEY ("subscription_id") REFERENCES "public"."subscriptions"("id") ON DELETE SET NULL;
 
 
 
@@ -4617,6 +4707,21 @@ ALTER TABLE ONLY "public"."service_types"
 
 
 
+ALTER TABLE ONLY "public"."subscriptions"
+    ADD CONSTRAINT "subscriptions_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "public"."cleaner_data"("user_id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."subscriptions"
+    ADD CONSTRAINT "subscriptions_customer_id_fkey" FOREIGN KEY ("customer_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."subscriptions"
+    ADD CONSTRAINT "subscriptions_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."service_types"("id");
+
+
+
 ALTER TABLE ONLY "public"."transactions"
     ADD CONSTRAINT "transactions_booking_id_fkey" FOREIGN KEY ("booking_id") REFERENCES "public"."bookings"("id") ON DELETE CASCADE;
 
@@ -4716,6 +4821,14 @@ CREATE POLICY "Allow public read access" ON "public"."extra_tasks" FOR SELECT US
 
 
 
+CREATE POLICY "Allow read for authenticated" ON "public"."payment_split_config" FOR SELECT TO "authenticated" USING (true);
+
+
+
+CREATE POLICY "Allow read for service role" ON "public"."payment_split_config" FOR SELECT TO "service_role" USING (true);
+
+
+
 CREATE POLICY "Cleaner or customer can read own bookings" ON "public"."bookings" FOR SELECT TO "authenticated" USING ((("cleaner_id" = ( SELECT "auth"."uid"() AS "uid")) OR ("customer_id" = ( SELECT "auth"."uid"() AS "uid"))));
 
 
@@ -4741,6 +4854,10 @@ CREATE POLICY "Customers and cleaners can view platform fees" ON "public"."platf
   WHERE (("ur"."user_id" = ( SELECT "auth"."uid"() AS "uid")) AND ("ur"."role_id" = ANY (ARRAY['customer'::"text", 'cleaner'::"text"]))))) OR (EXISTS ( SELECT 1
    FROM "public"."user_roles" "ur"
   WHERE (("ur"."user_id" = ( SELECT "auth"."uid"() AS "uid")) AND ("ur"."role_id" = 'admin'::"text"))))));
+
+
+
+CREATE POLICY "Customers can read own subscriptions" ON "public"."subscriptions" FOR SELECT USING (("auth"."uid"() = "customer_id"));
 
 
 
@@ -5172,6 +5289,9 @@ ALTER TABLE "public"."messages" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."notifications" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."payment_split_config" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."payout_methods" ENABLE ROW LEVEL SECURITY;
 
 
@@ -5206,6 +5326,9 @@ ALTER TABLE "public"."service_categories" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."service_types" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."subscriptions" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."testimonials" ENABLE ROW LEVEL SECURITY;
@@ -8395,6 +8518,12 @@ GRANT ALL ON FUNCTION "public"."get_my_wallet_balance"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" integer, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" integer, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" integer, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" integer) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_payment_split_config"() TO "anon";
+GRANT ALL ON FUNCTION "public"."get_payment_split_config"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_payment_split_config"() TO "service_role";
 
 
 
@@ -12601,6 +12730,12 @@ GRANT ALL ON TABLE "public"."notifications" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."payment_split_config" TO "anon";
+GRANT ALL ON TABLE "public"."payment_split_config" TO "authenticated";
+GRANT ALL ON TABLE "public"."payment_split_config" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."payout_methods" TO "anon";
 GRANT ALL ON TABLE "public"."payout_methods" TO "authenticated";
 GRANT ALL ON TABLE "public"."payout_methods" TO "service_role";
@@ -12652,6 +12787,12 @@ GRANT ALL ON TABLE "public"."service_types" TO "service_role";
 GRANT ALL ON SEQUENCE "public"."service_types_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."service_types_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."service_types_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."subscriptions" TO "anon";
+GRANT ALL ON TABLE "public"."subscriptions" TO "authenticated";
+GRANT ALL ON TABLE "public"."subscriptions" TO "service_role";
 
 
 
