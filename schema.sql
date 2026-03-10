@@ -1398,62 +1398,68 @@ END;$$;
 ALTER FUNCTION "public"."get_cleaners_with_score"("customer_id" "uuid", "requested_services" "text"[]) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_location_current_time"("p_timezone" "text") RETURNS TABLE("current_timestamp_tz" timestamp with time zone, "current_time_only" time without time zone, "is_past_cutoff" boolean)
+CREATE OR REPLACE FUNCTION "public"."get_location_current_time"("p_timezone" "text", "p_duration_hours" numeric) RETURNS TABLE("current_timestamp_tz" timestamp with time zone, "local_date" "date", "local_time" time without time zone, "is_past_day_cutoff" boolean, "is_today_impossible" boolean, "latest_start_time" time without time zone, "same_day_cutoff_at" timestamp with time zone)
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
-    v_local_now timestamptz;
-BEGIN
-    -- Convert UTC server time to location's local time
-    v_local_now := now() AT TIME ZONE p_timezone;
-    
-    RETURN QUERY 
-    SELECT 
-        v_local_now,
-        v_local_now::time,
-        (v_local_now::time > '12:00:00'::time); -- Returns true if past 12pm
-END;
-$$;
-
-
-ALTER FUNCTION "public"."get_location_current_time"("p_timezone" "text") OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."get_location_current_time"("p_timezone" "text", "p_duration_hours" numeric DEFAULT 2) RETURNS TABLE("current_timestamp_tz" timestamp with time zone, "current_date_at_location" "date", "current_time_only" time without time zone, "is_past_day_cutoff" boolean, "is_today_impossible" boolean, "latest_start_time_today" time without time zone)
-    LANGUAGE "plpgsql"
-    AS $$
-DECLARE
-  v_now_at_location timestamptz;
+  v_now_at_location timestamp;
   v_work_day_end numeric;
   v_travel_buffer numeric;
   v_latest_start_decimal numeric;
+  v_current_time_decimal numeric;
+  v_cutoff_time time;
+  v_same_day_cutoff_at_local timestamp;
 BEGIN
-  -- 1. Fetch Dynamic Settings from your table
-  SELECT value_numeric INTO v_work_day_end FROM booking_settings WHERE key = 'work_day_end';
-  SELECT value_numeric INTO v_travel_buffer FROM booking_settings WHERE key = 'travel_buffer';
+  -- Fetch settings
+  SELECT value_numeric
+  INTO v_work_day_end
+  FROM booking_settings
+  WHERE key = 'work_day_end';
 
-  -- Fallbacks if settings are missing
-  v_work_day_end := COALESCE(v_work_day_end, 17.0); -- 5 PM
-  v_travel_buffer := COALESCE(v_travel_buffer, 1.0); -- 1 Hour
+  SELECT value_numeric
+  INTO v_travel_buffer
+  FROM booking_settings
+  WHERE key = 'travel_buffer';
 
-  -- 2. Get local time at the service location
+  -- Fallbacks
+  v_work_day_end := COALESCE(v_work_day_end, 17.0);   -- 5 PM
+  v_travel_buffer := COALESCE(v_travel_buffer, 1.0);  -- 1 hour
+
+  -- Local wall clock time at the service location
   v_now_at_location := now() AT TIME ZONE p_timezone;
 
-  -- 3. Calculate the latest possible start time for today
-  -- 17.0 (End) - Duration - 1.0 (Travel) = Latest Start
+  -- Latest allowed start time today:
+  -- work day end - service duration - travel buffer
   v_latest_start_decimal := v_work_day_end - p_duration_hours - v_travel_buffer;
 
+  -- Clamp to valid day range
+  v_latest_start_decimal := GREATEST(0, LEAST(23.999722, v_latest_start_decimal));
+
+  -- Current local time as decimal hours
+  v_current_time_decimal :=
+    EXTRACT(HOUR FROM v_now_at_location)
+    + (EXTRACT(MINUTE FROM v_now_at_location) / 60.0)
+    + (EXTRACT(SECOND FROM v_now_at_location) / 3600.0);
+
+  -- Convert latest start decimal to time
+  v_cutoff_time := make_time(
+    floor(v_latest_start_decimal)::int,
+    floor((v_latest_start_decimal - floor(v_latest_start_decimal)) * 60)::int,
+    0
+  );
+
+  -- Local timestamp for today's cutoff
+  v_same_day_cutoff_at_local := date_trunc('day', v_now_at_location) + v_cutoff_time;
+
   RETURN QUERY
-  SELECT 
-    v_now_at_location,
-    v_now_at_location::date,
-    v_now_at_location::time,
-    -- Cutoff logic: true if it is 12 PM or later in the property's timezone
-    (EXTRACT(HOUR FROM v_now_at_location) >= 12), 
-    -- Impossible logic: true if (Current Time + Duration + Buffer) goes past 5 PM
-    ((EXTRACT(HOUR FROM v_now_at_location) + (EXTRACT(MINUTE FROM v_now_at_location)/60.0)) > v_latest_start_decimal),
-    -- Convert the decimal latest start back into a readable TIME format
-    (make_interval(hours => floor(v_latest_start_decimal)::int, mins => ((v_latest_start_decimal % 1) * 60)::int))::time;
+  SELECT
+    now() AS current_timestamp_tz,
+    v_now_at_location::date AS local_date,
+    v_now_at_location::time AS local_time,
+    (v_now_at_location >= v_same_day_cutoff_at_local) AS is_past_day_cutoff,
+    (v_current_time_decimal > v_latest_start_decimal) AS is_today_impossible,
+    v_cutoff_time AS latest_start_time,
+    (v_same_day_cutoff_at_local AT TIME ZONE p_timezone) AS same_day_cutoff_at;
 END;
 $$;
 
@@ -3506,7 +3512,6 @@ CREATE TABLE IF NOT EXISTS "public"."subscriptions" (
     "cleaner_id" "uuid",
     "service_id" integer NOT NULL,
     "address" "text" NOT NULL,
-    "location_coordinates" "point",
     "duration_hours" integer DEFAULT 2 NOT NULL,
     "recurrence_interval" "text" NOT NULL,
     "paystack_subscription_code" "text",
@@ -3520,6 +3525,7 @@ CREATE TABLE IF NOT EXISTS "public"."subscriptions" (
     "special_instructions" "text",
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"(),
+    "location_coordinates" "public"."geometry"(Point,4326),
     CONSTRAINT "subscriptions_recurrence_interval_check" CHECK (("recurrence_interval" = ANY (ARRAY['weekly'::"text", 'monthly'::"text"]))),
     CONSTRAINT "subscriptions_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'active'::"text", 'cancelled'::"text", 'completed'::"text"])))
 );
@@ -4854,6 +4860,10 @@ CREATE POLICY "Customers and cleaners can view platform fees" ON "public"."platf
   WHERE (("ur"."user_id" = ( SELECT "auth"."uid"() AS "uid")) AND ("ur"."role_id" = ANY (ARRAY['customer'::"text", 'cleaner'::"text"]))))) OR (EXISTS ( SELECT 1
    FROM "public"."user_roles" "ur"
   WHERE (("ur"."user_id" = ( SELECT "auth"."uid"() AS "uid")) AND ("ur"."role_id" = 'admin'::"text"))))));
+
+
+
+CREATE POLICY "Customers can insert own subscriptions" ON "public"."subscriptions" FOR INSERT WITH CHECK (("auth"."uid"() = "customer_id"));
 
 
 
@@ -8494,12 +8504,6 @@ GRANT ALL ON FUNCTION "public"."get_cleaner_wallet"("p_user_id" "uuid") TO "serv
 GRANT ALL ON FUNCTION "public"."get_cleaners_with_score"("customer_id" "uuid", "requested_services" "text"[]) TO "anon";
 GRANT ALL ON FUNCTION "public"."get_cleaners_with_score"("customer_id" "uuid", "requested_services" "text"[]) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_cleaners_with_score"("customer_id" "uuid", "requested_services" "text"[]) TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."get_location_current_time"("p_timezone" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_location_current_time"("p_timezone" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_location_current_time"("p_timezone" "text") TO "service_role";
 
 
 
