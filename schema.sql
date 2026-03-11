@@ -1690,8 +1690,7 @@ ALTER FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleane
 CREATE OR REPLACE FUNCTION "public"."get_user_profile_stats"("p_user_id" "uuid", "p_is_cleaner" boolean DEFAULT false) RETURNS json
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
-    AS $$
-DECLARE
+    AS $$DECLARE
   v_result json;
   v_cleaner_rating numeric;
 BEGIN
@@ -1701,7 +1700,7 @@ BEGIN
 
     SELECT json_build_object(
       'earnedToday', COALESCE((
-        SELECT SUM(total_price)::numeric / 100
+        SELECT SUM(total_price)::numeric
         FROM bookings
         WHERE cleaner_id = p_user_id
           AND status = 'completed'
@@ -1737,7 +1736,7 @@ BEGIN
         WHERE customer_id = p_user_id AND status = 'completed'
       ), 0),
       'totalSpent', COALESCE((
-        SELECT SUM(total_price)::numeric / 100
+        SELECT SUM(total_price)::numeric
         FROM bookings
         WHERE customer_id = p_user_id AND status = 'completed'
       ), 0),
@@ -1752,8 +1751,7 @@ BEGIN
   END IF;
 
   RETURN v_result;
-END;
-$$;
+END;$$;
 
 
 ALTER FUNCTION "public"."get_user_profile_stats"("p_user_id" "uuid", "p_is_cleaner" boolean) OWNER TO "postgres";
@@ -2657,7 +2655,7 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "recurrence_interval" "text",
     CONSTRAINT "bookings_customer_rating_range" CHECK ((("customer_rating" IS NULL) OR (("customer_rating" >= 1) AND ("customer_rating" <= 5)))),
     CONSTRAINT "bookings_duration_hours_valid" CHECK ((("duration_hours" > (0)::numeric) AND ("duration_hours" <= (24)::numeric))),
-    CONSTRAINT "bookings_recurrence_interval_check" CHECK ((("recurrence_interval" IS NULL) OR ("recurrence_interval" = ANY (ARRAY['weekly'::"text", 'monthly'::"text"]))))
+    CONSTRAINT "bookings_recurrence_interval_check" CHECK ((("recurrence_interval" IS NULL) OR ("recurrence_interval" = ANY (ARRAY['weekly'::"text", 'bi-weekly'::"text", 'monthly'::"text"]))))
 );
 
 
@@ -3526,7 +3524,7 @@ CREATE TABLE IF NOT EXISTS "public"."subscriptions" (
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"(),
     "location_coordinates" "public"."geometry"(Point,4326),
-    CONSTRAINT "subscriptions_recurrence_interval_check" CHECK (("recurrence_interval" = ANY (ARRAY['weekly'::"text", 'monthly'::"text"]))),
+    CONSTRAINT "subscriptions_recurrence_interval_check" CHECK (("recurrence_interval" = ANY (ARRAY['weekly'::"text", 'bi-weekly'::"text", 'monthly'::"text"]))),
     CONSTRAINT "subscriptions_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'active'::"text", 'cancelled'::"text", 'completed'::"text"])))
 );
 
