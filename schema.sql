@@ -174,6 +174,65 @@ CREATE TYPE "public"."withdrawal_status" AS ENUM (
 ALTER TYPE "public"."withdrawal_status" OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."accept_co_cleaner_invite"("p_token" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  r public.co_cleaner_invitations%ROWTYPE;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  SELECT * INTO r
+  FROM public.co_cleaner_invitations
+  WHERE token = p_token
+    AND status = 'pending'
+    AND expires_at > now();
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_or_expired_invite');
+  END IF;
+
+  IF r.inviter_user_id = v_uid THEN
+    RETURN jsonb_build_object('success', false, 'error', 'cannot_accept_own_invite');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM public.cleaner_data
+    WHERE user_id = v_uid AND verified IS TRUE
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'co_cleaner_not_verified');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM public.cleaner_data
+    WHERE user_id = r.inviter_user_id AND verified IS TRUE
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'inviter_not_verified');
+  END IF;
+
+  INSERT INTO public.co_cleaner_relationships (lead_cleaner_id, co_cleaner_id)
+  VALUES (r.inviter_user_id, v_uid)
+  ON CONFLICT (lead_cleaner_id, co_cleaner_id) DO NOTHING;
+
+  UPDATE public.co_cleaner_invitations
+  SET
+    status = 'accepted',
+    accepted_user_id = v_uid,
+    updated_at = now()
+  WHERE id = r.id;
+
+  RETURN jsonb_build_object('success', true, 'lead_cleaner_id', r.inviter_user_id);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."accept_co_cleaner_invite"("p_token" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."approve_and_complete_booking"("p_booking_id" "uuid", "p_rating" integer, "p_feedback" "text") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
@@ -464,6 +523,47 @@ $$;
 
 
 ALTER FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text" DEFAULT NULL::"text", "p_invitee_phone_e164" "text" DEFAULT NULL::"text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_token uuid := gen_random_uuid();
+  v_expires timestamptz := now() + interval '30 days';
+  v_id uuid;
+  v_email text := NULLIF(lower(trim(COALESCE(p_invitee_email, ''))), '');
+  v_phone text := NULLIF(trim(COALESCE(p_invitee_phone_e164, '')), '');
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'not_authenticated';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM public.cleaner_data
+    WHERE user_id = v_uid AND verified IS TRUE
+  ) THEN
+    RAISE EXCEPTION 'only_verified_cleaners_can_invite';
+  END IF;
+
+  INSERT INTO public.co_cleaner_invitations (
+    inviter_user_id, token, invitee_email, invitee_phone_e164, expires_at
+  )
+  VALUES (v_uid, v_token, v_email, v_phone, v_expires)
+  RETURNING id INTO v_id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'token', v_token,
+    'invite_id', v_id,
+    'expires_at', v_expires
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."ensure_single_default_platform_fee"() RETURNS "trigger"
@@ -2130,6 +2230,34 @@ $$;
 ALTER FUNCTION "public"."release_cleaner_after_15min_hold"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."revoke_co_cleaner_invite"("p_invite_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  n int;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'not_authenticated';
+  END IF;
+  UPDATE public.co_cleaner_invitations
+  SET status = 'revoked', updated_at = now()
+  WHERE id = p_invite_id
+    AND inviter_user_id = v_uid
+    AND status = 'pending';
+  GET DIAGNOSTICS n = ROW_COUNT;
+  IF n = 0 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found_or_not_pending');
+  END IF;
+  RETURN jsonb_build_object('success', true);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."revoke_co_cleaner_invite"("p_invite_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[] DEFAULT '{}'::"text"[], "p_max_distance_meters" double precision DEFAULT 50000) RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "rating" double precision, "distance_meters" double precision, "matching_skills_count" integer, "total_skills_count" integer)
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     AS $$
@@ -2808,6 +2936,36 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_verifications" (
 
 
 ALTER TABLE "public"."cleaner_verifications" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."co_cleaner_invitations" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "inviter_user_id" "uuid" NOT NULL,
+    "token" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "invitee_email" "text",
+    "invitee_phone_e164" "text",
+    "expires_at" timestamp with time zone NOT NULL,
+    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "accepted_user_id" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "co_cleaner_invitations_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'accepted'::"text", 'expired'::"text", 'revoked'::"text"])))
+);
+
+
+ALTER TABLE "public"."co_cleaner_invitations" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."co_cleaner_relationships" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "lead_cleaner_id" "uuid" NOT NULL,
+    "co_cleaner_id" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "co_cleaner_relationships_check" CHECK (("lead_cleaner_id" <> "co_cleaner_id"))
+);
+
+
+ALTER TABLE "public"."co_cleaner_relationships" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."conversations" (
@@ -3779,6 +3937,26 @@ ALTER TABLE ONLY "public"."cleaner_verifications"
 
 
 
+ALTER TABLE ONLY "public"."co_cleaner_invitations"
+    ADD CONSTRAINT "co_cleaner_invitations_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."co_cleaner_invitations"
+    ADD CONSTRAINT "co_cleaner_invitations_token_key" UNIQUE ("token");
+
+
+
+ALTER TABLE ONLY "public"."co_cleaner_relationships"
+    ADD CONSTRAINT "co_cleaner_relationships_lead_cleaner_id_co_cleaner_id_key" UNIQUE ("lead_cleaner_id", "co_cleaner_id");
+
+
+
+ALTER TABLE ONLY "public"."co_cleaner_relationships"
+    ADD CONSTRAINT "co_cleaner_relationships_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."conversations"
     ADD CONSTRAINT "conversations_customer_id_cleaner_id_booking_id_key" UNIQUE ("customer_id", "cleaner_id", "booking_id");
 
@@ -4200,6 +4378,22 @@ CREATE INDEX "idx_cleaner_verifications_id" ON "public"."cleaner_verifications" 
 
 
 
+CREATE INDEX "idx_co_cleaner_invitations_inviter" ON "public"."co_cleaner_invitations" USING "btree" ("inviter_user_id");
+
+
+
+CREATE INDEX "idx_co_cleaner_invitations_token_pending" ON "public"."co_cleaner_invitations" USING "btree" ("token") WHERE ("status" = 'pending'::"text");
+
+
+
+CREATE INDEX "idx_co_cleaner_relationships_co" ON "public"."co_cleaner_relationships" USING "btree" ("co_cleaner_id");
+
+
+
+CREATE INDEX "idx_co_cleaner_relationships_lead" ON "public"."co_cleaner_relationships" USING "btree" ("lead_cleaner_id");
+
+
+
 CREATE INDEX "idx_conversations_booking_id" ON "public"."conversations" USING "btree" ("booking_id");
 
 
@@ -4566,6 +4760,26 @@ ALTER TABLE ONLY "public"."cleaner_verifications"
 
 
 
+ALTER TABLE ONLY "public"."co_cleaner_invitations"
+    ADD CONSTRAINT "co_cleaner_invitations_accepted_user_id_fkey" FOREIGN KEY ("accepted_user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."co_cleaner_invitations"
+    ADD CONSTRAINT "co_cleaner_invitations_inviter_user_id_fkey" FOREIGN KEY ("inviter_user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."co_cleaner_relationships"
+    ADD CONSTRAINT "co_cleaner_relationships_co_cleaner_id_fkey" FOREIGN KEY ("co_cleaner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."co_cleaner_relationships"
+    ADD CONSTRAINT "co_cleaner_relationships_lead_cleaner_id_fkey" FOREIGN KEY ("lead_cleaner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."conversations"
     ADD CONSTRAINT "conversations_booking_id_fkey" FOREIGN KEY ("booking_id") REFERENCES "public"."bookings"("id") ON DELETE CASCADE;
 
@@ -4895,6 +5109,18 @@ CREATE POLICY "System can view all availability exceptions" ON "public"."cleaner
 
 
 
+CREATE POLICY "Users can delete own preferred cleaners" ON "public"."preferred_cleaners" FOR DELETE USING (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "Users can insert own preferred cleaners" ON "public"."preferred_cleaners" FOR INSERT WITH CHECK (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "Users can read own preferred cleaners" ON "public"."preferred_cleaners" FOR SELECT USING (("auth"."uid"() = "user_id"));
+
+
+
 CREATE POLICY "Users can read their own kyc" ON "public"."kyc_profiles" FOR SELECT USING (("user_id" = "auth"."uid"()));
 
 
@@ -5196,6 +5422,24 @@ CREATE POLICY "cleaners_select_own_withdrawals" ON "public"."withdrawal_requests
 
 
 CREATE POLICY "cleaners_update_own_cleaner_data" ON "public"."cleaner_data" FOR UPDATE TO "authenticated" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
+
+
+
+ALTER TABLE "public"."co_cleaner_invitations" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "co_cleaner_invitations_select_own" ON "public"."co_cleaner_invitations" FOR SELECT USING (("auth"."uid"() = "inviter_user_id"));
+
+
+
+CREATE POLICY "co_cleaner_invitations_update_own" ON "public"."co_cleaner_invitations" FOR UPDATE USING (("auth"."uid"() = "inviter_user_id")) WITH CHECK (("auth"."uid"() = "inviter_user_id"));
+
+
+
+ALTER TABLE "public"."co_cleaner_relationships" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "co_cleaner_relationships_select_participant" ON "public"."co_cleaner_relationships" FOR SELECT USING ((("auth"."uid"() = "lead_cleaner_id") OR ("auth"."uid"() = "co_cleaner_id")));
 
 
 
@@ -6347,6 +6591,13 @@ GRANT ALL ON FUNCTION "public"."_st_within"("geom1" "public"."geometry", "geom2"
 
 
 
+REVOKE ALL ON FUNCTION "public"."accept_co_cleaner_invite"("p_token" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."accept_co_cleaner_invite"("p_token" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."accept_co_cleaner_invite"("p_token" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."accept_co_cleaner_invite"("p_token" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."addauth"("text") TO "postgres";
 GRANT ALL ON FUNCTION "public"."addauth"("text") TO "anon";
 GRANT ALL ON FUNCTION "public"."addauth"("text") TO "authenticated";
@@ -6482,6 +6733,13 @@ GRANT ALL ON FUNCTION "public"."contains_2d"("public"."geometry", "public"."box2
 GRANT ALL ON FUNCTION "public"."contains_2d"("public"."geometry", "public"."box2df") TO "anon";
 GRANT ALL ON FUNCTION "public"."contains_2d"("public"."geometry", "public"."box2df") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."contains_2d"("public"."geometry", "public"."box2df") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "service_role";
 
 
 
@@ -9292,6 +9550,13 @@ GRANT ALL ON FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_
 GRANT ALL ON FUNCTION "public"."release_cleaner_after_15min_hold"() TO "anon";
 GRANT ALL ON FUNCTION "public"."release_cleaner_after_15min_hold"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."release_cleaner_after_15min_hold"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."revoke_co_cleaner_invite"("p_invite_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."revoke_co_cleaner_invite"("p_invite_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."revoke_co_cleaner_invite"("p_invite_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."revoke_co_cleaner_invite"("p_invite_id" "uuid") TO "service_role";
 
 
 
@@ -12579,6 +12844,18 @@ GRANT ALL ON TABLE "public"."cleaner_tracking" TO "service_role";
 GRANT ALL ON TABLE "public"."cleaner_verifications" TO "anon";
 GRANT ALL ON TABLE "public"."cleaner_verifications" TO "authenticated";
 GRANT ALL ON TABLE "public"."cleaner_verifications" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."co_cleaner_invitations" TO "anon";
+GRANT ALL ON TABLE "public"."co_cleaner_invitations" TO "authenticated";
+GRANT ALL ON TABLE "public"."co_cleaner_invitations" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."co_cleaner_relationships" TO "anon";
+GRANT ALL ON TABLE "public"."co_cleaner_relationships" TO "authenticated";
+GRANT ALL ON TABLE "public"."co_cleaner_relationships" TO "service_role";
 
 
 
