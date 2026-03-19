@@ -5357,6 +5357,18 @@ ALTER TABLE "public"."booking_settings" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."booking_timeline" ENABLE ROW LEVEL SECURITY;
 
 
+CREATE POLICY "booking_timeline_insert_by_participant" ON "public"."booking_timeline" FOR INSERT TO "authenticated" WITH CHECK ((EXISTS ( SELECT 1
+   FROM "public"."bookings" "b"
+  WHERE (("b"."id" = "booking_timeline"."booking_id") AND (("b"."customer_id" = "auth"."uid"()) OR ("b"."cleaner_id" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "booking_timeline_select_by_participant" ON "public"."booking_timeline" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."bookings" "b"
+  WHERE (("b"."id" = "booking_timeline"."booking_id") AND (("b"."customer_id" = "auth"."uid"()) OR ("b"."cleaner_id" = "auth"."uid"()))))));
+
+
+
 ALTER TABLE "public"."bookings" ENABLE ROW LEVEL SECURITY;
 
 
