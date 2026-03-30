@@ -3,76 +3,193 @@ name: Supa-backup
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "roles.sql"
+      - "schema.sql"
+      - "data.sql.gz"
+      - "exports/**"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "roles.sql"
+      - "schema.sql"
+      - "data.sql.gz"
+      - "exports/**"
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *" # Runs every day at midnight
+    - cron: "0 0 * * *" # daily at midnight UTC
+
+concurrency:
+  group: supabase-backups
+  cancel-in-progress: false
 
 jobs:
   run_db_backup:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     env:
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
       BACKUP_ENABLED: ${{ secrets.BACKUP_ENABLED }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
 
     steps:
       - name: Check if backups are enabled
         shell: bash
         run: |
-          if [ "$BACKUP_ENABLED" != "true" ]; then
+          set -euo pipefail
+          if [ "${BACKUP_ENABLED:-false}" != "true" ]; then
             echo "Backups are not enabled. Skipping."
             exit 0
           fi
 
-      - name: Checkout repository
+      - name: Determine backup mode
+        id: mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+            echo "Running FULL backup"
+          else
+            echo "mode=schema" >> "$GITHUB_OUTPUT"
+            echo "Running SCHEMA-ONLY backup"
+          fi
+
+      - name: Checkout checkpoint branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: checkpoint
 
       - name: Setup Supabase CLI
         uses: supabase/setup-cli@v1
         with:
           version: latest
 
+      - name: Install PostgreSQL 17 client and AWS CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg lsb-release ca-certificates python3-pip
+
+          echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+
+          wget -qO - https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | gpg --dearmor \
+            | sudo tee /etc/apt/trusted.gpg.d/postgresql.gpg > /dev/null
+
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+          python3 -m pip install --user awscli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          /usr/lib/postgresql/17/bin/pg_dump --version
+          /usr/lib/postgresql/17/bin/psql --version
+          "$HOME/.local/bin/aws" --version
+
       - name: Force IPv4 for Supabase host
         shell: bash
         run: |
           set -euo pipefail
-          # Safely extract hostname
+
           HOST=$(python3 -c "import os, urllib.parse; print(urllib.parse.urlparse(os.environ.get('SUPABASE_DB_URL', '')).hostname or '')")
           echo "Host: $HOST"
 
-          # Resolve IPv4 to bypass GitHub Runner IPv6 "Network unreachable" errors
           IPV4=$(getent ahostsv4 "$HOST" | awk '/RAW/ {print $1; exit}')
           if [ -z "$IPV4" ]; then
             echo "Error: Could not resolve IPv4 for $HOST" >&2
             exit 1
           fi
+
           echo "IPv4: $IPV4"
 
-          # Build the connection string with hostaddr override
-          [[ "$SUPABASE_DB_URL" == *\?* ]] && SEP="&" || SEP="?"
+          if [[ "$SUPABASE_DB_URL" == *\?* ]]; then
+            SEP="&"
+          else
+            SEP="?"
+          fi
+
           echo "SUPABASE_DB_URL_IPV4=${SUPABASE_DB_URL}${SEP}sslmode=require&hostaddr=${IPV4}" >> "$GITHUB_ENV"
 
-      - name: Run Dumps and Compress
+      - name: Dump roles and schema
+        shell: bash
         run: |
-          # 1. Dump roles and schema (Small files)
+          set -euo pipefail
+
+          mkdir -p exports
+
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f roles.sql --role-only
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f schema.sql
 
-          # 2. Dump data and compress immediately to bypass GitHub's 100MB limit
-          supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" --data-only --use-copy | gzip > data.sql.gz
+      - name: Dump full data
+        if: steps.mode.outputs.mode == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          # 3. Explicitly remove any uncompressed data.sql to prevent accidental commits
+          supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" --data-only --use-copy | gzip > data.sql.gz
           rm -f data.sql
 
-      - name: Commit and Push
+      - name: Export config tables to compressed SQL file
+        if: steps.mode.outputs.mode == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          /usr/lib/postgresql/17/bin/pg_dump "$SUPABASE_DB_URL_IPV4" \
+            --data-only \
+            --inserts \
+            --table=public.base_duration \
+            --table=public.booking_settings \
+            --table=public.discounts \
+            --table=public.extra_tasks \
+            --table=public.roles \
+            --table=public.service_categories \
+            --table=public.service_types \
+            --table=public.timezones \
+            | gzip > exports/config_data.sql.gz
+
+      - name: Show generated files
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh roles.sql schema.sql || true
+          ls -lh data.sql.gz exports/config_data.sql.gz || true
+
+      - name: Commit schema files only
+        if: github.event_name != 'pull_request'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: automated supabase backup [skip ci]"
-          file_pattern: "roles.sql schema.sql data.sql.gz"
+          commit_message: "chore: schema backup [skip ci]"
+          file_pattern: "roles.sql schema.sql"
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
+
+      - name: Upload full backups to Cloudflare R2
+        if: steps.mode.outputs.mode == 'full'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          set -euo pipefail
+
+          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          DATE=$(date -u +%Y-%m-%d)
+          RUN_ID="${{ github.run_id }}"
+
+          aws s3 cp data.sql.gz \
+            "s3://$R2_BUCKET_NAME/$DATE/$RUN_ID/data.sql.gz" \
+            --endpoint-url "$ENDPOINT"
+
+          aws s3 cp exports/config_data.sql.gz \
+            "s3://$R2_BUCKET_NAME/$DATE/$RUN_ID/config_data.sql.gz" \
+            --endpoint-url "$ENDPOINT"
