@@ -68,6 +68,9 @@ jobs:
             echo "Running SCHEMA-ONLY backup"
           fi
 
+          # Schema + functions/triggers to R2 on every run when R2 secrets are set (not only full data dumps).
+          echo "upload_ddl_to_r2=true" >> "$GITHUB_OUTPUT"
+
       - name: Checkout checkpoint branch
         if: github.event_name != 'pull_request'
         uses: actions/checkout@v4
@@ -145,6 +148,16 @@ jobs:
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f roles.sql --role-only
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f schema.sql
 
+      - name: Dump functions and triggers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          /usr/lib/postgresql/17/bin/psql "$SUPABASE_DB_URL_IPV4" \
+            -v ON_ERROR_STOP=1 \
+            -q \
+            -f scripts/dump_functions_triggers.sql
+
       - name: Dump full data
         if: steps.mode.outputs.mode == 'full'
         shell: bash
@@ -177,19 +190,48 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ls -lh roles.sql schema.sql || true
+          ls -lh roles.sql schema.sql exports/functions_triggers.sql || true
           ls -lh data.sql.gz exports/config_data.sql.gz || true
 
-      - name: Commit schema files only
+      - name: Commit schema, roles, and functions/triggers to GitHub
         if: github.event_name != 'pull_request'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore: schema backup [skip ci]"
-          file_pattern: "roles.sql schema.sql"
+          file_pattern: "roles.sql schema.sql exports/functions_triggers.sql"
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
 
-      - name: Upload full backups to Cloudflare R2
+      - name: Upload schema and functions/triggers to Cloudflare R2
+        if: >
+          steps.mode.outputs.upload_ddl_to_r2 == 'true' &&
+          env.R2_BUCKET_NAME != '' &&
+          env.R2_ACCOUNT_ID != ''
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          set -euo pipefail
+
+          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          DATE=$(date -u +%Y-%m-%d)
+          RUN_ID="${{ github.run_id }}"
+          PREFIX="s3://$R2_BUCKET_NAME/$DATE/$RUN_ID"
+
+          gzip -c schema.sql > schema.sql.gz
+          gzip -c exports/functions_triggers.sql > exports/functions_triggers.sql.gz
+
+          aws s3 cp schema.sql.gz \
+            "$PREFIX/schema.sql.gz" \
+            --endpoint-url "$ENDPOINT"
+
+          aws s3 cp exports/functions_triggers.sql.gz \
+            "$PREFIX/functions_triggers.sql.gz" \
+            --endpoint-url "$ENDPOINT"
+
+      - name: Upload full data backups to Cloudflare R2
         if: steps.mode.outputs.upload_to_r2 == 'true'
         shell: bash
         env:
@@ -202,11 +244,12 @@ jobs:
           ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           DATE=$(date -u +%Y-%m-%d)
           RUN_ID="${{ github.run_id }}"
+          PREFIX="s3://$R2_BUCKET_NAME/$DATE/$RUN_ID"
 
           aws s3 cp data.sql.gz \
-            "s3://$R2_BUCKET_NAME/$DATE/$RUN_ID/data.sql.gz" \
+            "$PREFIX/data.sql.gz" \
             --endpoint-url "$ENDPOINT"
 
           aws s3 cp exports/config_data.sql.gz \
-            "s3://$R2_BUCKET_NAME/$DATE/$RUN_ID/config_data.sql.gz" \
+            "$PREFIX/config_data.sql.gz" \
             --endpoint-url "$ENDPOINT"
