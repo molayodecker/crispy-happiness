@@ -449,6 +449,60 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.accept_preferred_cleaner_invite(p_token uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  r public.preferred_cleaner_invitations%ROWTYPE;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  SELECT * INTO r
+  FROM public.preferred_cleaner_invitations
+  WHERE token = p_token
+    AND status = 'pending'
+    AND expires_at > now();
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_or_expired_invite');
+  END IF;
+
+  IF r.inviter_user_id = v_uid THEN
+    RETURN jsonb_build_object('success', false, 'error', 'cannot_accept_own_invite');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM public.cleaner_data
+    WHERE user_id = v_uid AND verified IS TRUE
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'preferred_invite_cleaner_not_verified');
+  END IF;
+
+  INSERT INTO public.preferred_cleaners (user_id, cleaner_id)
+  VALUES (r.inviter_user_id, v_uid)
+  ON CONFLICT (user_id, cleaner_id) DO NOTHING;
+
+  UPDATE public.preferred_cleaner_invitations
+  SET
+    status = 'accepted',
+    accepted_cleaner_id = v_uid,
+    updated_at = now()
+  WHERE id = r.id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'customer_user_id', r.inviter_user_id
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.addauth(text)
  RETURNS boolean
  LANGUAGE plpgsql
@@ -1142,6 +1196,40 @@ BEGIN
   END IF;
 
   INSERT INTO public.co_cleaner_invitations (
+    inviter_user_id, token, invitee_email, invitee_phone_e164, expires_at
+  )
+  VALUES (v_uid, v_token, v_email, v_phone, v_expires)
+  RETURNING id INTO v_id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'token', v_token,
+    'invite_id', v_id,
+    'expires_at', v_expires
+  );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.create_preferred_cleaner_invite(p_invitee_email text DEFAULT NULL::text, p_invitee_phone_e164 text DEFAULT NULL::text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_token uuid := gen_random_uuid();
+  v_expires timestamptz := now() + interval '30 days';
+  v_id uuid;
+  v_email text := NULLIF(lower(trim(COALESCE(p_invitee_email, ''))), '');
+  v_phone text := NULLIF(trim(COALESCE(p_invitee_phone_e164, '')), '');
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'not_authenticated';
+  END IF;
+
+  INSERT INTO public.preferred_cleaner_invitations (
     inviter_user_id, token, invitee_email, invitee_phone_e164, expires_at
   )
   VALUES (v_uid, v_token, v_email, v_phone, v_expires)
@@ -6488,6 +6576,33 @@ BEGIN
     RAISE EXCEPTION 'not_authenticated';
   END IF;
   UPDATE public.co_cleaner_invitations
+  SET status = 'revoked', updated_at = now()
+  WHERE id = p_invite_id
+    AND inviter_user_id = v_uid
+    AND status = 'pending';
+  GET DIAGNOSTICS n = ROW_COUNT;
+  IF n = 0 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found_or_not_pending');
+  END IF;
+  RETURN jsonb_build_object('success', true);
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.revoke_preferred_cleaner_invite(p_invite_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  n int;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'not_authenticated';
+  END IF;
+  UPDATE public.preferred_cleaner_invitations
   SET status = 'revoked', updated_at = now()
   WHERE id = p_invite_id
     AND inviter_user_id = v_uid

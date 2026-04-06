@@ -233,6 +233,61 @@ $$;
 ALTER FUNCTION "public"."accept_co_cleaner_invite"("p_token" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."accept_preferred_cleaner_invite"("p_token" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  r public.preferred_cleaner_invitations%ROWTYPE;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  SELECT * INTO r
+  FROM public.preferred_cleaner_invitations
+  WHERE token = p_token
+    AND status = 'pending'
+    AND expires_at > now();
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_or_expired_invite');
+  END IF;
+
+  IF r.inviter_user_id = v_uid THEN
+    RETURN jsonb_build_object('success', false, 'error', 'cannot_accept_own_invite');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM public.cleaner_data
+    WHERE user_id = v_uid AND verified IS TRUE
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'preferred_invite_cleaner_not_verified');
+  END IF;
+
+  INSERT INTO public.preferred_cleaners (user_id, cleaner_id)
+  VALUES (r.inviter_user_id, v_uid)
+  ON CONFLICT (user_id, cleaner_id) DO NOTHING;
+
+  UPDATE public.preferred_cleaner_invitations
+  SET
+    status = 'accepted',
+    accepted_cleaner_id = v_uid,
+    updated_at = now()
+  WHERE id = r.id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'customer_user_id', r.inviter_user_id
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."accept_preferred_cleaner_invite"("p_token" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."approve_and_complete_booking"("p_booking_id" "uuid", "p_rating" integer, "p_feedback" "text") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
@@ -564,6 +619,41 @@ $$;
 
 
 ALTER FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_email" "text" DEFAULT NULL::"text", "p_invitee_phone_e164" "text" DEFAULT NULL::"text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_token uuid := gen_random_uuid();
+  v_expires timestamptz := now() + interval '30 days';
+  v_id uuid;
+  v_email text := NULLIF(lower(trim(COALESCE(p_invitee_email, ''))), '');
+  v_phone text := NULLIF(trim(COALESCE(p_invitee_phone_e164, '')), '');
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'not_authenticated';
+  END IF;
+
+  INSERT INTO public.preferred_cleaner_invitations (
+    inviter_user_id, token, invitee_email, invitee_phone_e164, expires_at
+  )
+  VALUES (v_uid, v_token, v_email, v_phone, v_expires)
+  RETURNING id INTO v_id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'token', v_token,
+    'invite_id', v_id,
+    'expires_at', v_expires
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."ensure_single_default_platform_fee"() RETURNS "trigger"
@@ -2258,6 +2348,34 @@ $$;
 ALTER FUNCTION "public"."revoke_co_cleaner_invite"("p_invite_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."revoke_preferred_cleaner_invite"("p_invite_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  n int;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'not_authenticated';
+  END IF;
+  UPDATE public.preferred_cleaner_invitations
+  SET status = 'revoked', updated_at = now()
+  WHERE id = p_invite_id
+    AND inviter_user_id = v_uid
+    AND status = 'pending';
+  GET DIAGNOSTICS n = ROW_COUNT;
+  IF n = 0 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found_or_not_pending');
+  END IF;
+  RETURN jsonb_build_object('success', true);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."revoke_preferred_cleaner_invite"("p_invite_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[] DEFAULT '{}'::"text"[], "p_max_distance_meters" double precision DEFAULT 50000) RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "rating" double precision, "distance_meters" double precision, "matching_skills_count" integer, "total_skills_count" integer)
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     AS $$
@@ -3561,6 +3679,24 @@ CREATE TABLE IF NOT EXISTS "public"."platform_fees" (
 ALTER TABLE "public"."platform_fees" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."preferred_cleaner_invitations" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "inviter_user_id" "uuid" NOT NULL,
+    "token" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "invitee_email" "text",
+    "invitee_phone_e164" "text",
+    "expires_at" timestamp with time zone NOT NULL,
+    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "accepted_cleaner_id" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "preferred_cleaner_invitations_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'accepted'::"text", 'expired'::"text", 'revoked'::"text"])))
+);
+
+
+ALTER TABLE "public"."preferred_cleaner_invitations" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."preferred_cleaners" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid",
@@ -4097,6 +4233,16 @@ ALTER TABLE ONLY "public"."platform_fees"
 
 
 
+ALTER TABLE ONLY "public"."preferred_cleaner_invitations"
+    ADD CONSTRAINT "preferred_cleaner_invitations_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."preferred_cleaner_invitations"
+    ADD CONSTRAINT "preferred_cleaner_invitations_token_key" UNIQUE ("token");
+
+
+
 ALTER TABLE ONLY "public"."preferred_cleaners"
     ADD CONSTRAINT "preferred_cleaners_pkey" PRIMARY KEY ("id");
 
@@ -4498,6 +4644,14 @@ CREATE UNIQUE INDEX "idx_platform_fees_unique_default" ON "public"."platform_fee
 
 
 
+CREATE INDEX "idx_preferred_cleaner_invitations_inviter" ON "public"."preferred_cleaner_invitations" USING "btree" ("inviter_user_id");
+
+
+
+CREATE INDEX "idx_preferred_cleaner_invitations_token_pending" ON "public"."preferred_cleaner_invitations" USING "btree" ("token") WHERE ("status" = 'pending'::"text");
+
+
+
 CREATE INDEX "idx_preferred_cleaners_user_id" ON "public"."preferred_cleaners" USING "btree" ("user_id");
 
 
@@ -4872,6 +5026,16 @@ ALTER TABLE ONLY "public"."payout_methods"
 
 ALTER TABLE ONLY "public"."platform_fees"
     ADD CONSTRAINT "platform_fees_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."preferred_cleaner_invitations"
+    ADD CONSTRAINT "preferred_cleaner_invitations_accepted_cleaner_id_fkey" FOREIGN KEY ("accepted_cleaner_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."preferred_cleaner_invitations"
+    ADD CONSTRAINT "preferred_cleaner_invitations_inviter_user_id_fkey" FOREIGN KEY ("inviter_user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -5560,6 +5724,17 @@ ALTER TABLE "public"."payout_methods" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."platform_fees" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."preferred_cleaner_invitations" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "preferred_cleaner_invitations_select_own" ON "public"."preferred_cleaner_invitations" FOR SELECT USING (("auth"."uid"() = "inviter_user_id"));
+
+
+
+CREATE POLICY "preferred_cleaner_invitations_update_own" ON "public"."preferred_cleaner_invitations" FOR UPDATE USING (("auth"."uid"() = "inviter_user_id")) WITH CHECK (("auth"."uid"() = "inviter_user_id"));
+
 
 
 ALTER TABLE "public"."preferred_cleaners" ENABLE ROW LEVEL SECURITY;
@@ -6610,6 +6785,13 @@ GRANT ALL ON FUNCTION "public"."accept_co_cleaner_invite"("p_token" "uuid") TO "
 
 
 
+REVOKE ALL ON FUNCTION "public"."accept_preferred_cleaner_invite"("p_token" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."accept_preferred_cleaner_invite"("p_token" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."accept_preferred_cleaner_invite"("p_token" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."accept_preferred_cleaner_invite"("p_token" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."addauth"("text") TO "postgres";
 GRANT ALL ON FUNCTION "public"."addauth"("text") TO "anon";
 GRANT ALL ON FUNCTION "public"."addauth"("text") TO "authenticated";
@@ -6752,6 +6934,13 @@ REVOKE ALL ON FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "te
 GRANT ALL ON FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "service_role";
 
 
 
@@ -9569,6 +9758,13 @@ REVOKE ALL ON FUNCTION "public"."revoke_co_cleaner_invite"("p_invite_id" "uuid")
 GRANT ALL ON FUNCTION "public"."revoke_co_cleaner_invite"("p_invite_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."revoke_co_cleaner_invite"("p_invite_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."revoke_co_cleaner_invite"("p_invite_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."revoke_preferred_cleaner_invite"("p_invite_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."revoke_preferred_cleaner_invite"("p_invite_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."revoke_preferred_cleaner_invite"("p_invite_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."revoke_preferred_cleaner_invite"("p_invite_id" "uuid") TO "service_role";
 
 
 
@@ -13036,6 +13232,12 @@ GRANT ALL ON TABLE "public"."payout_methods" TO "service_role";
 GRANT ALL ON TABLE "public"."platform_fees" TO "anon";
 GRANT ALL ON TABLE "public"."platform_fees" TO "authenticated";
 GRANT ALL ON TABLE "public"."platform_fees" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."preferred_cleaner_invitations" TO "anon";
+GRANT ALL ON TABLE "public"."preferred_cleaner_invitations" TO "authenticated";
+GRANT ALL ON TABLE "public"."preferred_cleaner_invitations" TO "service_role";
 
 
 
