@@ -1880,7 +1880,8 @@ ALTER FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleane
 CREATE OR REPLACE FUNCTION "public"."get_user_profile_stats"("p_user_id" "uuid", "p_is_cleaner" boolean DEFAULT false) RETURNS json
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
-    AS $$DECLARE
+    AS $$
+DECLARE
   v_result json;
   v_cleaner_rating numeric;
 BEGIN
@@ -1890,7 +1891,7 @@ BEGIN
 
     SELECT json_build_object(
       'earnedToday', COALESCE((
-        SELECT SUM(total_price)::numeric
+        SELECT SUM(COALESCE(final_amount_minor, total_price))::numeric
         FROM bookings
         WHERE cleaner_id = p_user_id
           AND status = 'completed'
@@ -1926,7 +1927,7 @@ BEGIN
         WHERE customer_id = p_user_id AND status = 'completed'
       ), 0),
       'totalSpent', COALESCE((
-        SELECT SUM(total_price)::numeric
+        SELECT SUM(COALESCE(final_amount_minor, total_price))::numeric
         FROM bookings
         WHERE customer_id = p_user_id AND status = 'completed'
       ), 0),
@@ -1941,7 +1942,8 @@ BEGIN
   END IF;
 
   RETURN v_result;
-END;$$;
+END;
+$$;
 
 
 ALTER FUNCTION "public"."get_user_profile_stats"("p_user_id" "uuid", "p_is_cleaner" boolean) OWNER TO "postgres";
@@ -2899,9 +2901,23 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "customer_rating" smallint,
     "subscription_id" "uuid",
     "recurrence_interval" "text",
+    "currency" "text" DEFAULT 'GHS'::"text",
+    "pricing_version" "text" DEFAULT 'v1'::"text",
+    "core_amount_minor" integer,
+    "same_day_surcharge_minor" integer DEFAULT 0,
+    "weekend_surcharge_minor" integer DEFAULT 0,
+    "recurring_discount_minor" integer DEFAULT 0,
+    "final_amount_minor" integer,
+    "is_same_day" boolean,
+    "is_weekend" boolean,
+    CONSTRAINT "bookings_core_amount_nonnegative_check" CHECK ((("core_amount_minor" IS NULL) OR ("core_amount_minor" >= 0))),
     CONSTRAINT "bookings_customer_rating_range" CHECK ((("customer_rating" IS NULL) OR (("customer_rating" >= 1) AND ("customer_rating" <= 5)))),
     CONSTRAINT "bookings_duration_hours_valid" CHECK ((("duration_hours" > (0)::numeric) AND ("duration_hours" <= (24)::numeric))),
-    CONSTRAINT "bookings_recurrence_interval_check" CHECK ((("recurrence_interval" IS NULL) OR ("recurrence_interval" = ANY (ARRAY['weekly'::"text", 'bi-weekly'::"text", 'monthly'::"text"]))))
+    CONSTRAINT "bookings_final_amount_nonnegative_check" CHECK ((("final_amount_minor" IS NULL) OR ("final_amount_minor" >= 0))),
+    CONSTRAINT "bookings_recurrence_interval_check" CHECK ((("recurrence_interval" IS NULL) OR ("recurrence_interval" = ANY (ARRAY['weekly'::"text", 'bi-weekly'::"text", 'monthly'::"text"])))),
+    CONSTRAINT "bookings_recurring_discount_nonnegative_check" CHECK (("recurring_discount_minor" >= 0)),
+    CONSTRAINT "bookings_same_day_surcharge_nonnegative_check" CHECK (("same_day_surcharge_minor" >= 0)),
+    CONSTRAINT "bookings_weekend_surcharge_nonnegative_check" CHECK (("weekend_surcharge_minor" >= 0))
 );
 
 
@@ -3818,7 +3834,17 @@ CREATE TABLE IF NOT EXISTS "public"."subscriptions" (
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"(),
     "location_coordinates" "public"."geometry"(Point,4326),
+    "currency" "text" DEFAULT 'GHS'::"text",
+    "pricing_version" "text" DEFAULT 'v1'::"text",
+    "first_charge_amount_minor" integer,
+    "recurring_amount_minor" integer,
+    "discount_type" "text",
+    "discount_rate_bps" integer DEFAULT 0,
+    CONSTRAINT "subscriptions_discount_rate_bps_range_check" CHECK ((("discount_rate_bps" >= 0) AND ("discount_rate_bps" <= 10000))),
+    CONSTRAINT "subscriptions_discount_type_check" CHECK (("discount_type" = ANY (ARRAY['none'::"text", 'weekly'::"text", 'bi-weekly'::"text", 'monthly'::"text"]))),
+    CONSTRAINT "subscriptions_first_charge_amount_nonnegative_check" CHECK ((("first_charge_amount_minor" IS NULL) OR ("first_charge_amount_minor" >= 0))),
     CONSTRAINT "subscriptions_recurrence_interval_check" CHECK (("recurrence_interval" = ANY (ARRAY['weekly'::"text", 'bi-weekly'::"text", 'monthly'::"text"]))),
+    CONSTRAINT "subscriptions_recurring_amount_nonnegative_check" CHECK ((("recurring_amount_minor" IS NULL) OR ("recurring_amount_minor" >= 0))),
     CONSTRAINT "subscriptions_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'active'::"text", 'cancelled'::"text", 'completed'::"text"])))
 );
 
@@ -4436,6 +4462,10 @@ CREATE INDEX "idx_bookings_customer_id" ON "public"."bookings" USING "btree" ("c
 
 
 
+CREATE INDEX "idx_bookings_final_amount_minor" ON "public"."bookings" USING "btree" ("final_amount_minor");
+
+
+
 CREATE INDEX "idx_bookings_hold_cleanup" ON "public"."bookings" USING "btree" ("payment_status", "status", "created_at") WHERE ("cleaner_id" IS NOT NULL);
 
 
@@ -4693,6 +4723,10 @@ CREATE INDEX "idx_subscriptions_customer" ON "public"."subscriptions" USING "btr
 
 
 CREATE INDEX "idx_subscriptions_paystack_code" ON "public"."subscriptions" USING "btree" ("paystack_subscription_code") WHERE ("paystack_subscription_code" IS NOT NULL);
+
+
+
+CREATE INDEX "idx_subscriptions_recurring_amount_minor" ON "public"."subscriptions" USING "btree" ("recurring_amount_minor");
 
 
 

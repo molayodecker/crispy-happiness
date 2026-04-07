@@ -4805,7 +4805,8 @@ CREATE OR REPLACE FUNCTION public.get_user_profile_stats(p_user_id uuid, p_is_cl
  LANGUAGE plpgsql
  SECURITY DEFINER
  SET search_path TO 'public'
-AS $function$DECLARE
+AS $function$
+DECLARE
   v_result json;
   v_cleaner_rating numeric;
 BEGIN
@@ -4815,7 +4816,7 @@ BEGIN
 
     SELECT json_build_object(
       'earnedToday', COALESCE((
-        SELECT SUM(total_price)::numeric
+        SELECT SUM(COALESCE(final_amount_minor, total_price))::numeric
         FROM bookings
         WHERE cleaner_id = p_user_id
           AND status = 'completed'
@@ -4851,7 +4852,7 @@ BEGIN
         WHERE customer_id = p_user_id AND status = 'completed'
       ), 0),
       'totalSpent', COALESCE((
-        SELECT SUM(total_price)::numeric
+        SELECT SUM(COALESCE(final_amount_minor, total_price))::numeric
         FROM bookings
         WHERE customer_id = p_user_id AND status = 'completed'
       ), 0),
@@ -4866,7 +4867,8 @@ BEGIN
   END IF;
 
   RETURN v_result;
-END;$function$
+END;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.get_user_role(p_user_id uuid)
