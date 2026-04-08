@@ -3780,6 +3780,26 @@ ALTER SEQUENCE "public"."service_categories_id_seq" OWNED BY "public"."service_c
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."service_duration_options" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "service_type_id" integer NOT NULL,
+    "sort_order" integer DEFAULT 0 NOT NULL,
+    "label" "text" NOT NULL,
+    "duration_hours" numeric(6,2) NOT NULL,
+    "is_default" boolean DEFAULT false NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    CONSTRAINT "service_duration_options_duration_hours_check" CHECK ((("duration_hours" >= (0)::numeric) AND ("duration_hours" <= (24)::numeric)))
+);
+
+
+ALTER TABLE "public"."service_duration_options" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."service_duration_options" IS 'Per–service-type load/tier rows; duration_hours is billable hours (single source of truth).';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."service_types" (
     "id" integer NOT NULL,
     "category_id" integer,
@@ -4314,6 +4334,11 @@ ALTER TABLE ONLY "public"."service_categories"
 
 
 
+ALTER TABLE ONLY "public"."service_duration_options"
+    ADD CONSTRAINT "service_duration_options_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."service_types"
     ADD CONSTRAINT "service_types_pkey" PRIMARY KEY ("id");
 
@@ -4711,6 +4736,10 @@ CREATE INDEX "idx_reviews_reviewee_created" ON "public"."reviews" USING "btree" 
 
 
 CREATE INDEX "idx_reviews_reviewee_id" ON "public"."reviews" USING "btree" ("reviewee_id");
+
+
+
+CREATE INDEX "idx_service_duration_options_service" ON "public"."service_duration_options" USING "btree" ("service_type_id");
 
 
 
@@ -5115,6 +5144,11 @@ ALTER TABLE ONLY "public"."reviews"
 
 ALTER TABLE ONLY "public"."reviews"
     ADD CONSTRAINT "reviews_reviewer_id_fkey" FOREIGN KEY ("reviewer_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."service_duration_options"
+    ADD CONSTRAINT "service_duration_options_service_type_id_fkey" FOREIGN KEY ("service_type_id") REFERENCES "public"."service_types"("id") ON DELETE CASCADE;
 
 
 
@@ -5796,6 +5830,13 @@ ALTER TABLE "public"."roles" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."service_categories" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."service_duration_options" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "service_duration_options_select_anon" ON "public"."service_duration_options" FOR SELECT TO "authenticated", "anon" USING (true);
+
 
 
 ALTER TABLE "public"."service_types" ENABLE ROW LEVEL SECURITY;
@@ -13302,6 +13343,12 @@ GRANT ALL ON TABLE "public"."service_categories" TO "service_role";
 GRANT ALL ON SEQUENCE "public"."service_categories_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."service_categories_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."service_categories_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."service_duration_options" TO "anon";
+GRANT ALL ON TABLE "public"."service_duration_options" TO "authenticated";
+GRANT ALL ON TABLE "public"."service_duration_options" TO "service_role";
 
 
 
