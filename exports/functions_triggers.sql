@@ -1150,6 +1150,257 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.compute_booking_pricing(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false)
+ RETURNS TABLE(pricing_version text, currency text, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, core_amount_minor bigint, same_day_surcharge_minor bigint, weekend_surcharge_minor bigint, recurring_discount_minor bigint, final_amount_minor bigint, recurring_amount_minor bigint, first_charge_amount_minor bigint, discount_rate_bps integer, is_same_day boolean, is_weekend boolean)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_now timestamptz := now();
+  -- Stage 6 / 7: calendar math uses this IANA zone (default Accra if blank).
+  v_tz text := COALESCE(NULLIF(trim(p_service_timezone), ''), 'Africa/Accra');
+  v_min_dur numeric := 3.5;
+  v_max_dur numeric := 10;
+  v_stepped numeric;
+  v_dur numeric;
+  v_base numeric;
+  v_rate numeric;
+  v_disc_amount numeric;
+  v_st RECORD;
+  v_rule RECORD;
+  v_pf_pct numeric := 15;
+  v_cover numeric := 21;
+  v_subtotal numeric;
+  v_pf numeric;
+  v_core bigint;
+  v_same bigint := 0;
+  v_wknd bigint := 0;
+  v_after_same bigint;
+  v_final bigint;
+  v_today date;
+  v_isodow int;
+  v_same_day boolean := false;
+  v_weekend boolean := false;
+  v_bps_same int;
+  v_bps_wknd int;
+  v_bps_rw int;
+  v_bps_rm int;
+  v_disc_rate int;
+  v_recurring bigint;
+  v_first bigint;
+  v_recurring_disc bigint := 0;
+  v_pf_setting numeric;
+  v_cover_setting numeric;
+BEGIN
+  -- ---------------------------------------------------------------------------
+  -- Stage 0: validate service id (caller must pass a positive service_types.id).
+  -- ---------------------------------------------------------------------------
+  IF p_service_id IS NULL OR p_service_id <= 0 THEN
+    RAISE EXCEPTION 'Invalid service id';
+  END IF;
+
+  -- ---------------------------------------------------------------------------
+  -- Stage 1: billable duration — match clampBookingDurationHours() in TS.
+  -- Round to nearest 0.5h, then clamp to [3.5, 10] (MIN/MAX_DURATION_HOURS).
+  -- ---------------------------------------------------------------------------
+  v_stepped := round(p_duration_hours_raw::numeric * 2) / 2;
+  v_dur := greatest(v_min_dur, least(v_max_dur, v_stepped));
+
+  -- ---------------------------------------------------------------------------
+  -- Stage 2: base hourly rate from service_types.price.
+  -- Reject inactive or missing services (same as fetchEffectiveHourlyRateGhs).
+  -- ---------------------------------------------------------------------------
+  SELECT s.price, s.active INTO v_st
+  FROM public.service_types s
+  WHERE s.id = p_service_id;
+
+  IF NOT FOUND OR v_st.active IS DISTINCT FROM true THEN
+    RAISE EXCEPTION 'Invalid or inactive service';
+  END IF;
+
+  v_base := v_st.price::numeric;
+  IF v_base IS NULL OR v_base < 0 THEN
+    RAISE EXCEPTION 'Invalid service price';
+  END IF;
+
+  -- ---------------------------------------------------------------------------
+  -- Stage 3: optional percentage discount from discounts (active, date window).
+  -- If a row matches: effective rate = round(base * (1 - amount/100), 2) like TS.
+  -- Window: valid_from <= now <= valid_to (both ends required, same as web query).
+  -- ---------------------------------------------------------------------------
+  SELECT d.amount INTO v_disc_amount
+  FROM public.discounts d
+  WHERE d.active = true
+    AND d.service_type_id = p_service_id
+    AND d.valid_from IS NOT NULL
+    AND d.valid_to IS NOT NULL
+    AND d.valid_from <= v_now
+    AND d.valid_to >= v_now
+  ORDER BY d.id DESC
+  LIMIT 1;
+
+  IF FOUND AND v_disc_amount IS NOT NULL THEN
+    v_rate := round((v_base * (1 - (v_disc_amount::numeric / 100)))::numeric, 2);
+  ELSE
+    v_rate := v_base;
+  END IF;
+
+  -- ---------------------------------------------------------------------------
+  -- Stage 4: active pricing rule (bps for surcharges + recurring discounts).
+  -- Same source as get_active_pricing_rule: one row with active = true.
+  -- If none: fall back to v1 constants (500/500/700/1200 bps) like FALLBACK_ACTIVE_PRICING_RULE_V1.
+  -- Output columns also expose the bps so clients can build ActivePricingRule.
+  -- ---------------------------------------------------------------------------
+  SELECT
+    r.pricing_version,
+    r.currency,
+    r.same_day_surcharge_bps,
+    r.weekend_surcharge_bps,
+    r.recurring_weekly_discount_bps,
+    r.recurring_monthly_discount_bps
+  INTO v_rule
+  FROM public.pricing_rules r
+  WHERE r.active = true
+  ORDER BY r.created_at DESC
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    pricing_version := 'v1';
+    currency := 'GHS';
+    v_bps_same := 500;
+    v_bps_wknd := 500;
+    v_bps_rw := 700;
+    v_bps_rm := 1200;
+  ELSE
+    pricing_version := v_rule.pricing_version;
+    currency := v_rule.currency;
+    v_bps_same := least(10000, greatest(0, coalesce(v_rule.same_day_surcharge_bps, 500)));
+    v_bps_wknd := least(10000, greatest(0, coalesce(v_rule.weekend_surcharge_bps, 500)));
+    v_bps_rw := least(10000, greatest(0, coalesce(v_rule.recurring_weekly_discount_bps, 700)));
+    v_bps_rm := least(10000, greatest(0, coalesce(v_rule.recurring_monthly_discount_bps, 1200)));
+  END IF;
+
+  same_day_surcharge_bps := v_bps_same;
+  weekend_surcharge_bps := v_bps_wknd;
+  recurring_weekly_discount_bps := v_bps_rw;
+  recurring_monthly_discount_bps := v_bps_rm;
+
+  -- ---------------------------------------------------------------------------
+  -- Stage 5: booking_settings — platform fee % of labor + booking cover (GHS).
+  -- Keys: platform_fee_percentage (whole percent, default 15), booking_cover_amount (default 21).
+  -- Matches fetchBookingSettingsPricingKv().
+  -- ---------------------------------------------------------------------------
+  SELECT bs.value_numeric INTO v_pf_setting
+  FROM public.booking_settings bs
+  WHERE bs.key = 'platform_fee_percentage'
+  LIMIT 1;
+
+  SELECT bs.value_numeric INTO v_cover_setting
+  FROM public.booking_settings bs
+  WHERE bs.key = 'booking_cover_amount'
+  LIMIT 1;
+
+  IF v_pf_setting IS NOT NULL AND v_pf_setting >= 0 THEN
+    v_pf_pct := least(100::numeric, greatest(0::numeric, v_pf_setting::numeric));
+  END IF;
+
+  IF v_cover_setting IS NOT NULL AND v_cover_setting >= 0 THEN
+    v_cover := v_cover_setting::numeric;
+  END IF;
+
+  -- ---------------------------------------------------------------------------
+  -- Stage 6: labor subtotal, platform fee (on labor only), core in minor units.
+  -- subtotal_labor = rate * duration; platform_fee = subtotal * (pct/100);
+  -- core_amount_minor = round((subtotal + platform_fee + cover) * 100) — computeCoreAmountMinor.
+  -- ---------------------------------------------------------------------------
+  v_subtotal := greatest(0::numeric, v_rate * v_dur);
+  v_pf := (v_subtotal * least(100::numeric, greatest(0::numeric, v_pf_pct))) / 100::numeric;
+  v_core := round(greatest(0::numeric, v_subtotal + v_pf + v_cover) * 100)::bigint;
+
+  -- ---------------------------------------------------------------------------
+  -- Stage 7: same-day vs weekend in the service timezone (applyRuleSurchargesMinor).
+  -- "Today" in zone: compare p_scheduled_date to (now() rendered in v_tz)::date.
+  -- Weekday: ISO DOW 1–7 Mon–Sun at local civil date for noon UTC on p_scheduled_date
+  -- (matches date-fns getIsoWeekdayInServiceTz anchor).
+  -- Same-day surcharge: bps on core. Weekend: bps on (core + same_day_surcharge_minor).
+  -- ---------------------------------------------------------------------------
+  v_today := (timezone(v_tz, v_now))::date;
+  v_same_day := (p_scheduled_date = v_today);
+
+  v_isodow := EXTRACT(
+    ISODOW FROM (
+      ((p_scheduled_date::timestamp + interval '12 hours') AT TIME ZONE 'UTC') AT TIME ZONE v_tz
+    )
+  )::int;
+
+  v_weekend := (v_isodow IN (6, 7));
+
+  IF v_same_day THEN
+    v_same := round((v_core::numeric * v_bps_same::numeric) / 10000.0)::bigint;
+  ELSE
+    v_same := 0;
+  END IF;
+
+  v_after_same := v_core + v_same;
+
+  IF v_weekend THEN
+    v_wknd := round((v_after_same::numeric * v_bps_wknd::numeric) / 10000.0)::bigint;
+  ELSE
+    v_wknd := 0;
+  END IF;
+
+  v_final := v_core + v_same + v_wknd;
+
+  -- ---------------------------------------------------------------------------
+  -- Stage 8: recurring subscription (optional).
+  -- If p_is_recurring and interval set: discount bps on core from rule — monthly uses
+  -- recurring_monthly_discount_bps; weekly and bi-weekly use recurring_weekly_discount_bps.
+  -- recurring_amount_minor = round(core * (10000 - bps) / 10000).
+  -- first_charge_amount_minor = final_amount after surcharges (first visit pays full).
+  -- recurring_discount_minor = max(0, core - recurring_amount_minor).
+  -- ---------------------------------------------------------------------------
+  IF p_is_recurring AND p_recurrence_interval IS NOT NULL THEN
+    IF lower(trim(p_recurrence_interval)) = 'monthly' THEN
+      v_disc_rate := v_bps_rm;
+    ELSE
+      v_disc_rate := v_bps_rw;
+    END IF;
+    v_disc_rate := least(10000, greatest(0, v_disc_rate));
+    v_recurring := round((v_core::numeric * (10000 - v_disc_rate)::numeric) / 10000.0)::bigint;
+    v_first := v_final;
+    v_recurring_disc := greatest(0::bigint, v_core - v_recurring);
+  ELSE
+    v_disc_rate := NULL;
+    v_recurring := NULL;
+    v_first := NULL;
+    v_recurring_disc := 0;
+  END IF;
+
+  -- ---------------------------------------------------------------------------
+  -- Stage 9: fill RETURNS TABLE (one row).
+  -- ---------------------------------------------------------------------------
+  work_rate_ghs_per_hour := v_rate;
+  duration_hours := v_dur;
+  subtotal_labor_major := v_subtotal;
+  platform_fee_major := v_pf;
+  booking_cover_major := v_cover;
+  core_amount_minor := v_core;
+  same_day_surcharge_minor := v_same;
+  weekend_surcharge_minor := v_wknd;
+  recurring_discount_minor := v_recurring_disc;
+  final_amount_minor := v_final;
+  recurring_amount_minor := v_recurring;
+  first_charge_amount_minor := v_first;
+  discount_rate_bps := v_disc_rate;
+  is_same_day := v_same_day;
+  is_weekend := v_weekend;
+
+  RETURN NEXT;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.contains_2d(box2df, box2df)
  RETURNS boolean
  LANGUAGE c
@@ -3792,6 +4043,28 @@ CREATE OR REPLACE FUNCTION public.geomfromewkt(text)
  LANGUAGE c
  IMMUTABLE PARALLEL SAFE STRICT COST 50
 AS '$libdir/postgis-3', $function$parse_WKT_lwgeom$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_active_pricing_rule()
+ RETURNS TABLE(pricing_version text, currency text, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer)
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT
+    pr.pricing_version,
+    pr.currency,
+    pr.same_day_surcharge_bps,
+    pr.weekend_surcharge_bps,
+    pr.recurring_weekly_discount_bps,
+    pr.recurring_monthly_discount_bps
+  FROM public.pricing_rules pr
+  WHERE pr.is_active = true
+    AND (pr.effective_from IS NULL OR pr.effective_from <= now())
+    AND (pr.effective_to IS NULL OR pr.effective_to > now())
+  ORDER BY pr.updated_at DESC
+  LIMIT 1;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.get_available_booking_days(p_timezone text DEFAULT 'UTC'::text, p_duration_hours numeric DEFAULT 3.0, p_days_ahead integer DEFAULT 14)
