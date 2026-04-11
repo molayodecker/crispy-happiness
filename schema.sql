@@ -930,6 +930,33 @@ $$;
 ALTER FUNCTION "public"."ensure_single_default_platform_fee"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."expire_stale_pending_bookings"() RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  affected integer;
+  v_now timestamptz := now();
+BEGIN
+  UPDATE public.bookings
+  SET
+    status = 'cancelled'::booking_status,
+    updated_at = v_now
+  WHERE status = 'pending'::booking_status
+    AND payment_status = 'pending'
+    AND subscription_id IS NULL
+    AND created_at < (v_now - interval '48 hours')
+    AND updated_at < (v_now - interval '48 hours');
+
+  GET DIAGNOSTICS affected = ROW_COUNT;
+  RETURN affected;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."expire_stale_pending_bookings"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."fetch_cleaner_earnings"("p_user_id" "uuid", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone) RETURNS json
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
@@ -7434,6 +7461,12 @@ GRANT ALL ON FUNCTION "public"."equals"("geom1" "public"."geometry", "geom2" "pu
 GRANT ALL ON FUNCTION "public"."equals"("geom1" "public"."geometry", "geom2" "public"."geometry") TO "anon";
 GRANT ALL ON FUNCTION "public"."equals"("geom1" "public"."geometry", "geom2" "public"."geometry") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."equals"("geom1" "public"."geometry", "geom2" "public"."geometry") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."expire_stale_pending_bookings"() TO "anon";
+GRANT ALL ON FUNCTION "public"."expire_stale_pending_bookings"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."expire_stale_pending_bookings"() TO "service_role";
 
 
 
