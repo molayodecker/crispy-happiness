@@ -4001,6 +4001,26 @@ CREATE TABLE IF NOT EXISTS "public"."platform_fees" (
 ALTER TABLE "public"."platform_fees" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."platform_settings" (
+    "singleton" boolean DEFAULT true NOT NULL,
+    "general" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "booking" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "payment" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "notification" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "security" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_by" "uuid",
+    CONSTRAINT "platform_settings_singleton_check" CHECK (("singleton" = true))
+);
+
+
+ALTER TABLE "public"."platform_settings" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."platform_settings" IS 'Singleton row for admin settings UI; each column is a JSON object merged with app defaults on read.';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."preferred_cleaner_invitations" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "inviter_user_id" "uuid" NOT NULL,
@@ -4052,6 +4072,20 @@ CREATE TABLE IF NOT EXISTS "public"."pricing_rules" (
 
 
 ALTER TABLE "public"."pricing_rules" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."reviewer_permissions" (
+    "user_id" "uuid" NOT NULL,
+    "permission_key" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."reviewer_permissions" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."reviewer_permissions" IS 'Keys match lib/auth/permissions.ts ReviewerPermissionKey; only users with user_roles.role_id = reviewer should have rows.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."reviews" (
@@ -4609,6 +4643,11 @@ ALTER TABLE ONLY "public"."platform_fees"
 
 
 
+ALTER TABLE ONLY "public"."platform_settings"
+    ADD CONSTRAINT "platform_settings_pkey" PRIMARY KEY ("singleton");
+
+
+
 ALTER TABLE ONLY "public"."preferred_cleaner_invitations"
     ADD CONSTRAINT "preferred_cleaner_invitations_pkey" PRIMARY KEY ("id");
 
@@ -4651,6 +4690,11 @@ ALTER TABLE ONLY "public"."psk_transaction"
 
 ALTER TABLE ONLY "public"."psk_transaction"
     ADD CONSTRAINT "psk_transaction_reference_key" UNIQUE ("reference");
+
+
+
+ALTER TABLE ONLY "public"."reviewer_permissions"
+    ADD CONSTRAINT "reviewer_permissions_pkey" PRIMARY KEY ("user_id", "permission_key");
 
 
 
@@ -5075,6 +5119,10 @@ CREATE INDEX "idx_psk_ref" ON "public"."psk_transaction" USING "btree" ("referen
 
 
 
+CREATE INDEX "idx_reviewer_permissions_user_id" ON "public"."reviewer_permissions" USING "btree" ("user_id");
+
+
+
 CREATE INDEX "idx_reviews_booking_id" ON "public"."reviews" USING "btree" ("booking_id");
 
 
@@ -5440,6 +5488,11 @@ ALTER TABLE ONLY "public"."platform_fees"
 
 
 
+ALTER TABLE ONLY "public"."platform_settings"
+    ADD CONSTRAINT "platform_settings_updated_by_fkey" FOREIGN KEY ("updated_by") REFERENCES "public"."users"("id") ON DELETE SET NULL;
+
+
+
 ALTER TABLE ONLY "public"."preferred_cleaner_invitations"
     ADD CONSTRAINT "preferred_cleaner_invitations_accepted_cleaner_id_fkey" FOREIGN KEY ("accepted_cleaner_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
@@ -5477,6 +5530,11 @@ ALTER TABLE ONLY "public"."psk_transaction"
 
 ALTER TABLE ONLY "public"."psk_transaction"
     ADD CONSTRAINT "psk_transaction_user_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "public"."profiles"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."reviewer_permissions"
+    ADD CONSTRAINT "reviewer_permissions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -6152,6 +6210,9 @@ ALTER TABLE "public"."payout_methods" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."platform_fees" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."platform_settings" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."preferred_cleaner_invitations" ENABLE ROW LEVEL SECURITY;
@@ -13692,6 +13753,12 @@ GRANT ALL ON TABLE "public"."platform_fees" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."platform_settings" TO "anon";
+GRANT ALL ON TABLE "public"."platform_settings" TO "authenticated";
+GRANT ALL ON TABLE "public"."platform_settings" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."preferred_cleaner_invitations" TO "anon";
 GRANT ALL ON TABLE "public"."preferred_cleaner_invitations" TO "authenticated";
 GRANT ALL ON TABLE "public"."preferred_cleaner_invitations" TO "service_role";
@@ -13707,6 +13774,12 @@ GRANT ALL ON TABLE "public"."preferred_cleaners" TO "service_role";
 GRANT SELECT,REFERENCES,TRIGGER,TRUNCATE,MAINTAIN ON TABLE "public"."pricing_rules" TO "anon";
 GRANT SELECT,REFERENCES,TRIGGER,TRUNCATE,MAINTAIN ON TABLE "public"."pricing_rules" TO "authenticated";
 GRANT ALL ON TABLE "public"."pricing_rules" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."reviewer_permissions" TO "anon";
+GRANT ALL ON TABLE "public"."reviewer_permissions" TO "authenticated";
+GRANT ALL ON TABLE "public"."reviewer_permissions" TO "service_role";
 
 
 
