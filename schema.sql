@@ -3265,6 +3265,11 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_applications" (
     "kyc_completed_at" timestamp with time zone,
     "kyc_provider_event" "text",
     "admin_feedback" "text",
+    "reference1_name" "text",
+    "reference1_phone" "text",
+    "reference2_name" "text",
+    "reference2_phone" "text",
+    "service_type_ids" integer[] DEFAULT '{}'::integer[],
     CONSTRAINT "cleaner_applications_kyc_status_check" CHECK (("kyc_status" = ANY (ARRAY['not_started'::"text", 'pending'::"text", 'completed'::"text", 'rejected'::"text", 'on_hold'::"text"]))),
     CONSTRAINT "cleaner_applications_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'approved'::"text", 'rejected'::"text", 'requested_info'::"text"])))
 );
