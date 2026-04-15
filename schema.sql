@@ -5549,12 +5549,12 @@ ALTER TABLE ONLY "public"."reviews"
 
 
 ALTER TABLE ONLY "public"."reviews"
-    ADD CONSTRAINT "reviews_reviewee_id_fkey" FOREIGN KEY ("reviewee_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "reviews_reviewee_id_fkey" FOREIGN KEY ("reviewee_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."reviews"
-    ADD CONSTRAINT "reviews_reviewer_id_fkey" FOREIGN KEY ("reviewer_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "reviews_reviewer_id_fkey" FOREIGN KEY ("reviewer_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -6303,6 +6303,10 @@ CREATE POLICY "users_select_own_notifications" ON "public"."notifications" FOR S
 
 
 CREATE POLICY "users_select_own_wallet" ON "public"."wallets" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_role"('admin'::"text")));
+
+
+
+CREATE POLICY "users_update_own_cleaner_application" ON "public"."cleaner_applications" FOR UPDATE TO "authenticated" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
 
 
 
