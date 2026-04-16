@@ -3238,6 +3238,21 @@ COMMENT ON COLUMN "public"."bookings"."customer_rating" IS 'Cleaner rating of cu
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."cleaner_application_drafts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "email" "text" NOT NULL,
+    "current_step" integer DEFAULT 1 NOT NULL,
+    "payload" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "last_saved_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."cleaner_application_drafts" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."cleaner_applications" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "name" "text" NOT NULL,
@@ -3270,6 +3285,8 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_applications" (
     "reference2_name" "text",
     "reference2_phone" "text",
     "service_type_ids" integer[] DEFAULT '{}'::integer[],
+    "reference3_name" "text",
+    "reference3_phone" "text",
     CONSTRAINT "cleaner_applications_kyc_status_check" CHECK (("kyc_status" = ANY (ARRAY['not_started'::"text", 'pending'::"text", 'completed'::"text", 'rejected'::"text", 'on_hold'::"text"]))),
     CONSTRAINT "cleaner_applications_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'approved'::"text", 'rejected'::"text", 'requested_info'::"text"])))
 );
@@ -4443,6 +4460,11 @@ ALTER TABLE ONLY "public"."bookings"
 
 
 
+ALTER TABLE ONLY "public"."cleaner_application_drafts"
+    ADD CONSTRAINT "cleaner_application_drafts_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."cleaner_applications"
     ADD CONSTRAINT "cleaner_applications_pkey" PRIMARY KEY ("id");
 
@@ -4809,6 +4831,10 @@ ALTER TABLE ONLY "public"."withdrawal_requests"
 
 
 CREATE INDEX "bookings_location_idx" ON "public"."bookings" USING "gist" ("location_coordinates");
+
+
+
+CREATE UNIQUE INDEX "cleaner_application_drafts_user_id_key" ON "public"."cleaner_application_drafts" USING "btree" ("user_id");
 
 
 
@@ -5335,6 +5361,11 @@ ALTER TABLE ONLY "public"."bookings"
 
 ALTER TABLE ONLY "public"."bookings"
     ADD CONSTRAINT "bookings_subscription_id_fkey" FOREIGN KEY ("subscription_id") REFERENCES "public"."subscriptions"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."cleaner_application_drafts"
+    ADD CONSTRAINT "cleaner_application_drafts_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -6035,6 +6066,9 @@ CREATE POLICY "bookings: update own" ON "public"."bookings" FOR UPDATE TO "authe
 
 
 
+ALTER TABLE "public"."cleaner_application_drafts" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."cleaner_applications" ENABLE ROW LEVEL SECURITY;
 
 
@@ -6290,11 +6324,23 @@ ALTER TABLE "public"."user_roles" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."users" ENABLE ROW LEVEL SECURITY;
 
 
+CREATE POLICY "users_delete_own_cleaner_application_draft" ON "public"."cleaner_application_drafts" FOR DELETE TO "authenticated" USING (("auth"."uid"() = "user_id"));
+
+
+
 CREATE POLICY "users_insert_own_cleaner_application" ON "public"."cleaner_applications" FOR INSERT TO "authenticated" WITH CHECK (("auth"."uid"() = "user_id"));
 
 
 
+CREATE POLICY "users_insert_own_cleaner_application_draft" ON "public"."cleaner_application_drafts" FOR INSERT TO "authenticated" WITH CHECK (("auth"."uid"() = "user_id"));
+
+
+
 CREATE POLICY "users_select_own_cleaner_application" ON "public"."cleaner_applications" FOR SELECT TO "authenticated" USING (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "users_select_own_cleaner_application_draft" ON "public"."cleaner_application_drafts" FOR SELECT TO "authenticated" USING (("auth"."uid"() = "user_id"));
 
 
 
@@ -6307,6 +6353,10 @@ CREATE POLICY "users_select_own_wallet" ON "public"."wallets" FOR SELECT TO "aut
 
 
 CREATE POLICY "users_update_own_cleaner_application" ON "public"."cleaner_applications" FOR UPDATE TO "authenticated" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "users_update_own_cleaner_application_draft" ON "public"."cleaner_application_drafts" FOR UPDATE TO "authenticated" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
 
 
 
@@ -13537,6 +13587,12 @@ GRANT ALL ON TABLE "public"."booking_timeline" TO "service_role";
 GRANT ALL ON TABLE "public"."bookings" TO "anon";
 GRANT ALL ON TABLE "public"."bookings" TO "authenticated";
 GRANT ALL ON TABLE "public"."bookings" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."cleaner_application_drafts" TO "anon";
+GRANT ALL ON TABLE "public"."cleaner_application_drafts" TO "authenticated";
+GRANT ALL ON TABLE "public"."cleaner_application_drafts" TO "service_role";
 
 
 
