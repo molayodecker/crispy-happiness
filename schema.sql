@@ -2350,33 +2350,52 @@ ALTER FUNCTION "public"."handle_new_google_user"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."handle_new_user_multi_role"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    AS $$
-BEGIN
-    -- 1. Create entry in public users table
-    INSERT INTO public.users (id, email, phone) 
-    VALUES (NEW.id, NEW.email, NEW.phone);
+    AS $$BEGIN
+    INSERT INTO public.users (id, email, phone)
+    VALUES (NEW.id, NEW.email, NEW.phone)
+    ON CONFLICT (id) DO UPDATE
+    SET
+      email = EXCLUDED.email,
+      phone = COALESCE(EXCLUDED.phone, public.users.phone);
 
-    -- 2. Create entry in unified profiles table
-    INSERT INTO public.profiles (id, user_id, firstname, lastname) 
+    INSERT INTO public.profiles (id, user_id, firstname, lastname)
     VALUES (
-        NEW.id, 
-        NEW.id, 
-        NEW.raw_user_meta_data->>'first_name', 
-        NEW.raw_user_meta_data->>'last_name'
-    );
+        NEW.id,
+        NEW.id,
+        COALESCE(
+            NULLIF(NEW.raw_user_meta_data->>'first_name', ''),
+            NULLIF(split_part(trim(NEW.raw_user_meta_data->>'name'), ' ', 1), '')
+        ),
+        COALESCE(
+            NULLIF(NEW.raw_user_meta_data->>'last_name', ''),
+            NULLIF(
+                trim(
+                    substr(
+                        trim(NEW.raw_user_meta_data->>'name'),
+                        length(split_part(trim(NEW.raw_user_meta_data->>'name'), ' ', 1)) + 2
+                    )
+                ),
+                ''
+            )
+        )
+    )
+    ON CONFLICT (id) DO UPDATE
+    SET
+      firstname = COALESCE(EXCLUDED.firstname, public.profiles.firstname),
+      lastname  = COALESCE(EXCLUDED.lastname, public.profiles.lastname);
 
-    -- 3. Assign default role from metadata or 'customer'
-    INSERT INTO public.user_roles (user_id, role_id) 
-    VALUES (NEW.id, COALESCE(NEW.raw_app_meta_data->>'role', 'customer'));
-    
-    -- 4. If metadata says cleaner, initialize professional extension table
-    IF (NEW.raw_app_meta_data->>'role' = 'cleaner') THEN
-        INSERT INTO public.cleaner_data (user_id) VALUES (NEW.id);
+    INSERT INTO public.user_roles (user_id, role_id)
+    VALUES (NEW.id, COALESCE(NEW.raw_app_meta_data->>'role', 'customer'))
+    ON CONFLICT (user_id, role_id) DO NOTHING;
+
+    IF COALESCE(NEW.raw_app_meta_data->>'role', '') = 'cleaner' THEN
+        INSERT INTO public.cleaner_data (user_id)
+        VALUES (NEW.id)
+        ON CONFLICT (user_id) DO NOTHING;
     END IF;
 
     RETURN NEW;
-END;
-$$;
+END;$$;
 
 
 ALTER FUNCTION "public"."handle_new_user_multi_role"() OWNER TO "postgres";
@@ -2769,6 +2788,70 @@ end $$;
 
 
 ALTER FUNCTION "public"."set_updated_at"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."sync_auth_user_to_public_user"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  meta_first text;
+  meta_last text;
+  meta_full text;
+begin
+  meta_first := nullif(trim(coalesce(new.raw_user_meta_data->>'first_name', '')), '');
+  meta_last := nullif(trim(coalesce(new.raw_user_meta_data->>'last_name', '')), '');
+  meta_full := nullif(
+    trim(
+      coalesce(
+        new.raw_user_meta_data->>'full_name',
+        new.raw_user_meta_data->>'name',
+        concat_ws(' ', meta_first, meta_last)
+      )
+    ),
+    ''
+  );
+
+  insert into public.users (id, email, phone, updated_at, last_updated)
+  values (new.id, new.email, new.phone, now(), now())
+  on conflict (id) do update
+  set
+    email = excluded.email,
+    phone = coalesce(excluded.phone, public.users.phone),
+    updated_at = now(),
+    last_updated = now();
+
+  insert into public.profiles (id, user_id, firstname, lastname, fullname, updated_at)
+  values (new.id, new.id, meta_first, meta_last, meta_full, now())
+  on conflict (id) do update
+  set
+    firstname = case
+      when nullif(trim(coalesce(public.profiles.firstname, '')), '') is null
+        then coalesce(excluded.firstname, public.profiles.firstname)
+      else public.profiles.firstname
+    end,
+    lastname = case
+      when nullif(trim(coalesce(public.profiles.lastname, '')), '') is null
+        then coalesce(excluded.lastname, public.profiles.lastname)
+      else public.profiles.lastname
+    end,
+    fullname = case
+      when nullif(trim(coalesce(public.profiles.fullname, '')), '') is null
+        then coalesce(excluded.fullname, public.profiles.fullname)
+      else public.profiles.fullname
+    end,
+    updated_at = now();
+
+  insert into public.user_roles (user_id, role_id)
+  values (new.id, coalesce(new.raw_app_meta_data->>'role', 'customer'))
+  on conflict (user_id, role_id) do nothing;
+
+  return new;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."sync_auth_user_to_public_user"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."trigger_paystack_on_approval"() RETURNS "trigger"
@@ -5290,6 +5373,10 @@ CREATE INDEX "timezones_geom_idx" ON "public"."timezones" USING "gist" ("geom");
 
 
 
+CREATE UNIQUE INDEX "users_phone_unique" ON "public"."users" USING "btree" ("phone") WHERE ("phone" IS NOT NULL);
+
+
+
 CREATE OR REPLACE TRIGGER "ensure_single_default_platform_fee_trigger" BEFORE INSERT OR UPDATE ON "public"."platform_fees" FOR EACH ROW WHEN (("new"."is_default" = true)) EXECUTE FUNCTION "public"."ensure_single_default_platform_fee"();
 
 
@@ -6357,6 +6444,10 @@ CREATE POLICY "users_update_own_cleaner_application" ON "public"."cleaner_applic
 
 
 CREATE POLICY "users_update_own_cleaner_application_draft" ON "public"."cleaner_application_drafts" FOR UPDATE TO "authenticated" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "users_update_own_user" ON "public"."users" FOR UPDATE TO "authenticated" USING (("auth"."uid"() = "id")) WITH CHECK (("auth"."uid"() = "id"));
 
 
 
@@ -13286,6 +13377,12 @@ GRANT ALL ON FUNCTION "public"."st_zmin"("public"."box3d") TO "postgres";
 GRANT ALL ON FUNCTION "public"."st_zmin"("public"."box3d") TO "anon";
 GRANT ALL ON FUNCTION "public"."st_zmin"("public"."box3d") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."st_zmin"("public"."box3d") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."sync_auth_user_to_public_user"() TO "anon";
+GRANT ALL ON FUNCTION "public"."sync_auth_user_to_public_user"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."sync_auth_user_to_public_user"() TO "service_role";
 
 
 
