@@ -3433,6 +3433,30 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_devices" (
 ALTER TABLE "public"."cleaner_devices" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."cleaner_leads" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "phone" "text" NOT NULL,
+    "name" "text",
+    "area" "text",
+    "experience" "text",
+    "availability" "text",
+    "step" "text" DEFAULT 'start'::"text" NOT NULL,
+    "id_media_url" "text",
+    "source" "text" DEFAULT 'whatsapp'::"text" NOT NULL,
+    "status" "text" DEFAULT 'new'::"text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "in_accra" boolean,
+    CONSTRAINT "cleaner_leads_status_check" CHECK (("status" = ANY (ARRAY['new'::"text", 'screened'::"text", 'out_of_area'::"text"]))),
+    CONSTRAINT "cleaner_leads_step_check" CHECK (("step" = ANY (ARRAY['start'::"text", 'awaiting_apply'::"text", 'name'::"text", 'accra_check'::"text", 'area'::"text", 'experience'::"text", 'availability'::"text", 'id_upload'::"text", 'completed'::"text", 'out_of_area'::"text"])))
+);
+
+ALTER TABLE ONLY "public"."cleaner_leads" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."cleaner_leads" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."cleaner_schedules" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "cleaner_id" "uuid",
@@ -4472,6 +4496,27 @@ CREATE TABLE IF NOT EXISTS "public"."wallets" (
 ALTER TABLE "public"."wallets" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."whatsapp_inbox_messages" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "direction" "text" NOT NULL,
+    "phone_e164" "text" NOT NULL,
+    "user_id" "uuid",
+    "body" "text" NOT NULL,
+    "twilio_message_sid" "text",
+    "error_detail" "text",
+    "sent_by_user_id" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "whatsapp_inbox_messages_direction_check" CHECK (("direction" = ANY (ARRAY['inbound'::"text", 'outbound'::"text"])))
+);
+
+
+ALTER TABLE "public"."whatsapp_inbox_messages" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."whatsapp_inbox_messages" IS 'WhatsApp messages mirrored from Twilio (inbound) and admin sends (outbound); no anon policies — use service role on server.';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."withdrawal_requests" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "cleaner_id" "uuid" NOT NULL,
@@ -4575,6 +4620,11 @@ ALTER TABLE ONLY "public"."cleaner_devices"
 
 ALTER TABLE ONLY "public"."cleaner_devices"
     ADD CONSTRAINT "cleaner_devices_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."cleaner_leads"
+    ADD CONSTRAINT "cleaner_leads_pkey" PRIMARY KEY ("id");
 
 
 
@@ -4898,6 +4948,16 @@ ALTER TABLE ONLY "public"."wallets"
 
 
 
+ALTER TABLE ONLY "public"."whatsapp_inbox_messages"
+    ADD CONSTRAINT "whatsapp_inbox_messages_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."whatsapp_inbox_messages"
+    ADD CONSTRAINT "whatsapp_inbox_messages_twilio_message_sid_key" UNIQUE ("twilio_message_sid");
+
+
+
 ALTER TABLE ONLY "public"."withdrawal_requests"
     ADD CONSTRAINT "withdrawal_requests_paystack_reference_key" UNIQUE ("paystack_reference");
 
@@ -4926,6 +4986,18 @@ CREATE UNIQUE INDEX "cleaner_applications_user_id_uniq" ON "public"."cleaner_app
 
 
 CREATE INDEX "cleaner_base_loc_idx" ON "public"."cleaner_data" USING "gist" ("base_location");
+
+
+
+CREATE INDEX "cleaner_leads_created_at_idx" ON "public"."cleaner_leads" USING "btree" ("created_at" DESC);
+
+
+
+CREATE UNIQUE INDEX "cleaner_leads_phone_uniq" ON "public"."cleaner_leads" USING "btree" ("phone");
+
+
+
+CREATE INDEX "cleaner_leads_status_idx" ON "public"."cleaner_leads" USING "btree" ("status");
 
 
 
@@ -5377,6 +5449,14 @@ CREATE UNIQUE INDEX "users_phone_unique" ON "public"."users" USING "btree" ("pho
 
 
 
+CREATE INDEX "whatsapp_inbox_messages_phone_created_idx" ON "public"."whatsapp_inbox_messages" USING "btree" ("phone_e164", "created_at" DESC);
+
+
+
+CREATE INDEX "whatsapp_inbox_messages_user_created_idx" ON "public"."whatsapp_inbox_messages" USING "btree" ("user_id", "created_at" DESC) WHERE ("user_id" IS NOT NULL);
+
+
+
 CREATE OR REPLACE TRIGGER "ensure_single_default_platform_fee_trigger" BEFORE INSERT OR UPDATE ON "public"."platform_fees" FOR EACH ROW WHEN (("new"."is_default" = true)) EXECUTE FUNCTION "public"."ensure_single_default_platform_fee"();
 
 
@@ -5756,6 +5836,16 @@ ALTER TABLE ONLY "public"."wallets"
 
 
 
+ALTER TABLE ONLY "public"."whatsapp_inbox_messages"
+    ADD CONSTRAINT "whatsapp_inbox_messages_sent_by_user_id_fkey" FOREIGN KEY ("sent_by_user_id") REFERENCES "public"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."whatsapp_inbox_messages"
+    ADD CONSTRAINT "whatsapp_inbox_messages_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE SET NULL;
+
+
+
 ALTER TABLE ONLY "public"."withdrawal_requests"
     ADD CONSTRAINT "withdrawal_requests_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "public"."users"("id");
 
@@ -5774,6 +5864,12 @@ CREATE POLICY "Admin update pricing_rules" ON "public"."pricing_rules" FOR UPDAT
 
 
 
+CREATE POLICY "Admins can delete cleaner leads" ON "public"."cleaner_leads" FOR DELETE TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."user_roles" "ur"
+  WHERE (("ur"."user_id" = "auth"."uid"()) AND ("ur"."role_id" = 'admin'::"text")))));
+
+
+
 CREATE POLICY "Admins can delete platform fees" ON "public"."platform_fees" FOR DELETE USING ("public"."is_platform_fee_admin"());
 
 
@@ -5788,11 +5884,25 @@ CREATE POLICY "Admins can select platform fees" ON "public"."platform_fees" FOR 
 
 
 
+CREATE POLICY "Admins can update cleaner leads" ON "public"."cleaner_leads" FOR UPDATE TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."user_roles" "ur"
+  WHERE (("ur"."user_id" = "auth"."uid"()) AND ("ur"."role_id" = 'admin'::"text"))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM "public"."user_roles" "ur"
+  WHERE (("ur"."user_id" = "auth"."uid"()) AND ("ur"."role_id" = 'admin'::"text")))));
+
+
+
 CREATE POLICY "Admins can update platform fees" ON "public"."platform_fees" FOR UPDATE USING ("public"."is_platform_fee_admin"()) WITH CHECK ("public"."is_platform_fee_admin"());
 
 
 
 CREATE POLICY "Admins can view all user roles (safe)" ON "public"."user_roles" FOR SELECT USING ("public"."is_admin"("auth"."uid"()));
+
+
+
+CREATE POLICY "Admins can view cleaner leads" ON "public"."cleaner_leads" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."user_roles" "ur"
+  WHERE (("ur"."user_id" = "auth"."uid"()) AND ("ur"."role_id" = 'admin'::"text")))));
 
 
 
@@ -5813,6 +5923,10 @@ CREATE POLICY "Allow read for authenticated" ON "public"."payment_split_config" 
 
 
 CREATE POLICY "Allow read for service role" ON "public"."payment_split_config" FOR SELECT TO "service_role" USING (true);
+
+
+
+CREATE POLICY "Authenticated users can insert cleaner leads" ON "public"."cleaner_leads" FOR INSERT TO "authenticated" WITH CHECK (true);
 
 
 
@@ -6176,6 +6290,9 @@ CREATE POLICY "cleaner_devices_cleaner_all" ON "public"."cleaner_devices" USING 
 
 
 
+ALTER TABLE "public"."cleaner_leads" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."cleaner_schedules" ENABLE ROW LEVEL SECURITY;
 
 
@@ -6484,6 +6601,9 @@ ALTER TABLE "public"."wallet_transactions" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."wallets" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."whatsapp_inbox_messages" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."withdrawal_requests" ENABLE ROW LEVEL SECURITY;
@@ -13721,6 +13841,12 @@ GRANT ALL ON TABLE "public"."cleaner_devices" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."cleaner_leads" TO "anon";
+GRANT ALL ON TABLE "public"."cleaner_leads" TO "authenticated";
+GRANT ALL ON TABLE "public"."cleaner_leads" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."cleaner_schedules" TO "anon";
 GRANT ALL ON TABLE "public"."cleaner_schedules" TO "authenticated";
 GRANT ALL ON TABLE "public"."cleaner_schedules" TO "service_role";
@@ -14048,6 +14174,12 @@ GRANT ALL ON TABLE "public"."wallet_transactions" TO "service_role";
 GRANT ALL ON TABLE "public"."wallets" TO "anon";
 GRANT ALL ON TABLE "public"."wallets" TO "authenticated";
 GRANT ALL ON TABLE "public"."wallets" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."whatsapp_inbox_messages" TO "anon";
+GRANT ALL ON TABLE "public"."whatsapp_inbox_messages" TO "authenticated";
+GRANT ALL ON TABLE "public"."whatsapp_inbox_messages" TO "service_role";
 
 
 
