@@ -134,7 +134,8 @@ CREATE TYPE "public"."notification_type" AS ENUM (
     'booking_reminder',
     'booking_cancelled',
     'cleaner_assigned',
-    'payment_received'
+    'payment_received',
+    'admin_message'
 );
 
 
@@ -3668,6 +3669,20 @@ ALTER SEQUENCE "public"."deduction_rules_id_seq" OWNED BY "public"."deduction_ru
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."device_tokens" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "token" "text" NOT NULL,
+    "platform" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "device_tokens_platform_check" CHECK (("platform" = ANY (ARRAY['ios'::"text", 'android'::"text"])))
+);
+
+
+ALTER TABLE "public"."device_tokens" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."discounts" (
     "id" integer NOT NULL,
     "service_type_id" integer,
@@ -4678,6 +4693,16 @@ ALTER TABLE ONLY "public"."deduction_rules"
 
 
 
+ALTER TABLE ONLY "public"."device_tokens"
+    ADD CONSTRAINT "device_tokens_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."device_tokens"
+    ADD CONSTRAINT "device_tokens_token_key" UNIQUE ("token");
+
+
+
 ALTER TABLE ONLY "public"."discounts"
     ADD CONSTRAINT "discounts_pkey" PRIMARY KEY ("id");
 
@@ -5177,6 +5202,14 @@ CREATE INDEX "idx_conversations_participants" ON "public"."conversations" USING 
 
 
 
+CREATE INDEX "idx_device_tokens_platform" ON "public"."device_tokens" USING "btree" ("platform");
+
+
+
+CREATE INDEX "idx_device_tokens_user_id" ON "public"."device_tokens" USING "btree" ("user_id");
+
+
+
 CREATE INDEX "idx_discounts_active_service" ON "public"."discounts" USING "btree" ("service_type_id") WHERE ("active" = true);
 
 
@@ -5608,6 +5641,11 @@ ALTER TABLE ONLY "public"."conversations"
 
 ALTER TABLE ONLY "public"."conversations"
     ADD CONSTRAINT "conversations_customer_id_fkey" FOREIGN KEY ("customer_id") REFERENCES "public"."profiles"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."device_tokens"
+    ADD CONSTRAINT "device_tokens_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -6080,6 +6118,10 @@ CREATE POLICY "admins_all_deduction_rules" ON "public"."deduction_rules" TO "aut
 
 
 
+CREATE POLICY "admins_all_device_tokens" ON "public"."device_tokens" TO "authenticated" USING ("public"."has_role"('admin'::"text")) WITH CHECK ("public"."has_role"('admin'::"text"));
+
+
+
 CREATE POLICY "admins_all_discounts" ON "public"."discounts" TO "authenticated" USING ("public"."has_role"('admin'::"text"));
 
 
@@ -6362,6 +6404,9 @@ CREATE POLICY "customers_manage_own_preferred" ON "public"."preferred_cleaners" 
 ALTER TABLE "public"."deduction_rules" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."device_tokens" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."discounts" ENABLE ROW LEVEL SECURITY;
 
 
@@ -6544,6 +6589,10 @@ CREATE POLICY "users_insert_own_cleaner_application_draft" ON "public"."cleaner_
 
 
 
+CREATE POLICY "users_manage_own_device_tokens" ON "public"."device_tokens" TO "authenticated" USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
 CREATE POLICY "users_select_own_cleaner_application" ON "public"."cleaner_applications" FOR SELECT TO "authenticated" USING (("auth"."uid"() = "user_id"));
 
 
@@ -6565,6 +6614,10 @@ CREATE POLICY "users_update_own_cleaner_application" ON "public"."cleaner_applic
 
 
 CREATE POLICY "users_update_own_cleaner_application_draft" ON "public"."cleaner_application_drafts" FOR UPDATE TO "authenticated" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "users_update_own_notifications" ON "public"."notifications" FOR UPDATE TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_role"('admin'::"text"))) WITH CHECK ((("user_id" = "auth"."uid"()) OR "public"."has_role"('admin'::"text")));
 
 
 
@@ -13916,6 +13969,12 @@ GRANT ALL ON TABLE "public"."deduction_rules" TO "service_role";
 GRANT ALL ON SEQUENCE "public"."deduction_rules_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."deduction_rules_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."deduction_rules_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."device_tokens" TO "anon";
+GRANT ALL ON TABLE "public"."device_tokens" TO "authenticated";
+GRANT ALL ON TABLE "public"."device_tokens" TO "service_role";
 
 
 
