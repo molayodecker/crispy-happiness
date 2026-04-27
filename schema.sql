@@ -38,13 +38,6 @@ CREATE EXTENSION IF NOT EXISTS "btree_gist" WITH SCHEMA "public";
 
 
 
-CREATE EXTENSION IF NOT EXISTS "pg_graphql" WITH SCHEMA "graphql";
-
-
-
-
-
-
 CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" WITH SCHEMA "extensions";
 
 
@@ -7115,9 +7108,6 @@ GRANT ALL ON FUNCTION "public"."geometry"("text") TO "postgres";
 GRANT ALL ON FUNCTION "public"."geometry"("text") TO "anon";
 GRANT ALL ON FUNCTION "public"."geometry"("text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."geometry"("text") TO "service_role";
-
-
-
 
 
 

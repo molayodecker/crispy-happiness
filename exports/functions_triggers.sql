@@ -10982,10 +10982,6 @@ CREATE TRIGGER trg_profiles_fullname BEFORE INSERT OR UPDATE OF firstname, lastn
 
 
 -- === EVENT TRIGGERS (summary; DDL in schema.sql) ===
--- graphql_watch_ddl ON ddl_command_end EXECUTE FUNCTION graphql.increment_schema_version()
-
--- graphql_watch_drop ON sql_drop EXECUTE FUNCTION graphql.increment_schema_version()
-
 -- issue_graphql_placeholder ON sql_drop EXECUTE FUNCTION set_graphql_placeholder()
 
 -- issue_pg_cron_access ON ddl_command_end EXECUTE FUNCTION grant_pg_cron_access()
