@@ -1155,8 +1155,7 @@ CREATE OR REPLACE FUNCTION public.compute_booking_pricing(p_service_id integer, 
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
  SET search_path TO 'public'
-AS $function$
-DECLARE
+AS $function$DECLARE
   v_now timestamptz := now();
   -- Stage 6 / 7: calendar math uses this IANA zone (default Accra if blank).
   v_tz text := COALESCE(NULLIF(trim(p_service_timezone), ''), 'Africa/Accra');
@@ -1261,7 +1260,7 @@ BEGIN
     r.recurring_monthly_discount_bps
   INTO v_rule
   FROM public.pricing_rules r
-  WHERE r.active = true
+  WHERE r.is_active = true
   ORDER BY r.created_at DESC
   LIMIT 1;
 
@@ -1397,8 +1396,7 @@ BEGIN
   is_weekend := v_weekend;
 
   RETURN NEXT;
-END;
-$function$
+END;$function$
 
 
 CREATE OR REPLACE FUNCTION public.contains_2d(box2df, box2df)

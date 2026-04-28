@@ -577,8 +577,7 @@ ALTER FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") OW
 CREATE OR REPLACE FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text" DEFAULT NULL::"text", "p_is_recurring" boolean DEFAULT false) RETURNS TABLE("pricing_version" "text", "currency" "text", "same_day_surcharge_bps" integer, "weekend_surcharge_bps" integer, "recurring_weekly_discount_bps" integer, "recurring_monthly_discount_bps" integer, "work_rate_ghs_per_hour" numeric, "duration_hours" numeric, "subtotal_labor_major" numeric, "platform_fee_major" numeric, "booking_cover_major" numeric, "core_amount_minor" bigint, "same_day_surcharge_minor" bigint, "weekend_surcharge_minor" bigint, "recurring_discount_minor" bigint, "final_amount_minor" bigint, "recurring_amount_minor" bigint, "first_charge_amount_minor" bigint, "discount_rate_bps" integer, "is_same_day" boolean, "is_weekend" boolean)
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
-    AS $$
-DECLARE
+    AS $$DECLARE
   v_now timestamptz := now();
   -- Stage 6 / 7: calendar math uses this IANA zone (default Accra if blank).
   v_tz text := COALESCE(NULLIF(trim(p_service_timezone), ''), 'Africa/Accra');
@@ -683,7 +682,7 @@ BEGIN
     r.recurring_monthly_discount_bps
   INTO v_rule
   FROM public.pricing_rules r
-  WHERE r.active = true
+  WHERE r.is_active = true
   ORDER BY r.created_at DESC
   LIMIT 1;
 
@@ -819,8 +818,7 @@ BEGIN
   is_weekend := v_weekend;
 
   RETURN NEXT;
-END;
-$$;
+END;$$;
 
 
 ALTER FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean) OWNER TO "postgres";
@@ -3364,6 +3362,9 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_applications" (
     "service_type_ids" integer[] DEFAULT '{}'::integer[],
     "reference3_name" "text",
     "reference3_phone" "text",
+    "reference1_relationship" "text",
+    "reference2_relationship" "text",
+    "reference3_relationship" "text",
     CONSTRAINT "cleaner_applications_kyc_status_check" CHECK (("kyc_status" = ANY (ARRAY['not_started'::"text", 'pending'::"text", 'completed'::"text", 'rejected'::"text", 'on_hold'::"text"]))),
     CONSTRAINT "cleaner_applications_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'approved'::"text", 'rejected'::"text", 'requested_info'::"text"])))
 );
@@ -3494,7 +3495,8 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_verifications" (
     "bio" "text",
     "service_area" "text",
     "status" "text" DEFAULT 'pending'::"text",
-    "created_at" timestamp with time zone DEFAULT "now"()
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "date_of_birth" "date"
 );
 
 
@@ -4440,6 +4442,29 @@ CREATE TABLE IF NOT EXISTS "public"."transactions" (
 ALTER TABLE "public"."transactions" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."user_login_sessions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "user_email" "text",
+    "ip_address" "text",
+    "user_agent" "text",
+    "browser_label" "text",
+    "os_label" "text",
+    "country" "text",
+    "region" "text",
+    "city" "text",
+    "location_display" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."user_login_sessions" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."user_login_sessions" IS 'Append-only sign-in audit (IP, UA, coarse geo). Filled by app API; readable by super admins via service role.';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."user_roles" (
     "user_id" "uuid" NOT NULL,
     "role_id" "text" NOT NULL
@@ -4931,6 +4956,11 @@ ALTER TABLE ONLY "public"."transactions"
 
 
 
+ALTER TABLE ONLY "public"."user_login_sessions"
+    ADD CONSTRAINT "user_login_sessions_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."user_roles"
     ADD CONSTRAINT "user_roles_pkey" PRIMARY KEY ("user_id", "role_id");
 
@@ -4996,6 +5026,14 @@ CREATE INDEX "bookings_location_idx" ON "public"."bookings" USING "gist" ("locat
 
 
 CREATE UNIQUE INDEX "cleaner_application_drafts_user_id_key" ON "public"."cleaner_application_drafts" USING "btree" ("user_id");
+
+
+
+CREATE UNIQUE INDEX "cleaner_applications_email_uniq" ON "public"."cleaner_applications" USING "btree" ("lower"("email"));
+
+
+
+CREATE UNIQUE INDEX "cleaner_applications_phone_uniq" ON "public"."cleaner_applications" USING "btree" ("phone");
 
 
 
@@ -5471,6 +5509,14 @@ CREATE INDEX "timezones_geom_idx" ON "public"."timezones" USING "gist" ("geom");
 
 
 
+CREATE INDEX "user_login_sessions_created_at_idx" ON "public"."user_login_sessions" USING "btree" ("created_at" DESC);
+
+
+
+CREATE INDEX "user_login_sessions_user_id_idx" ON "public"."user_login_sessions" USING "btree" ("user_id");
+
+
+
 CREATE UNIQUE INDEX "users_phone_unique" ON "public"."users" USING "btree" ("phone") WHERE ("phone" IS NOT NULL);
 
 
@@ -5819,6 +5865,11 @@ ALTER TABLE ONLY "public"."transactions"
 
 ALTER TABLE ONLY "public"."transactions"
     ADD CONSTRAINT "transactions_user_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."user_login_sessions"
+    ADD CONSTRAINT "user_login_sessions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -6562,6 +6613,9 @@ ALTER TABLE "public"."transactions" ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "update_own_profile" ON "public"."profiles" FOR UPDATE TO "authenticated" USING (("auth"."uid"() = "id")) WITH CHECK (("auth"."uid"() = "id"));
 
+
+
+ALTER TABLE "public"."user_login_sessions" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."user_roles" ENABLE ROW LEVEL SECURITY;
@@ -14193,6 +14247,12 @@ GRANT ALL ON SEQUENCE "public"."timezones_gid_seq" TO "service_role";
 GRANT ALL ON TABLE "public"."transactions" TO "anon";
 GRANT ALL ON TABLE "public"."transactions" TO "authenticated";
 GRANT ALL ON TABLE "public"."transactions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."user_login_sessions" TO "anon";
+GRANT ALL ON TABLE "public"."user_login_sessions" TO "authenticated";
+GRANT ALL ON TABLE "public"."user_login_sessions" TO "service_role";
 
 
 
