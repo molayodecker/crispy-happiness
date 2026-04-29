@@ -1399,6 +1399,69 @@ BEGIN
 END;$function$
 
 
+CREATE OR REPLACE FUNCTION public.compute_ghana_phone_variants(raw_phone text)
+ RETURNS TABLE(phone_e164 text, phone_variants text[])
+ LANGUAGE plpgsql
+ IMMUTABLE
+AS $function$
+declare
+  cleaned text;
+  digits text;
+  national text;
+begin
+  cleaned := nullif(regexp_replace(coalesce(raw_phone, ''), '[[:space:]-]', '', 'g'), '');
+
+  if cleaned is null or position('@' in cleaned) > 0 then
+    return query select null::text, '{}'::text[];
+    return;
+  end if;
+
+  digits := case
+    when left(cleaned, 1) = '+' then substring(cleaned from 2)
+    else cleaned
+  end;
+
+  if digits !~ '^\d+$' then
+    return query select null::text, '{}'::text[];
+    return;
+  end if;
+
+  if digits like '233%' and char_length(digits) >= 12 then
+    phone_e164 := '+' || digits;
+  elsif digits like '0%' and char_length(digits) = 10 then
+    phone_e164 := '+233' || substring(digits from 2);
+  elsif char_length(digits) = 9 then
+    phone_e164 := '+233' || digits;
+  else
+    return query
+    select cleaned, array[cleaned]::text[];
+    return;
+  end if;
+
+  digits := substring(phone_e164 from 2);
+  national := case
+    when digits like '233%' then substring(digits from 4)
+    else digits
+  end;
+
+  phone_variants := array(
+    select distinct variant
+    from unnest(
+      array[
+        phone_e164,
+        digits,
+        national,
+        '0' || national
+      ]
+    ) as variant
+    where variant is not null and variant <> ''
+  );
+
+  return next;
+end;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.contains_2d(box2df, box2df)
  RETURNS boolean
  LANGUAGE c
@@ -6852,6 +6915,108 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.refresh_auth_identity_lookup(target_user_id uuid)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'auth'
+AS $function$
+declare
+  auth_user auth.users%rowtype;
+  normalized_email text;
+  computed_phone_e164 text;
+  computed_phone_variants text[];
+  identity_providers text[];
+  metadata_providers text[];
+  merged_providers text[];
+begin
+  select *
+  into auth_user
+  from auth.users
+  where id = target_user_id;
+
+  if not found then
+    delete from public.auth_identity_lookup where user_id = target_user_id;
+    return;
+  end if;
+
+  normalized_email := nullif(lower(trim(coalesce(auth_user.email, ''))), '');
+
+  select
+    coalesce(v.phone_e164, null),
+    coalesce(v.phone_variants, '{}'::text[])
+  into
+    computed_phone_e164,
+    computed_phone_variants
+  from public.compute_ghana_phone_variants(auth_user.phone) as v;
+
+  select
+    coalesce(
+      array_agg(distinct lower(trim(i.provider)))
+        filter (where i.provider is not null and trim(i.provider) <> ''),
+      '{}'::text[]
+    )
+  into identity_providers
+  from auth.identities i
+  where i.user_id = target_user_id;
+
+  if jsonb_typeof(auth_user.raw_app_meta_data -> 'providers') = 'array' then
+    select
+      coalesce(
+        array_agg(distinct lower(trim(provider_value)))
+          filter (where provider_value is not null and trim(provider_value) <> ''),
+        '{}'::text[]
+      )
+    into metadata_providers
+    from jsonb_array_elements_text(auth_user.raw_app_meta_data -> 'providers') as provider_value;
+  elsif nullif(trim(coalesce(auth_user.raw_app_meta_data ->> 'provider', '')), '') is not null then
+    metadata_providers := array[lower(trim(auth_user.raw_app_meta_data ->> 'provider'))];
+  else
+    metadata_providers := '{}'::text[];
+  end if;
+
+  select
+    coalesce(
+      array_agg(distinct provider_value)
+        filter (where provider_value is not null and trim(provider_value) <> ''),
+      '{}'::text[]
+    )
+  into merged_providers
+  from unnest(coalesce(identity_providers, '{}'::text[]) || coalesce(metadata_providers, '{}'::text[])) as provider_value;
+
+  insert into public.auth_identity_lookup (
+    user_id,
+    email,
+    email_normalized,
+    phone,
+    phone_e164,
+    phone_variants,
+    providers,
+    updated_at
+  )
+  values (
+    auth_user.id,
+    auth_user.email,
+    normalized_email,
+    auth_user.phone,
+    computed_phone_e164,
+    coalesce(computed_phone_variants, '{}'::text[]),
+    coalesce(merged_providers, '{}'::text[]),
+    now()
+  )
+  on conflict (user_id) do update
+  set
+    email = excluded.email,
+    email_normalized = excluded.email_normalized,
+    phone = excluded.phone,
+    phone_e164 = excluded.phone_e164,
+    phone_variants = excluded.phone_variants,
+    providers = excluded.providers,
+    updated_at = now();
+end;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.release_cleaner_after_15min_hold()
  RETURNS integer
  LANGUAGE plpgsql
@@ -10332,6 +10497,32 @@ CREATE OR REPLACE FUNCTION public.st_zmin(box3d)
 AS '$libdir/postgis-3', $function$BOX3D_zmin$function$
 
 
+CREATE OR REPLACE FUNCTION public.sync_auth_identity_lookup_from_auth_identities()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'auth'
+AS $function$
+begin
+  perform public.refresh_auth_identity_lookup(coalesce(new.user_id, old.user_id));
+  return coalesce(new, old);
+end;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.sync_auth_identity_lookup_from_auth_users()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'auth'
+AS $function$
+begin
+  perform public.refresh_auth_identity_lookup(coalesce(new.id, old.id));
+  return coalesce(new, old);
+end;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.sync_auth_user_to_public_user()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -10950,9 +11141,13 @@ $function$
 
 
 -- === TRIGGERS ===
+CREATE TRIGGER on_auth_identity_lookup_sync AFTER INSERT OR DELETE OR UPDATE ON auth.identities FOR EACH ROW EXECUTE FUNCTION sync_auth_identity_lookup_from_auth_identities();
+
 CREATE TRIGGER on_auth_user_created AFTER INSERT ON auth.users FOR EACH ROW EXECUTE FUNCTION handle_new_user_multi_role();
 
 CREATE TRIGGER on_auth_user_google_sync AFTER INSERT ON auth.users FOR EACH ROW WHEN ((new.raw_app_meta_data ->> 'provider'::text) = 'google'::text) EXECUTE FUNCTION handle_new_google_user();
+
+CREATE TRIGGER on_auth_user_identity_lookup_sync AFTER INSERT OR DELETE OR UPDATE ON auth.users FOR EACH ROW EXECUTE FUNCTION sync_auth_identity_lookup_from_auth_users();
 
 CREATE TRIGGER on_auth_user_updated_sync_public AFTER UPDATE ON auth.users FOR EACH ROW EXECUTE FUNCTION sync_auth_user_to_public_user();
 

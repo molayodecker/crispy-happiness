@@ -828,6 +828,70 @@ COMMENT ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "
 
 
 
+CREATE OR REPLACE FUNCTION "public"."compute_ghana_phone_variants"("raw_phone" "text") RETURNS TABLE("phone_e164" "text", "phone_variants" "text"[])
+    LANGUAGE "plpgsql" IMMUTABLE
+    AS $_$
+declare
+  cleaned text;
+  digits text;
+  national text;
+begin
+  cleaned := nullif(regexp_replace(coalesce(raw_phone, ''), '[[:space:]-]', '', 'g'), '');
+
+  if cleaned is null or position('@' in cleaned) > 0 then
+    return query select null::text, '{}'::text[];
+    return;
+  end if;
+
+  digits := case
+    when left(cleaned, 1) = '+' then substring(cleaned from 2)
+    else cleaned
+  end;
+
+  if digits !~ '^\d+$' then
+    return query select null::text, '{}'::text[];
+    return;
+  end if;
+
+  if digits like '233%' and char_length(digits) >= 12 then
+    phone_e164 := '+' || digits;
+  elsif digits like '0%' and char_length(digits) = 10 then
+    phone_e164 := '+233' || substring(digits from 2);
+  elsif char_length(digits) = 9 then
+    phone_e164 := '+233' || digits;
+  else
+    return query
+    select cleaned, array[cleaned]::text[];
+    return;
+  end if;
+
+  digits := substring(phone_e164 from 2);
+  national := case
+    when digits like '233%' then substring(digits from 4)
+    else digits
+  end;
+
+  phone_variants := array(
+    select distinct variant
+    from unnest(
+      array[
+        phone_e164,
+        digits,
+        national,
+        '0' || national
+      ]
+    ) as variant
+    where variant is not null and variant <> ''
+  );
+
+  return next;
+end;
+$_$;
+
+
+ALTER FUNCTION "public"."compute_ghana_phone_variants"("raw_phone" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text" DEFAULT NULL::"text", "p_invitee_phone_e164" "text" DEFAULT NULL::"text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -2610,6 +2674,109 @@ $$;
 ALTER FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."refresh_auth_identity_lookup"("target_user_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth'
+    AS $$
+declare
+  auth_user auth.users%rowtype;
+  normalized_email text;
+  computed_phone_e164 text;
+  computed_phone_variants text[];
+  identity_providers text[];
+  metadata_providers text[];
+  merged_providers text[];
+begin
+  select *
+  into auth_user
+  from auth.users
+  where id = target_user_id;
+
+  if not found then
+    delete from public.auth_identity_lookup where user_id = target_user_id;
+    return;
+  end if;
+
+  normalized_email := nullif(lower(trim(coalesce(auth_user.email, ''))), '');
+
+  select
+    coalesce(v.phone_e164, null),
+    coalesce(v.phone_variants, '{}'::text[])
+  into
+    computed_phone_e164,
+    computed_phone_variants
+  from public.compute_ghana_phone_variants(auth_user.phone) as v;
+
+  select
+    coalesce(
+      array_agg(distinct lower(trim(i.provider)))
+        filter (where i.provider is not null and trim(i.provider) <> ''),
+      '{}'::text[]
+    )
+  into identity_providers
+  from auth.identities i
+  where i.user_id = target_user_id;
+
+  if jsonb_typeof(auth_user.raw_app_meta_data -> 'providers') = 'array' then
+    select
+      coalesce(
+        array_agg(distinct lower(trim(provider_value)))
+          filter (where provider_value is not null and trim(provider_value) <> ''),
+        '{}'::text[]
+      )
+    into metadata_providers
+    from jsonb_array_elements_text(auth_user.raw_app_meta_data -> 'providers') as provider_value;
+  elsif nullif(trim(coalesce(auth_user.raw_app_meta_data ->> 'provider', '')), '') is not null then
+    metadata_providers := array[lower(trim(auth_user.raw_app_meta_data ->> 'provider'))];
+  else
+    metadata_providers := '{}'::text[];
+  end if;
+
+  select
+    coalesce(
+      array_agg(distinct provider_value)
+        filter (where provider_value is not null and trim(provider_value) <> ''),
+      '{}'::text[]
+    )
+  into merged_providers
+  from unnest(coalesce(identity_providers, '{}'::text[]) || coalesce(metadata_providers, '{}'::text[])) as provider_value;
+
+  insert into public.auth_identity_lookup (
+    user_id,
+    email,
+    email_normalized,
+    phone,
+    phone_e164,
+    phone_variants,
+    providers,
+    updated_at
+  )
+  values (
+    auth_user.id,
+    auth_user.email,
+    normalized_email,
+    auth_user.phone,
+    computed_phone_e164,
+    coalesce(computed_phone_variants, '{}'::text[]),
+    coalesce(merged_providers, '{}'::text[]),
+    now()
+  )
+  on conflict (user_id) do update
+  set
+    email = excluded.email,
+    email_normalized = excluded.email_normalized,
+    phone = excluded.phone,
+    phone_e164 = excluded.phone_e164,
+    phone_variants = excluded.phone_variants,
+    providers = excluded.providers,
+    updated_at = now();
+end;
+$$;
+
+
+ALTER FUNCTION "public"."refresh_auth_identity_lookup"("target_user_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."release_cleaner_after_15min_hold"() RETURNS integer
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -2780,6 +2947,34 @@ end $$;
 
 
 ALTER FUNCTION "public"."set_updated_at"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."sync_auth_identity_lookup_from_auth_identities"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth'
+    AS $$
+begin
+  perform public.refresh_auth_identity_lookup(coalesce(new.user_id, old.user_id));
+  return coalesce(new, old);
+end;
+$$;
+
+
+ALTER FUNCTION "public"."sync_auth_identity_lookup_from_auth_identities"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."sync_auth_identity_lookup_from_auth_users"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth'
+    AS $$
+begin
+  perform public.refresh_auth_identity_lookup(coalesce(new.id, old.id));
+  return coalesce(new, old);
+end;
+$$;
+
+
+ALTER FUNCTION "public"."sync_auth_identity_lookup_from_auth_users"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."sync_auth_user_to_public_user"() RETURNS "trigger"
@@ -3195,6 +3390,22 @@ $_$;
 
 
 ALTER FUNCTION "public"."validate_booking_timeslot_24h_debug"("p_start_time_24h" "text", "p_duration_hours" numeric, "p_booking_date" "date", "p_timezone" "text") OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."auth_identity_lookup" (
+    "user_id" "uuid" NOT NULL,
+    "email" "text",
+    "email_normalized" "text",
+    "phone" "text",
+    "phone_e164" "text",
+    "phone_variants" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
+    "providers" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."auth_identity_lookup" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."availability" (
@@ -4596,6 +4807,11 @@ ALTER TABLE ONLY "public"."timezones" ALTER COLUMN "gid" SET DEFAULT "nextval"('
 
 
 
+ALTER TABLE ONLY "public"."auth_identity_lookup"
+    ADD CONSTRAINT "auth_identity_lookup_pkey" PRIMARY KEY ("user_id");
+
+
+
 ALTER TABLE ONLY "public"."availability"
     ADD CONSTRAINT "availability_pkey" PRIMARY KEY ("id");
 
@@ -5018,6 +5234,22 @@ ALTER TABLE ONLY "public"."withdrawal_requests"
 
 ALTER TABLE ONLY "public"."withdrawal_requests"
     ADD CONSTRAINT "withdrawal_requests_pkey" PRIMARY KEY ("id");
+
+
+
+CREATE INDEX "auth_identity_lookup_email_normalized_idx" ON "public"."auth_identity_lookup" USING "btree" ("email_normalized");
+
+
+
+CREATE INDEX "auth_identity_lookup_phone_e164_idx" ON "public"."auth_identity_lookup" USING "btree" ("phone_e164");
+
+
+
+CREATE INDEX "auth_identity_lookup_phone_variants_idx" ON "public"."auth_identity_lookup" USING "gin" ("phone_variants");
+
+
+
+CREATE INDEX "auth_identity_lookup_providers_idx" ON "public"."auth_identity_lookup" USING "gin" ("providers");
 
 
 
@@ -5570,6 +5802,11 @@ CREATE OR REPLACE TRIGGER "trigger_update_cleaner_availability_exceptions_update
 
 
 CREATE OR REPLACE TRIGGER "update_platform_fees_updated_at" BEFORE UPDATE ON "public"."platform_fees" FOR EACH ROW EXECUTE FUNCTION "public"."update_platform_fees_updated_at"();
+
+
+
+ALTER TABLE ONLY "public"."auth_identity_lookup"
+    ADD CONSTRAINT "auth_identity_lookup_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -6316,6 +6553,9 @@ CREATE POLICY "anyone_read_service_categories" ON "public"."service_categories" 
 
 CREATE POLICY "anyone_read_service_types" ON "public"."service_types" FOR SELECT USING (true);
 
+
+
+ALTER TABLE "public"."auth_identity_lookup" ENABLE ROW LEVEL SECURITY;
 
 
 CREATE POLICY "authenticated_read_invite_codes" ON "public"."invite_codes" FOR SELECT TO "authenticated" USING (true);
@@ -7782,6 +8022,12 @@ GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uu
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean) TO "anon";
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."compute_ghana_phone_variants"("raw_phone" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."compute_ghana_phone_variants"("raw_phone" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."compute_ghana_phone_variants"("raw_phone" "text") TO "service_role";
 
 
 
@@ -10634,6 +10880,12 @@ GRANT ALL ON FUNCTION "public"."postgis_wagyu_version"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") TO "anon";
 GRANT ALL ON FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."refresh_auth_identity_lookup"("target_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."refresh_auth_identity_lookup"("target_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."refresh_auth_identity_lookup"("target_user_id" "uuid") TO "service_role";
 
 
 
@@ -13601,6 +13853,18 @@ GRANT ALL ON FUNCTION "public"."st_zmin"("public"."box3d") TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."sync_auth_identity_lookup_from_auth_identities"() TO "anon";
+GRANT ALL ON FUNCTION "public"."sync_auth_identity_lookup_from_auth_identities"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."sync_auth_identity_lookup_from_auth_identities"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."sync_auth_identity_lookup_from_auth_users"() TO "anon";
+GRANT ALL ON FUNCTION "public"."sync_auth_identity_lookup_from_auth_users"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."sync_auth_identity_lookup_from_auth_users"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."sync_auth_user_to_public_user"() TO "anon";
 GRANT ALL ON FUNCTION "public"."sync_auth_user_to_public_user"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."sync_auth_user_to_public_user"() TO "service_role";
@@ -13875,6 +14139,12 @@ GRANT ALL ON FUNCTION "public"."st_union"("public"."geometry", double precision)
 
 
 
+
+
+
+GRANT ALL ON TABLE "public"."auth_identity_lookup" TO "anon";
+GRANT ALL ON TABLE "public"."auth_identity_lookup" TO "authenticated";
+GRANT ALL ON TABLE "public"."auth_identity_lookup" TO "service_role";
 
 
 
