@@ -2596,6 +2596,101 @@ $$;
 ALTER FUNCTION "public"."is_platform_fee_admin"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."lookup_sign_in_account"("lookup_identifier" "text") RETURNS TABLE("has_account" boolean, "matched_by" "text", "user_id" "uuid", "providers" "text"[], "supports_email_password" boolean, "supports_phone_otp" boolean, "email" "text", "phone_e164" "text")
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  normalized_identifier text := nullif(trim(coalesce(lookup_identifier, '')), '');
+  computed_phone_e164 text;
+  computed_phone_variants text[];
+begin
+  if normalized_identifier is null then
+    return query
+    select
+      false,
+      null::text,
+      null::uuid,
+      '{}'::text[],
+      false,
+      false,
+      null::text,
+      null::text;
+    return;
+  end if;
+
+  if position('@' in normalized_identifier) > 0 then
+    return query
+    select
+      true,
+      'email'::text,
+      ail.user_id,
+      ail.providers,
+      coalesce('email' = any(ail.providers), false),
+      coalesce('phone' = any(ail.providers), false),
+      ail.email,
+      ail.phone_e164
+    from public.auth_identity_lookup ail
+    where ail.email_normalized = lower(normalized_identifier)
+    order by ail.updated_at desc
+    limit 1;
+
+    if found then
+      return;
+    end if;
+  else
+    select
+      phone_e164,
+      phone_variants
+    into
+      computed_phone_e164,
+      computed_phone_variants
+    from public.compute_ghana_phone_variants(normalized_identifier);
+
+    return query
+    select
+      true,
+      'phone'::text,
+      ail.user_id,
+      ail.providers,
+      coalesce('email' = any(ail.providers), false),
+      coalesce('phone' = any(ail.providers), false),
+      ail.email,
+      ail.phone_e164
+    from public.auth_identity_lookup ail
+    where
+      (computed_phone_e164 is not null and ail.phone_e164 = computed_phone_e164)
+      or (
+        coalesce(array_length(computed_phone_variants, 1), 0) > 0
+        and ail.phone_variants && computed_phone_variants
+      )
+    order by
+      case when computed_phone_e164 is not null and ail.phone_e164 = computed_phone_e164 then 0 else 1 end,
+      ail.updated_at desc
+    limit 1;
+
+    if found then
+      return;
+    end if;
+  end if;
+
+  return query
+  select
+    false,
+    null::text,
+    null::uuid,
+    '{}'::text[],
+    false,
+    false,
+    null::text,
+    null::text;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."lookup_sign_in_account"("lookup_identifier" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."manage_base_durations"("action" "text", "duration_id" "text" DEFAULT NULL::"text", "new_hours" numeric DEFAULT NULL::numeric) RETURNS TABLE("id" "text", "label" "text", "hours" numeric)
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
@@ -3921,6 +4016,21 @@ ALTER SEQUENCE "public"."discounts_id_seq" OWNED BY "public"."discounts"."id";
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."email_signup_tokens" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "email" "text" NOT NULL,
+    "token_hash" "text" NOT NULL,
+    "return_url" "text",
+    "expires_at" timestamp with time zone NOT NULL,
+    "used_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."email_signup_tokens" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."email_verifications" (
     "id" "uuid" DEFAULT "extensions"."uuid_generate_v4"() NOT NULL,
     "email" "text" NOT NULL,
@@ -4942,6 +5052,11 @@ ALTER TABLE ONLY "public"."discounts"
 
 
 
+ALTER TABLE ONLY "public"."email_signup_tokens"
+    ADD CONSTRAINT "email_signup_tokens_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."email_verifications"
     ADD CONSTRAINT "email_verifications_pkey" PRIMARY KEY ("id");
 
@@ -5286,6 +5401,22 @@ CREATE UNIQUE INDEX "cleaner_leads_phone_uniq" ON "public"."cleaner_leads" USING
 
 
 CREATE INDEX "cleaner_leads_status_idx" ON "public"."cleaner_leads" USING "btree" ("status");
+
+
+
+CREATE INDEX "email_signup_tokens_email_idx" ON "public"."email_signup_tokens" USING "btree" ("email");
+
+
+
+CREATE INDEX "email_signup_tokens_expires_at_idx" ON "public"."email_signup_tokens" USING "btree" ("expires_at");
+
+
+
+CREATE UNIQUE INDEX "email_signup_tokens_token_hash_idx" ON "public"."email_signup_tokens" USING "btree" ("token_hash");
+
+
+
+CREATE INDEX "email_signup_tokens_user_id_idx" ON "public"."email_signup_tokens" USING "btree" ("user_id");
 
 
 
@@ -5927,6 +6058,11 @@ ALTER TABLE ONLY "public"."device_tokens"
 
 ALTER TABLE ONLY "public"."discounts"
     ADD CONSTRAINT "discounts_service_type_id_fkey" FOREIGN KEY ("service_type_id") REFERENCES "public"."service_types"("id");
+
+
+
+ALTER TABLE ONLY "public"."email_signup_tokens"
+    ADD CONSTRAINT "email_signup_tokens_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -6692,6 +6828,9 @@ ALTER TABLE "public"."device_tokens" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."discounts" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."email_signup_tokens" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."extra_tasks" ENABLE ROW LEVEL SECURITY;
@@ -10337,6 +10476,12 @@ GRANT ALL ON FUNCTION "public"."longtransactionsenabled"() TO "postgres";
 GRANT ALL ON FUNCTION "public"."longtransactionsenabled"() TO "anon";
 GRANT ALL ON FUNCTION "public"."longtransactionsenabled"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."longtransactionsenabled"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."lookup_sign_in_account"("lookup_identifier" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."lookup_sign_in_account"("lookup_identifier" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."lookup_sign_in_account"("lookup_identifier" "text") TO "service_role";
 
 
 
@@ -14142,8 +14287,6 @@ GRANT ALL ON FUNCTION "public"."st_union"("public"."geometry", double precision)
 
 
 
-GRANT ALL ON TABLE "public"."auth_identity_lookup" TO "anon";
-GRANT ALL ON TABLE "public"."auth_identity_lookup" TO "authenticated";
 GRANT ALL ON TABLE "public"."auth_identity_lookup" TO "service_role";
 
 
@@ -14301,6 +14444,12 @@ GRANT ALL ON TABLE "public"."discounts" TO "service_role";
 GRANT ALL ON SEQUENCE "public"."discounts_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."discounts_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."discounts_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."email_signup_tokens" TO "anon";
+GRANT ALL ON TABLE "public"."email_signup_tokens" TO "authenticated";
+GRANT ALL ON TABLE "public"."email_signup_tokens" TO "service_role";
 
 
 

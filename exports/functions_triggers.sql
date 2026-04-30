@@ -5681,6 +5681,100 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.lookup_sign_in_account(lookup_identifier text)
+ RETURNS TABLE(has_account boolean, matched_by text, user_id uuid, providers text[], supports_email_password boolean, supports_phone_otp boolean, email text, phone_e164 text)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+declare
+  normalized_identifier text := nullif(trim(coalesce(lookup_identifier, '')), '');
+  computed_phone_e164 text;
+  computed_phone_variants text[];
+begin
+  if normalized_identifier is null then
+    return query
+    select
+      false,
+      null::text,
+      null::uuid,
+      '{}'::text[],
+      false,
+      false,
+      null::text,
+      null::text;
+    return;
+  end if;
+
+  if position('@' in normalized_identifier) > 0 then
+    return query
+    select
+      true,
+      'email'::text,
+      ail.user_id,
+      ail.providers,
+      coalesce('email' = any(ail.providers), false),
+      coalesce('phone' = any(ail.providers), false),
+      ail.email,
+      ail.phone_e164
+    from public.auth_identity_lookup ail
+    where ail.email_normalized = lower(normalized_identifier)
+    order by ail.updated_at desc
+    limit 1;
+
+    if found then
+      return;
+    end if;
+  else
+    select
+      phone_e164,
+      phone_variants
+    into
+      computed_phone_e164,
+      computed_phone_variants
+    from public.compute_ghana_phone_variants(normalized_identifier);
+
+    return query
+    select
+      true,
+      'phone'::text,
+      ail.user_id,
+      ail.providers,
+      coalesce('email' = any(ail.providers), false),
+      coalesce('phone' = any(ail.providers), false),
+      ail.email,
+      ail.phone_e164
+    from public.auth_identity_lookup ail
+    where
+      (computed_phone_e164 is not null and ail.phone_e164 = computed_phone_e164)
+      or (
+        coalesce(array_length(computed_phone_variants, 1), 0) > 0
+        and ail.phone_variants && computed_phone_variants
+      )
+    order by
+      case when computed_phone_e164 is not null and ail.phone_e164 = computed_phone_e164 then 0 else 1 end,
+      ail.updated_at desc
+    limit 1;
+
+    if found then
+      return;
+    end if;
+  end if;
+
+  return query
+  select
+    false,
+    null::text,
+    null::uuid,
+    '{}'::text[],
+    false,
+    false,
+    null::text,
+    null::text;
+end;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.manage_base_durations(action text, duration_id text DEFAULT NULL::text, new_hours numeric DEFAULT NULL::numeric)
  RETURNS TABLE(id text, label text, hours numeric)
  LANGUAGE plpgsql
