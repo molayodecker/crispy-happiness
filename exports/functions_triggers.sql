@@ -1399,6 +1399,23 @@ BEGIN
 END;$function$
 
 
+CREATE OR REPLACE FUNCTION public.compute_booking_scheduled_at_utc()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+begin
+  if new.scheduled_date is null or new.scheduled_time is null then
+    new.scheduled_at_utc := null;
+  else
+    new.scheduled_at_utc :=
+      ((new.scheduled_date::date + new.scheduled_time::time)
+        at time zone coalesce(nullif(new.timezone_name, ''), 'Africa/Accra'));
+  end if;
+  return new;
+end;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.compute_ghana_phone_variants(raw_phone text)
  RETURNS TABLE(phone_e164 text, phone_variants text[])
  LANGUAGE plpgsql
@@ -5320,6 +5337,40 @@ CREATE OR REPLACE FUNCTION public.gserialized_gist_sel_nd(internal, oid, interna
 AS '$libdir/postgis-3', $function$gserialized_gist_sel_nd$function$
 
 
+CREATE OR REPLACE FUNCTION public.guard_booking_payment_status_writes()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+begin
+  -- Service-role calls (Paystack webhook, admin scripts) bypass entirely.
+  if auth.role() = 'service_role' then
+    return new;
+  end if;
+
+  -- Non-service-role callers cannot transition payment_status to a privileged value.
+  if new.payment_status is distinct from old.payment_status
+     and new.payment_status in ('paid', 'refunded') then
+    raise exception
+      'payment_status transitions to % are server-only (use the Paystack webhook)',
+      new.payment_status
+      using errcode = '42501'; -- insufficient_privilege
+  end if;
+
+  -- Once a booking is paid, the column is locked for non-service-role callers.
+  -- This prevents a customer from "unpaying" their own booking by writing
+  -- `payment_status = 'failed'` after the webhook has confirmed the charge.
+  if old.payment_status = 'paid'
+     and new.payment_status is distinct from old.payment_status then
+    raise exception
+      'cannot change payment_status of a paid booking from client'
+      using errcode = '42501';
+  end if;
+
+  return new;
+end;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.handle_job_completion()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -7006,6 +7057,28 @@ BEGIN
 
     RETURN v_new_transaction;
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.record_lookup_attempt(p_scope text, p_key text, p_max_attempts integer, p_window_seconds integer)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+declare
+  bucket  timestamptz := date_trunc('second', now())
+                       - (extract(epoch from now())::bigint % p_window_seconds) * interval '1 second';
+  current integer;
+begin
+  insert into public.auth_lookup_rate_limit (scope, key, window_start, attempts)
+  values (p_scope, p_key, bucket, 1)
+  on conflict (scope, key, window_start)
+  do update set attempts = public.auth_lookup_rate_limit.attempts + 1
+  returning attempts into current;
+
+  return current > p_max_attempts;
+end;
 $function$
 
 
@@ -11244,6 +11317,10 @@ CREATE TRIGGER on_auth_user_google_sync AFTER INSERT ON auth.users FOR EACH ROW 
 CREATE TRIGGER on_auth_user_identity_lookup_sync AFTER INSERT OR DELETE OR UPDATE ON auth.users FOR EACH ROW EXECUTE FUNCTION sync_auth_identity_lookup_from_auth_users();
 
 CREATE TRIGGER on_auth_user_updated_sync_public AFTER UPDATE ON auth.users FOR EACH ROW EXECUTE FUNCTION sync_auth_user_to_public_user();
+
+CREATE TRIGGER bookings_compute_scheduled_at_utc BEFORE INSERT OR UPDATE OF scheduled_date, scheduled_time, timezone_name ON bookings FOR EACH ROW EXECUTE FUNCTION compute_booking_scheduled_at_utc();
+
+CREATE TRIGGER bookings_guard_payment_status BEFORE UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION guard_booking_payment_status_writes();
 
 CREATE TRIGGER on_booking_completed AFTER UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION handle_job_completion();
 

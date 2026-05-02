@@ -828,6 +828,25 @@ COMMENT ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "
 
 
 
+CREATE OR REPLACE FUNCTION "public"."compute_booking_scheduled_at_utc"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+begin
+  if new.scheduled_date is null or new.scheduled_time is null then
+    new.scheduled_at_utc := null;
+  else
+    new.scheduled_at_utc :=
+      ((new.scheduled_date::date + new.scheduled_time::time)
+        at time zone coalesce(nullif(new.timezone_name, ''), 'Africa/Accra'));
+  end if;
+  return new;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."compute_booking_scheduled_at_utc"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."compute_ghana_phone_variants"("raw_phone" "text") RETURNS TABLE("phone_e164" "text", "phone_variants" "text"[])
     LANGUAGE "plpgsql" IMMUTABLE
     AS $_$
@@ -2353,6 +2372,42 @@ $$;
 ALTER FUNCTION "public"."get_user_role"("p_user_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."guard_booking_payment_status_writes"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+begin
+  -- Service-role calls (Paystack webhook, admin scripts) bypass entirely.
+  if auth.role() = 'service_role' then
+    return new;
+  end if;
+
+  -- Non-service-role callers cannot transition payment_status to a privileged value.
+  if new.payment_status is distinct from old.payment_status
+     and new.payment_status in ('paid', 'refunded') then
+    raise exception
+      'payment_status transitions to % are server-only (use the Paystack webhook)',
+      new.payment_status
+      using errcode = '42501'; -- insufficient_privilege
+  end if;
+
+  -- Once a booking is paid, the column is locked for non-service-role callers.
+  -- This prevents a customer from "unpaying" their own booking by writing
+  -- `payment_status = 'failed'` after the webhook has confirmed the charge.
+  if old.payment_status = 'paid'
+     and new.payment_status is distinct from old.payment_status then
+    raise exception
+      'cannot change payment_status of a paid booking from client'
+      using errcode = '42501';
+  end if;
+
+  return new;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."guard_booking_payment_status_writes"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."handle_job_completion"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
@@ -2767,6 +2822,29 @@ $$;
 
 
 ALTER FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."record_lookup_attempt"("p_scope" "text", "p_key" "text", "p_max_attempts" integer, "p_window_seconds" integer) RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  bucket  timestamptz := date_trunc('second', now())
+                       - (extract(epoch from now())::bigint % p_window_seconds) * interval '1 second';
+  current integer;
+begin
+  insert into public.auth_lookup_rate_limit (scope, key, window_start, attempts)
+  values (p_scope, p_key, bucket, 1)
+  on conflict (scope, key, window_start)
+  do update set attempts = public.auth_lookup_rate_limit.attempts + 1
+  returning attempts into current;
+
+  return current > p_max_attempts;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."record_lookup_attempt"("p_scope" "text", "p_key" "text", "p_max_attempts" integer, "p_window_seconds" integer) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."refresh_auth_identity_lookup"("target_user_id" "uuid") RETURNS "void"
@@ -3503,6 +3581,17 @@ CREATE TABLE IF NOT EXISTS "public"."auth_identity_lookup" (
 ALTER TABLE "public"."auth_identity_lookup" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."auth_lookup_rate_limit" (
+    "scope" "text" NOT NULL,
+    "key" "text" NOT NULL,
+    "window_start" timestamp with time zone NOT NULL,
+    "attempts" integer DEFAULT 0 NOT NULL
+);
+
+
+ALTER TABLE "public"."auth_lookup_rate_limit" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."availability" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "cleaner_id" "uuid",
@@ -3597,6 +3686,8 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "final_amount_minor" integer,
     "is_same_day" boolean,
     "is_weekend" boolean,
+    "scheduled_at_utc" timestamp with time zone,
+    "idempotency_key" "text",
     CONSTRAINT "bookings_core_amount_nonnegative_check" CHECK ((("core_amount_minor" IS NULL) OR ("core_amount_minor" >= 0))),
     CONSTRAINT "bookings_customer_rating_range" CHECK ((("customer_rating" IS NULL) OR (("customer_rating" >= 1) AND ("customer_rating" <= 5)))),
     CONSTRAINT "bookings_duration_hours_valid" CHECK ((("duration_hours" > (0)::numeric) AND ("duration_hours" <= (24)::numeric))),
@@ -4922,6 +5013,11 @@ ALTER TABLE ONLY "public"."auth_identity_lookup"
 
 
 
+ALTER TABLE ONLY "public"."auth_lookup_rate_limit"
+    ADD CONSTRAINT "auth_lookup_rate_limit_pkey" PRIMARY KEY ("scope", "key", "window_start");
+
+
+
 ALTER TABLE ONLY "public"."availability"
     ADD CONSTRAINT "availability_pkey" PRIMARY KEY ("id");
 
@@ -5368,6 +5464,14 @@ CREATE INDEX "auth_identity_lookup_providers_idx" ON "public"."auth_identity_loo
 
 
 
+CREATE INDEX "auth_lookup_rate_limit_window_idx" ON "public"."auth_lookup_rate_limit" USING "btree" ("window_start");
+
+
+
+CREATE UNIQUE INDEX "bookings_customer_idempotency_key_uidx" ON "public"."bookings" USING "btree" ("customer_id", "idempotency_key") WHERE ("idempotency_key" IS NOT NULL);
+
+
+
 CREATE INDEX "bookings_location_idx" ON "public"."bookings" USING "gist" ("location_coordinates");
 
 
@@ -5460,6 +5564,10 @@ CREATE INDEX "idx_bookings_cleaner_status_customer" ON "public"."bookings" USING
 
 
 
+CREATE INDEX "idx_bookings_cleaner_status_scheduled_at_utc" ON "public"."bookings" USING "btree" ("cleaner_id", "status", "scheduled_at_utc");
+
+
+
 CREATE INDEX "idx_bookings_customer" ON "public"."bookings" USING "btree" ("customer_id");
 
 
@@ -5473,6 +5581,10 @@ CREATE INDEX "idx_bookings_customer_ext" ON "public"."bookings" USING "btree" ("
 
 
 CREATE INDEX "idx_bookings_customer_id" ON "public"."bookings" USING "btree" ("customer_id");
+
+
+
+CREATE INDEX "idx_bookings_customer_status_scheduled_at_utc" ON "public"."bookings" USING "btree" ("customer_id", "status", "scheduled_at_utc");
 
 
 
@@ -5889,6 +6001,14 @@ CREATE INDEX "whatsapp_inbox_messages_phone_created_idx" ON "public"."whatsapp_i
 
 
 CREATE INDEX "whatsapp_inbox_messages_user_created_idx" ON "public"."whatsapp_inbox_messages" USING "btree" ("user_id", "created_at" DESC) WHERE ("user_id" IS NOT NULL);
+
+
+
+CREATE OR REPLACE TRIGGER "bookings_compute_scheduled_at_utc" BEFORE INSERT OR UPDATE OF "scheduled_date", "scheduled_time", "timezone_name" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."compute_booking_scheduled_at_utc"();
+
+
+
+CREATE OR REPLACE TRIGGER "bookings_guard_payment_status" BEFORE UPDATE ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."guard_booking_payment_status_writes"();
 
 
 
@@ -6694,6 +6814,9 @@ CREATE POLICY "anyone_read_service_types" ON "public"."service_types" FOR SELECT
 ALTER TABLE "public"."auth_identity_lookup" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."auth_lookup_rate_limit" ENABLE ROW LEVEL SECURITY;
+
+
 CREATE POLICY "authenticated_read_invite_codes" ON "public"."invite_codes" FOR SELECT TO "authenticated" USING (true);
 
 
@@ -6759,6 +6882,22 @@ ALTER TABLE "public"."cleaner_schedules" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."cleaner_tracking" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "cleaner_tracking_cleaner_insert" ON "public"."cleaner_tracking" FOR INSERT TO "authenticated" WITH CHECK ((("cleaner_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."bookings" "b"
+  WHERE (("b"."id" = "cleaner_tracking"."booking_id") AND ("b"."cleaner_id" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "cleaner_tracking_cleaner_read" ON "public"."cleaner_tracking" FOR SELECT TO "authenticated" USING (("cleaner_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "cleaner_tracking_customer_read" ON "public"."cleaner_tracking" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."bookings" "b"
+  WHERE (("b"."id" = "cleaner_tracking"."booking_id") AND ("b"."customer_id" = "auth"."uid"())))));
+
 
 
 CREATE POLICY "cleaner_tracking_insert_policy" ON "public"."cleaner_tracking" FOR INSERT WITH CHECK ((("auth"."uid"() = "cleaner_id") AND (EXISTS ( SELECT 1
@@ -6990,6 +7129,14 @@ ALTER TABLE "public"."testimonials" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."transactions" ENABLE ROW LEVEL SECURITY;
 
 
+CREATE POLICY "transactions_cleaner_select" ON "public"."transactions" FOR SELECT TO "authenticated" USING (("cleaner_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "transactions_customer_select" ON "public"."transactions" FOR SELECT TO "authenticated" USING (("customer_id" = "auth"."uid"()));
+
+
+
 CREATE POLICY "update_own_profile" ON "public"."profiles" FOR UPDATE TO "authenticated" USING (("auth"."uid"() = "id")) WITH CHECK (("auth"."uid"() = "id"));
 
 
@@ -7094,6 +7241,14 @@ ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
 
 
 
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."bookings";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."cleaner_tracking";
 
 
 
@@ -8161,6 +8316,12 @@ GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uu
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean) TO "anon";
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."compute_booking_scheduled_at_utc"() TO "anon";
+GRANT ALL ON FUNCTION "public"."compute_booking_scheduled_at_utc"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."compute_booking_scheduled_at_utc"() TO "service_role";
 
 
 
@@ -10340,6 +10501,12 @@ GRANT ALL ON FUNCTION "public"."gserialized_gist_sel_nd"("internal", "oid", "int
 
 
 
+GRANT ALL ON FUNCTION "public"."guard_booking_payment_status_writes"() TO "anon";
+GRANT ALL ON FUNCTION "public"."guard_booking_payment_status_writes"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."guard_booking_payment_status_writes"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."handle_job_completion"() TO "anon";
 GRANT ALL ON FUNCTION "public"."handle_job_completion"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."handle_job_completion"() TO "service_role";
@@ -11025,6 +11192,13 @@ GRANT ALL ON FUNCTION "public"."postgis_wagyu_version"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") TO "anon";
 GRANT ALL ON FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."record_lookup_attempt"("p_scope" "text", "p_key" "text", "p_max_attempts" integer, "p_window_seconds" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."record_lookup_attempt"("p_scope" "text", "p_key" "text", "p_max_attempts" integer, "p_window_seconds" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."record_lookup_attempt"("p_scope" "text", "p_key" "text", "p_max_attempts" integer, "p_window_seconds" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."record_lookup_attempt"("p_scope" "text", "p_key" "text", "p_max_attempts" integer, "p_window_seconds" integer) TO "service_role";
 
 
 
@@ -14288,6 +14462,10 @@ GRANT ALL ON FUNCTION "public"."st_union"("public"."geometry", double precision)
 
 
 GRANT ALL ON TABLE "public"."auth_identity_lookup" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."auth_lookup_rate_limit" TO "service_role";
 
 
 
