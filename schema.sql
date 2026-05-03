@@ -2661,84 +2661,44 @@ declare
   computed_phone_variants text[];
 begin
   if normalized_identifier is null then
-    return query
-    select
-      false,
-      null::text,
-      null::uuid,
-      '{}'::text[],
-      false,
-      false,
-      null::text,
-      null::text;
+    return query select false, null::text, null::uuid, '{}'::text[], false, false, null::text, null::text;
     return;
   end if;
 
   if position('@' in normalized_identifier) > 0 then
     return query
-    select
-      true,
-      'email'::text,
-      ail.user_id,
-      ail.providers,
+    select true, 'email'::text, ail.user_id, ail.providers,
       coalesce('email' = any(ail.providers), false),
       coalesce('phone' = any(ail.providers), false),
-      ail.email,
-      ail.phone_e164
+      ail.email, ail.phone_e164
     from public.auth_identity_lookup ail
     where ail.email_normalized = lower(normalized_identifier)
     order by ail.updated_at desc
     limit 1;
 
-    if found then
-      return;
-    end if;
+    if found then return; end if;
   else
-    select
-      phone_e164,
-      phone_variants
-    into
-      computed_phone_e164,
-      computed_phone_variants
+    select phone_e164, phone_variants
+    into computed_phone_e164, computed_phone_variants
     from public.compute_ghana_phone_variants(normalized_identifier);
 
     return query
-    select
-      true,
-      'phone'::text,
-      ail.user_id,
-      ail.providers,
+    select true, 'phone'::text, ail.user_id, ail.providers,
       coalesce('email' = any(ail.providers), false),
       coalesce('phone' = any(ail.providers), false),
-      ail.email,
-      ail.phone_e164
+      ail.email, ail.phone_e164
     from public.auth_identity_lookup ail
     where
       (computed_phone_e164 is not null and ail.phone_e164 = computed_phone_e164)
-      or (
-        coalesce(array_length(computed_phone_variants, 1), 0) > 0
-        and ail.phone_variants && computed_phone_variants
-      )
-    order by
-      case when computed_phone_e164 is not null and ail.phone_e164 = computed_phone_e164 then 0 else 1 end,
+      or (coalesce(array_length(computed_phone_variants, 1), 0) > 0 and ail.phone_variants && computed_phone_variants)
+    order by case when computed_phone_e164 is not null and ail.phone_e164 = computed_phone_e164 then 0 else 1 end,
       ail.updated_at desc
     limit 1;
 
-    if found then
-      return;
-    end if;
+    if found then return; end if;
   end if;
 
-  return query
-  select
-    false,
-    null::text,
-    null::uuid,
-    '{}'::text[],
-    false,
-    false,
-    null::text,
-    null::text;
+  return query select false, null::text, null::uuid, '{}'::text[], false, false, null::text, null::text;
 end;
 $$;
 
@@ -3847,6 +3807,28 @@ ALTER TABLE ONLY "public"."cleaner_leads" FORCE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."cleaner_leads" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."cleaner_payouts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "recipient_code" "text" NOT NULL,
+    "amount" bigint NOT NULL,
+    "currency" "text" DEFAULT 'GHS'::"text" NOT NULL,
+    "reference" "text" NOT NULL,
+    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "paystack_transfer_code" "text",
+    "paystack_transfer_id" bigint,
+    "reason" "text",
+    "error_message" "text",
+    "metadata" "jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "cleaner_payouts_amount_check" CHECK (("amount" > 0))
+);
+
+
+ALTER TABLE "public"."cleaner_payouts" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."cleaner_schedules" (
@@ -5083,6 +5065,11 @@ ALTER TABLE ONLY "public"."cleaner_leads"
 
 
 
+ALTER TABLE ONLY "public"."cleaner_payouts"
+    ADD CONSTRAINT "cleaner_payouts_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."cleaner_schedules"
     ADD CONSTRAINT "cleaner_schedules_pkey" PRIMARY KEY ("id");
 
@@ -5505,6 +5492,18 @@ CREATE UNIQUE INDEX "cleaner_leads_phone_uniq" ON "public"."cleaner_leads" USING
 
 
 CREATE INDEX "cleaner_leads_status_idx" ON "public"."cleaner_leads" USING "btree" ("status");
+
+
+
+CREATE INDEX "cleaner_payouts_transfer_code_idx" ON "public"."cleaner_payouts" USING "btree" ("paystack_transfer_code") WHERE ("paystack_transfer_code" IS NOT NULL);
+
+
+
+CREATE INDEX "cleaner_payouts_user_created_idx" ON "public"."cleaner_payouts" USING "btree" ("user_id", "created_at" DESC);
+
+
+
+CREATE UNIQUE INDEX "cleaner_payouts_user_reference_uidx" ON "public"."cleaner_payouts" USING "btree" ("user_id", "reference");
 
 
 
@@ -6113,6 +6112,11 @@ ALTER TABLE ONLY "public"."cleaner_data"
 
 ALTER TABLE ONLY "public"."cleaner_devices"
     ADD CONSTRAINT "cleaner_devices_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."cleaner_payouts"
+    ADD CONSTRAINT "cleaner_payouts_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -6876,6 +6880,13 @@ CREATE POLICY "cleaner_devices_cleaner_all" ON "public"."cleaner_devices" USING 
 
 
 ALTER TABLE "public"."cleaner_leads" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."cleaner_payouts" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "cleaner_payouts_select_own" ON "public"."cleaner_payouts" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
 
 
 ALTER TABLE "public"."cleaner_schedules" ENABLE ROW LEVEL SECURITY;
@@ -14532,6 +14543,12 @@ GRANT ALL ON TABLE "public"."cleaner_devices" TO "service_role";
 GRANT ALL ON TABLE "public"."cleaner_leads" TO "anon";
 GRANT ALL ON TABLE "public"."cleaner_leads" TO "authenticated";
 GRANT ALL ON TABLE "public"."cleaner_leads" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."cleaner_payouts" TO "anon";
+GRANT ALL ON TABLE "public"."cleaner_payouts" TO "authenticated";
+GRANT ALL ON TABLE "public"."cleaner_payouts" TO "service_role";
 
 
 
