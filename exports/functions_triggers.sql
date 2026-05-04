@@ -5742,46 +5742,137 @@ declare
   normalized_identifier text := nullif(trim(coalesce(lookup_identifier, '')), '');
   computed_phone_e164 text;
   computed_phone_variants text[];
+  forwarded_ip text;
+  blocked boolean;
 begin
+  -- Empty identifier: short-circuit with the standard "no account" shape.
   if normalized_identifier is null then
-    return query select false, null::text, null::uuid, '{}'::text[], false, false, null::text, null::text;
+    return query
+    select
+      false,
+      null::text,
+      null::uuid,
+      '{}'::text[],
+      false,
+      false,
+      null::text,
+      null::text;
     return;
   end if;
 
+  -- Per-identifier limit.
+  blocked := public.record_lookup_attempt(
+    'identifier',
+    lower(normalized_identifier),
+    10,    -- max attempts
+    300    -- 5-minute window
+  );
+
+  -- Per-IP limit (best-effort — only the first IP in x-forwarded-for).
+  begin
+    forwarded_ip := split_part(
+      coalesce(current_setting('request.headers', true)::json ->> 'x-forwarded-for', ''),
+      ',',
+      1
+    );
+    forwarded_ip := nullif(trim(forwarded_ip), '');
+  exception when others then
+    forwarded_ip := null;
+  end;
+
+  if forwarded_ip is not null then
+    blocked := blocked or public.record_lookup_attempt(
+      'ip',
+      forwarded_ip,
+      60,    -- max attempts
+      300    -- 5-minute window
+    );
+  end if;
+
+  if blocked then
+    -- Indistinguishable-from-no-account response.
+    return query
+    select
+      false,
+      null::text,
+      null::uuid,
+      '{}'::text[],
+      false,
+      false,
+      null::text,
+      null::text;
+    return;
+  end if;
+
+  -- Below this point: original lookup logic (unchanged).
+
   if position('@' in normalized_identifier) > 0 then
     return query
-    select true, 'email'::text, ail.user_id, ail.providers,
+    select
+      true,
+      'email'::text,
+      ail.user_id,
+      ail.providers,
       coalesce('email' = any(ail.providers), false),
       coalesce('phone' = any(ail.providers), false),
-      ail.email, ail.phone_e164
+      ail.email,
+      ail.phone_e164
     from public.auth_identity_lookup ail
     where ail.email_normalized = lower(normalized_identifier)
     order by ail.updated_at desc
     limit 1;
 
-    if found then return; end if;
+    if found then
+      return;
+    end if;
   else
-    select phone_e164, phone_variants
-    into computed_phone_e164, computed_phone_variants
-    from public.compute_ghana_phone_variants(normalized_identifier);
+    -- Qualify columns: bare `phone_e164` clashes with RETURNS TABLE output column.
+    select
+      pv.phone_e164,
+      pv.phone_variants
+    into
+      computed_phone_e164,
+      computed_phone_variants
+    from public.compute_ghana_phone_variants(normalized_identifier) as pv;
 
     return query
-    select true, 'phone'::text, ail.user_id, ail.providers,
+    select
+      true,
+      'phone'::text,
+      ail.user_id,
+      ail.providers,
       coalesce('email' = any(ail.providers), false),
       coalesce('phone' = any(ail.providers), false),
-      ail.email, ail.phone_e164
+      ail.email,
+      ail.phone_e164
     from public.auth_identity_lookup ail
     where
       (computed_phone_e164 is not null and ail.phone_e164 = computed_phone_e164)
-      or (coalesce(array_length(computed_phone_variants, 1), 0) > 0 and ail.phone_variants && computed_phone_variants)
-    order by case when computed_phone_e164 is not null and ail.phone_e164 = computed_phone_e164 then 0 else 1 end,
+      or (
+        coalesce(array_length(computed_phone_variants, 1), 0) > 0
+        and ail.phone_variants && computed_phone_variants
+      )
+    order by
+      case when computed_phone_e164 is not null and ail.phone_e164 = computed_phone_e164 then 0 else 1 end,
       ail.updated_at desc
     limit 1;
 
-    if found then return; end if;
+    if found then
+      return;
+    end if;
   end if;
 
-  return query select false, null::text, null::uuid, '{}'::text[], false, false, null::text, null::text;
+  -- No match.
+  return query
+  select
+    false,
+    null::text,
+    null::uuid,
+    '{}'::text[],
+    false,
+    false,
+    null::text,
+    null::text;
 end;
 $function$
 
