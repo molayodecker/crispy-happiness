@@ -282,6 +282,116 @@ $$;
 ALTER FUNCTION "public"."accept_preferred_cleaner_invite"("p_token" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."add_cleaner_record"("p_user_id" "uuid", "p_name" "text", "p_bio" "text", "p_avatar_url" "text", "p_status" "text", "p_verified" boolean) RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_clean_name      text := trim(coalesce(p_name, ''));
+  v_first_name      text;
+  v_last_name       text;
+  v_status          public.cleaner_status := COALESCE(NULLIF(p_status, '')::public.cleaner_status, 'active'::public.cleaner_status);
+  v_verified        boolean := COALESCE(p_verified, false);
+  v_now             timestamptz := now();
+  v_roles_inserted  int := 0;
+BEGIN
+  -- Confirm public.users mirror exists.
+  PERFORM 1
+  FROM public.users
+  WHERE id = p_user_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'user_not_found' USING ERRCODE = 'P0002';
+  END IF;
+
+  v_first_name := NULLIF(split_part(v_clean_name, ' ', 1), '');
+
+  v_last_name := NULLIF(
+    regexp_replace(v_clean_name, '^\S+\s*', ''),
+    ''
+  );
+
+  INSERT INTO public.profiles (
+    id,
+    user_id,
+    firstname,
+    lastname,
+    avatar_url,
+    bio,
+    updated_at
+  )
+  VALUES (
+    p_user_id,
+    p_user_id,
+    v_first_name,
+    v_last_name,
+    NULLIF(p_avatar_url, ''),
+    NULLIF(p_bio, ''),
+    v_now
+  )
+  ON CONFLICT (id) DO UPDATE SET
+    firstname  = COALESCE(NULLIF(public.profiles.firstname, ''), EXCLUDED.firstname),
+    lastname   = COALESCE(NULLIF(public.profiles.lastname, ''), EXCLUDED.lastname),
+    avatar_url = COALESCE(NULLIF(public.profiles.avatar_url, ''), EXCLUDED.avatar_url),
+    bio        = COALESCE(NULLIF(public.profiles.bio, ''), EXCLUDED.bio),
+    updated_at = v_now;
+
+  WITH inserted_roles AS (
+    INSERT INTO public.user_roles (user_id, role_id)
+    VALUES
+      (p_user_id, 'cleaner'),
+      (p_user_id, 'customer')
+    ON CONFLICT (user_id, role_id) DO NOTHING
+    RETURNING role_id
+  )
+  SELECT count(*) INTO v_roles_inserted
+  FROM inserted_roles;
+
+  INSERT INTO public.cleaner_data (
+    user_id,
+    bio,
+    status,
+    verified,
+    skills,
+    languages,
+    service_areas,
+    equipment_owned,
+    updated_at
+  )
+  VALUES (
+    p_user_id,
+    NULLIF(p_bio, ''),
+    v_status,
+    v_verified,
+    ARRAY[]::text[],
+    ARRAY['English']::text[],
+    ARRAY[]::text[],
+    ARRAY[]::text[],
+    v_now
+  )
+  ON CONFLICT (user_id) DO UPDATE SET
+    bio        = COALESCE(NULLIF(EXCLUDED.bio, ''), public.cleaner_data.bio),
+    status     = v_status,
+    verified   = v_verified,
+    updated_at = v_now;
+
+  RETURN jsonb_build_object(
+    'user_id', p_user_id,
+    'status', v_status,
+    'verified', v_verified,
+    'roles_inserted', v_roles_inserted
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."add_cleaner_record"("p_user_id" "uuid", "p_name" "text", "p_bio" "text", "p_avatar_url" "text", "p_status" "text", "p_verified" boolean) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."add_cleaner_record"("p_user_id" "uuid", "p_name" "text", "p_bio" "text", "p_avatar_url" "text", "p_status" "text", "p_verified" boolean) IS 'Transactionally provision the public-schema rows for an admin-added cleaner whose auth.users row already exists. Service-role only. Errors: P0002 user_not_found.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."approve_and_complete_booking"("p_booking_id" "uuid", "p_rating" integer, "p_feedback" "text") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
@@ -313,6 +423,159 @@ $$;
 
 
 ALTER FUNCTION "public"."approve_and_complete_booking"("p_booking_id" "uuid", "p_rating" integer, "p_feedback" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."approve_cleaner_application"("p_application_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_app             public.cleaner_applications%ROWTYPE;
+  v_user_id         uuid;
+  v_first_name      text;
+  v_last_name       text;
+  v_app_phone_e164  text;
+  v_now             timestamptz := now();
+  v_roles_inserted  int := 0;
+BEGIN
+  SELECT * INTO v_app
+  FROM public.cleaner_applications
+  WHERE id = p_application_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'application_not_found' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_app_phone_e164 := public.normalize_ghana_phone_to_e164(v_app.phone);
+
+  v_user_id := v_app.user_id;
+
+  IF v_user_id IS NULL AND NULLIF(trim(v_app.email), '') IS NOT NULL THEN
+    SELECT id INTO v_user_id
+    FROM public.users
+    WHERE lower(email) = lower(trim(v_app.email))
+    ORDER BY created_at ASC
+    LIMIT 1;
+  END IF;
+
+  IF v_user_id IS NULL AND v_app_phone_e164 IS NOT NULL THEN
+    SELECT id INTO v_user_id
+    FROM public.users
+    WHERE public.normalize_ghana_phone_to_e164(phone) = v_app_phone_e164
+    ORDER BY created_at ASC
+    LIMIT 1;
+  END IF;
+
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'user_not_found' USING ERRCODE = 'P0002';
+  END IF;
+
+  PERFORM 1
+  FROM public.users
+  WHERE id = v_user_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'user_not_found' USING ERRCODE = 'P0002';
+  END IF;
+
+  v_first_name := NULLIF(split_part(trim(coalesce(v_app.name, '')), ' ', 1), '');
+
+  v_last_name := NULLIF(
+    regexp_replace(trim(coalesce(v_app.name, '')), '^\S+\s*', ''),
+    ''
+  );
+
+  INSERT INTO public.profiles (
+    id,
+    user_id,
+    firstname,
+    lastname,
+    bio,
+    updated_at
+  )
+  VALUES (
+    v_user_id,
+    v_user_id,
+    v_first_name,
+    v_last_name,
+    NULLIF(v_app.bio, ''),
+    v_now
+  )
+  ON CONFLICT (id) DO UPDATE SET
+    firstname  = COALESCE(NULLIF(public.profiles.firstname, ''), EXCLUDED.firstname),
+    lastname   = COALESCE(NULLIF(public.profiles.lastname, ''), EXCLUDED.lastname),
+    bio        = COALESCE(NULLIF(public.profiles.bio, ''), EXCLUDED.bio),
+    updated_at = v_now;
+
+  WITH inserted_roles AS (
+    INSERT INTO public.user_roles (user_id, role_id)
+    VALUES
+      (v_user_id, 'cleaner'),
+      (v_user_id, 'customer')
+    ON CONFLICT (user_id, role_id) DO NOTHING
+    RETURNING role_id
+  )
+  SELECT count(*) INTO v_roles_inserted
+  FROM inserted_roles;
+
+  INSERT INTO public.cleaner_data (
+    user_id,
+    bio,
+    skills,
+    certifications,
+    service_areas,
+    hourly_rate,
+    status,
+    verified,
+    updated_at
+  )
+  VALUES (
+    v_user_id,
+    NULLIF(v_app.bio, ''),
+    v_app.skills,
+    v_app.certifications,
+    v_app.service_areas,
+    v_app.hourly_rate,
+    'active',
+    true,
+    v_now
+  )
+  ON CONFLICT (user_id) DO UPDATE SET
+    bio            = COALESCE(NULLIF(EXCLUDED.bio, ''), public.cleaner_data.bio),
+    skills         = COALESCE(EXCLUDED.skills, public.cleaner_data.skills),
+    certifications = COALESCE(EXCLUDED.certifications, public.cleaner_data.certifications),
+    service_areas  = COALESCE(EXCLUDED.service_areas, public.cleaner_data.service_areas),
+    hourly_rate    = COALESCE(EXCLUDED.hourly_rate, public.cleaner_data.hourly_rate),
+    status = CASE
+      WHEN public.cleaner_data.status = 'suspended'
+      THEN public.cleaner_data.status
+      ELSE 'active'
+    END,
+    verified   = true,
+    updated_at = v_now;
+
+  UPDATE public.cleaner_applications
+  SET status     = 'approved',
+      user_id    = v_user_id,
+      updated_at = v_now
+  WHERE id = p_application_id;
+
+  RETURN jsonb_build_object(
+    'user_id', v_user_id,
+    'application_id', p_application_id,
+    'approved_user_id', v_user_id,
+    'status', 'approved',
+    'roles_inserted', v_roles_inserted
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."approve_cleaner_application"("p_application_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."approve_cleaner_application"("p_application_id" "uuid") IS 'Transactionally approve or repair a cleaner application. Service-role only. Errors: P0001 application_not_found, P0002 user_not_found.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "target_role_id" "text") RETURNS "void"
@@ -352,6 +615,63 @@ $$;
 
 
 ALTER FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "target_role_id" "text", "is_verified" boolean) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."backfill_cleaner_application_approval"("p_user_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_app_id     uuid;
+  v_user_email text;
+  v_user_phone text;
+BEGIN
+  SELECT email, public.normalize_ghana_phone_to_e164(phone)
+  INTO v_user_email, v_user_phone
+  FROM public.users
+  WHERE id = p_user_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'user_not_found' USING ERRCODE = 'P0002';
+  END IF;
+
+  SELECT id INTO v_app_id
+  FROM public.cleaner_applications
+  WHERE COALESCE(status, 'pending') NOT IN ('rejected')
+    AND (
+      user_id = p_user_id
+      OR (
+        v_user_email IS NOT NULL
+        AND NULLIF(trim(email), '') IS NOT NULL
+        AND lower(email) = lower(v_user_email)
+      )
+      OR (
+        v_user_phone IS NOT NULL
+        AND public.normalize_ghana_phone_to_e164(phone) = v_user_phone
+      )
+    )
+  ORDER BY
+    CASE
+      WHEN COALESCE(status, 'pending') = 'approved' THEN 2
+      ELSE 1
+    END,
+    created_at DESC
+  LIMIT 1;
+
+  IF v_app_id IS NULL THEN
+    RAISE EXCEPTION 'application_not_found' USING ERRCODE = 'P0001';
+  END IF;
+
+  RETURN public.approve_cleaner_application(v_app_id);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."backfill_cleaner_application_approval"("p_user_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."backfill_cleaner_application_approval"("p_user_id" "uuid") IS 'One-shot repair for users stuck after approval but missing user_roles/cleaner_data. Service-role only.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."bookings_set_duration"() RETURNS "trigger"
@@ -1577,44 +1897,42 @@ ALTER FUNCTION "public"."get_available_timeslots_old"("p_booking_date" "date", "
 CREATE OR REPLACE FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[]) RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "bio" "text", "hourly_rate" numeric, "rating" double precision, "distance_meters" double precision, "final_score" double precision)
     LANGUAGE "plpgsql" STABLE
     AS $$
-DECLARE 
-  v_cust_id uuid := auth.uid(); 
+DECLARE
+  v_cust_id       uuid := auth.uid();
   v_booking_range tstzrange;
-  v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
-BEGIN 
-  -- 1. Security Check
+  v_cust_loc      geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
+BEGIN
   IF v_cust_id IS NULL THEN
     RAISE EXCEPTION 'Not authorized';
   END IF;
 
-  -- 2. Define the Booking Window
   v_booking_range := tstzrange(
-    (p_date + p_time)::timestamptz, 
-    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz, 
+    (p_date + p_time)::timestamptz,
+    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
     '[)'
   );
 
-  -- 3. Return Query (qualified with ac. / sc. to avoid ambiguous column reference)
   RETURN QUERY
   WITH available_cleaners AS (
-    SELECT 
-      cd.user_id AS cleaner_user_id, 
-      p.fullname AS cleaner_fullname, 
-      p.avatar_url AS profile_avatar_url, 
-      p.bio AS profile_bio, 
-      cd.hourly_rate AS cleaner_hourly_rate, 
-      cd.rating AS cleaner_rating, 
-      cd.skills AS cleaner_skills, 
-      cd.specialties AS cleaner_specialties,
-      (cd.base_location::geography <-> v_cust_loc)::float AS dist
+    SELECT
+      cd.user_id        AS cleaner_user_id,
+      p.fullname        AS cleaner_fullname,
+      p.avatar_url      AS profile_avatar_url,
+      p.bio             AS profile_bio,
+      cd.hourly_rate    AS cleaner_hourly_rate,
+      cd.rating         AS cleaner_rating,
+      cd.skills         AS cleaner_skills,
+      cd.specialties    AS cleaner_specialties,
+      (p.location_wkt <-> v_cust_loc)::float AS dist
     FROM public.cleaner_data cd
     JOIN public.profiles p ON p.id = cd.user_id
     WHERE cd.status = 'active'
-      AND ST_DWithin(cd.base_location::geography, v_cust_loc, p_max_distance_meters)
+      AND p.location_wkt IS NOT NULL
+      AND ST_DWithin(p.location_wkt, v_cust_loc, p_max_distance_meters)
       AND NOT EXISTS (
         SELECT 1
-        FROM public.bookings b 
-        WHERE b.cleaner_id = cd.user_id 
+        FROM public.bookings b
+        WHERE b.cleaner_id = cd.user_id
           AND b.booking_period && v_booking_range
           AND b.status != 'cancelled'
       )
@@ -1626,7 +1944,7 @@ BEGIN
       )
   ),
   scored_cleaners AS (
-    SELECT 
+    SELECT
       ac.cleaner_user_id,
       ac.cleaner_fullname,
       ac.profile_avatar_url,
@@ -1636,33 +1954,32 @@ BEGIN
       ac.cleaner_skills,
       ac.cleaner_specialties,
       ac.dist,
-      CASE 
-        WHEN cardinality(p_requested_services) > 0 
+      CASE
+        WHEN cardinality(p_requested_services) > 0
         THEN (
-          SELECT count(*)::float / cardinality(p_requested_services) 
-          FROM unnest(p_requested_services) s 
+          SELECT count(*)::float / cardinality(p_requested_services)
+          FROM unnest(p_requested_services) s
           WHERE s = ANY(ac.cleaner_skills) OR s = ANY(ac.cleaner_specialties)
         ) * 40
-        ELSE 20 
+        ELSE 20
       END AS s_score
     FROM available_cleaners ac
   )
-  SELECT 
-    sc.cleaner_user_id AS cleaner_id, 
-    sc.cleaner_fullname AS cleaner_name, 
-    sc.profile_avatar_url AS avatar_url, 
-    sc.profile_bio AS bio, 
-    sc.cleaner_hourly_rate AS hourly_rate, 
-    sc.cleaner_rating::float AS rating, 
-    sc.dist::float AS distance_meters,
+  SELECT
+    sc.cleaner_user_id           AS cleaner_id,
+    sc.cleaner_fullname          AS cleaner_name,
+    sc.profile_avatar_url        AS avatar_url,
+    sc.profile_bio               AS bio,
+    sc.cleaner_hourly_rate       AS hourly_rate,
+    sc.cleaner_rating::float     AS rating,
+    sc.dist::float               AS distance_meters,
     (
-      (GREATEST(0, (1.0 - (sc.dist / p_max_distance_meters))) * 30) + 
+      (GREATEST(0, (1.0 - (sc.dist / p_max_distance_meters))) * 30) +
       (COALESCE(sc.cleaner_rating, 0) / 5.0 * 30) +
       sc.s_score
-    )::float AS final_score
+    )::float                     AS final_score
   FROM scored_cleaners sc
   ORDER BY final_score DESC, sc.dist ASC;
-
 END;
 $$;
 
@@ -2057,57 +2374,107 @@ ALTER FUNCTION "public"."get_my_wallet_balance"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" integer, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" integer) RETURNS TABLE("id" "uuid", "fullname" "text", "avatar_url" "text", "distance_meters" double precision, "rating" double precision)
     LANGUAGE "sql" STABLE
-    AS $$
-with
-origin as (
-  select st_setsrid(st_makepoint(p_longitude, p_latitude), 4326)::geography as g
+    AS $$WITH
+origin AS (
+  SELECT ST_SetSRID(ST_MakePoint(p_longitude, p_latitude), 4326)::geography AS g
 ),
-booking as (
-  select tstzrange(
+booking AS (
+  SELECT tstzrange(
     (p_scheduled_date + p_start_time)::timestamptz,
     (p_scheduled_date + p_start_time + (p_duration_hours || ' hours')::interval)::timestamptz,
     '[)'
-  ) as r
+  ) AS r
+),
+cleaners AS (
+  SELECT
+    p.id,
+    p.fullname,
+    p.avatar_url,
+    cd.rating,
+    cd.max_travel_distance_meters,
+    COALESCE(cd.base_location::geography, p.location_wkt) AS effective_location
+  FROM public.profiles p
+  JOIN public.cleaner_data cd
+    ON cd.user_id = p.id
+  WHERE COALESCE(cd.base_location::geography, p.location_wkt) IS NOT NULL
+    AND cd.status = 'active'::public.cleaner_status
+    AND cd.verified = true
+    AND COALESCE(cd.is_online, false) = true
+    AND EXISTS (
+      SELECT 1
+      FROM public.user_roles ur
+      WHERE ur.user_id = p.id
+        AND ur.role_id = 'cleaner'
+    )
 )
-select
-  p.id,
-  p.fullname,
-  p.avatar_url,
+SELECT
+  c.id,
+  c.fullname,
+  c.avatar_url,
   d.distance_meters,
-  cd.rating::double precision as rating
-from public.profiles p
-join public.cleaner_data cd
-  on cd.user_id = p.id
-cross join origin o
-cross join booking bk
-cross join lateral (
-  select st_distance(p.location_wkt, o.g) as distance_meters
+  c.rating::double precision AS rating
+FROM cleaners c
+CROSS JOIN origin o
+CROSS JOIN booking bk
+CROSS JOIN LATERAL (
+  SELECT ST_Distance(c.effective_location, o.g) AS distance_meters
 ) d
-where
-  p.location_wkt is not null
-  and exists (
-    select 1
-    from public.user_roles ur
-    where ur.user_id = p.id
-      and ur.role_id = 'cleaner'
+WHERE ST_DWithin(c.effective_location, o.g, p_radius_meters)
+  AND d.distance_meters <= COALESCE(c.max_travel_distance_meters, 30000)
+  AND NOT EXISTS (
+    SELECT 1
+    FROM public.bookings b
+    WHERE b.cleaner_id = c.id
+      AND b.status <> 'cancelled'::public.booking_status
+      AND b.booking_period && bk.r
   )
-  and cd.status = 'active'::public.cleaner_status
-  and coalesce(cd.is_online, false) = true
-  and st_dwithin(p.location_wkt, o.g, p_radius_meters)
-  and d.distance_meters <= coalesce(cd.max_travel_distance_meters, 30000)
-  and not exists (
-    select 1
-    from public.bookings b
-    where b.cleaner_id = p.id
-      and b.status <> 'cancelled'::public.booking_status
-      and b.booking_period && bk.r
-  )
-order by d.distance_meters asc
-limit 200;
-$$;
+ORDER BY d.distance_meters ASC
+LIMIT 200;$$;
 
 
 ALTER FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" integer, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_own_cleaner_location"() RETURNS "jsonb"
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_user_id uuid := auth.uid();
+  v_lat     double precision;
+  v_lng     double precision;
+  v_max     integer;
+  v_geom    geometry;
+BEGIN
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+
+  SELECT cd.base_location, cd.max_travel_distance_meters
+    INTO v_geom, v_max
+  FROM public.cleaner_data cd
+  WHERE cd.user_id = v_user_id;
+
+  IF v_geom IS NOT NULL THEN
+    v_lat := ST_Y(v_geom);
+    v_lng := ST_X(v_geom);
+  END IF;
+
+  RETURN jsonb_build_object(
+    'has_location',                v_geom IS NOT NULL,
+    'latitude',                    v_lat,
+    'longitude',                   v_lng,
+    'max_travel_distance_meters',  COALESCE(v_max, 30000)
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_own_cleaner_location"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_own_cleaner_location"() IS 'Authenticated user reads their own cleaner_data.base_location. Returns lat/lng as numbers so callers do not parse PostGIS WKB.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."get_payment_split_config"() RETURNS "jsonb"
@@ -2837,6 +3204,53 @@ $$;
 ALTER FUNCTION "public"."manage_extra_tasks"("action" "text", "task_id" "text", "new_hours" numeric) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."normalize_ghana_phone_to_e164"("p_input" "text") RETURNS "text"
+    LANGUAGE "plpgsql" IMMUTABLE
+    AS $_$
+DECLARE
+  v_raw    text;
+  v_digits text;
+BEGIN
+  IF p_input IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  v_raw := regexp_replace(trim(p_input), '[\s-]', '', 'g');
+
+  IF v_raw = '' OR position('@' in v_raw) > 0 THEN
+    RETURN NULL;
+  END IF;
+
+  IF left(v_raw, 1) = '+' THEN
+    v_digits := substring(v_raw from 2);
+  ELSE
+    v_digits := v_raw;
+  END IF;
+
+  IF v_digits !~ '^\d+$' THEN
+    RETURN NULL;
+  END IF;
+
+  IF left(v_digits, 3) = '233' AND length(v_digits) = 12 THEN
+    RETURN '+' || v_digits;
+  END IF;
+
+  IF left(v_digits, 1) = '0' AND length(v_digits) = 10 THEN
+    RETURN '+233' || substring(v_digits from 2);
+  END IF;
+
+  IF length(v_digits) = 9 THEN
+    RETURN '+233' || v_digits;
+  END IF;
+
+  RETURN NULL;
+END;
+$_$;
+
+
+ALTER FUNCTION "public"."normalize_ghana_phone_to_e164"("p_input" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") RETURNS "public"."psk_transaction"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
@@ -3089,47 +3503,43 @@ ALTER FUNCTION "public"."revoke_preferred_cleaner_invite"("p_invite_id" "uuid") 
 CREATE OR REPLACE FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[] DEFAULT '{}'::"text"[], "p_max_distance_meters" double precision DEFAULT 50000) RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "rating" double precision, "distance_meters" double precision, "matching_skills_count" integer, "total_skills_count" integer)
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     AS $$
-DECLARE 
-    v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
-    v_booking_range tstzrange := tstzrange(
-        (p_date + p_time)::timestamptz, 
-        (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz, 
-        '[)'
-    );
-BEGIN 
-    -- Security Check for 2026 standards
-    IF auth.uid() IS NULL THEN
-        RAISE EXCEPTION 'Not authorized';
-    END IF;
+DECLARE
+  v_cust_loc      geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
+  v_booking_range tstzrange := tstzrange(
+    (p_date + p_time)::timestamptz,
+    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
+    '[)'
+  );
+BEGIN
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
 
-    RETURN QUERY
-    SELECT 
-        cd.user_id, 
-        p.fullname, 
-        p.avatar_url,
-        cd.rating::float,
-        -- Corrected to use base_location
-        (cd.base_location::geography <-> v_cust_loc)::float as dist_m,
-        (
-            SELECT count(*)::int 
-            FROM unnest(p_requested_services) s 
-            WHERE s = ANY(cd.skills) OR s = ANY(cd.specialties)
-        ) as matching_skills_count,
-        COALESCE(array_length(cd.skills, 1), 0) as total_skills_count
-    FROM public.cleaner_data cd
-    JOIN public.profiles p ON p.id = cd.user_id
-    WHERE cd.status = 'active'
-    -- Corrected to use base_location
-    AND ST_DWithin(cd.base_location::geography, v_cust_loc, p_max_distance_meters)
-    -- Availability check against bookings table
+  RETURN QUERY
+  SELECT
+    cd.user_id,
+    p.fullname,
+    p.avatar_url,
+    cd.rating::float,
+    (p.location_wkt <-> v_cust_loc)::float AS dist_m,
+    (
+      SELECT count(*)::int
+      FROM unnest(p_requested_services) s
+      WHERE s = ANY(cd.skills) OR s = ANY(cd.specialties)
+    ) AS matching_skills_count,
+    COALESCE(array_length(cd.skills, 1), 0) AS total_skills_count
+  FROM public.cleaner_data cd
+  JOIN public.profiles p ON p.id = cd.user_id
+  WHERE cd.status = 'active'
+    AND p.location_wkt IS NOT NULL
+    AND ST_DWithin(p.location_wkt, v_cust_loc, p_max_distance_meters)
     AND NOT EXISTS (
-        SELECT 1 FROM public.bookings b 
-        WHERE b.cleaner_id = cd.user_id 
+      SELECT 1 FROM public.bookings b
+      WHERE b.cleaner_id = cd.user_id
         AND b.booking_period && v_booking_range
         AND b.status != 'cancelled'
     )
-    -- Efficient spatial sorting
-    ORDER BY cd.base_location::geography <-> v_cust_loc ASC;
+  ORDER BY p.location_wkt <-> v_cust_loc ASC;
 END;
 $$;
 
@@ -3367,6 +3777,67 @@ END;$$;
 
 
 ALTER FUNCTION "public"."update_last_updated_column"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."update_own_cleaner_location"("p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer DEFAULT NULL::integer) RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_user_id uuid := auth.uid();
+  v_geom    geometry(Point, 4326);
+  v_geog    geography(Point, 4326);
+  v_now     timestamptz := now();
+BEGIN
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM public.user_roles ur
+    WHERE ur.user_id = v_user_id AND ur.role_id = 'cleaner'
+  ) THEN
+    RAISE EXCEPTION 'forbidden' USING ERRCODE = '42501';
+  END IF;
+
+  v_geom := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326);
+  v_geog := v_geom::geography;
+
+  -- cleaner_data row may not yet exist for the very newest cleaners
+  -- (approval RPC always creates one, but defence in depth).
+  INSERT INTO public.cleaner_data (user_id, base_location, max_travel_distance_meters, updated_at)
+  VALUES (
+    v_user_id,
+    v_geom,
+    COALESCE(p_max_distance_meters, 30000),
+    v_now
+  )
+  ON CONFLICT (user_id) DO UPDATE SET
+    base_location              = EXCLUDED.base_location,
+    max_travel_distance_meters = COALESCE(EXCLUDED.max_travel_distance_meters, public.cleaner_data.max_travel_distance_meters),
+    updated_at                 = v_now;
+
+  -- profiles row exists for every signed-in user (created by trigger).
+  UPDATE public.profiles
+  SET location_wkt = v_geog,
+      updated_at   = v_now
+  WHERE id = v_user_id;
+
+  RETURN jsonb_build_object(
+    'user_id',                    v_user_id,
+    'latitude',                   p_lat,
+    'longitude',                  p_lng,
+    'max_travel_distance_meters', COALESCE(p_max_distance_meters, 30000)
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_own_cleaner_location"("p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."update_own_cleaner_location"("p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer) IS 'Authenticated cleaner sets their own base location. Writes both cleaner_data.base_location (geometry) and profiles.location_wkt (geography) so the booking search RPCs see them. Errors: 42501 forbidden.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."update_platform_fees_updated_at"() RETURNS "trigger"
@@ -8298,6 +8769,11 @@ GRANT ALL ON FUNCTION "public"."accept_preferred_cleaner_invite"("p_token" "uuid
 
 
 
+REVOKE ALL ON FUNCTION "public"."add_cleaner_record"("p_user_id" "uuid", "p_name" "text", "p_bio" "text", "p_avatar_url" "text", "p_status" "text", "p_verified" boolean) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."add_cleaner_record"("p_user_id" "uuid", "p_name" "text", "p_bio" "text", "p_avatar_url" "text", "p_status" "text", "p_verified" boolean) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."addauth"("text") TO "postgres";
 GRANT ALL ON FUNCTION "public"."addauth"("text") TO "anon";
 GRANT ALL ON FUNCTION "public"."addauth"("text") TO "authenticated";
@@ -8332,6 +8808,11 @@ GRANT ALL ON FUNCTION "public"."approve_and_complete_booking"("p_booking_id" "uu
 
 
 
+REVOKE ALL ON FUNCTION "public"."approve_cleaner_application"("p_application_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."approve_cleaner_application"("p_application_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "target_role_id" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "target_role_id" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "target_role_id" "text") TO "service_role";
@@ -8341,6 +8822,11 @@ GRANT ALL ON FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "targ
 GRANT ALL ON FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "target_role_id" "text", "is_verified" boolean) TO "anon";
 GRANT ALL ON FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "target_role_id" "text", "is_verified" boolean) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "target_role_id" "text", "is_verified" boolean) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."backfill_cleaner_application_approval"("p_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."backfill_cleaner_application_approval"("p_user_id" "uuid") TO "service_role";
 
 
 
@@ -10519,6 +11005,12 @@ GRANT ALL ON FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" doub
 
 
 
+REVOKE ALL ON FUNCTION "public"."get_own_cleaner_location"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_own_cleaner_location"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_own_cleaner_location"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."get_payment_split_config"() TO "anon";
 GRANT ALL ON FUNCTION "public"."get_payment_split_config"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_payment_split_config"() TO "service_role";
@@ -10763,6 +11255,12 @@ GRANT ALL ON FUNCTION "public"."manage_base_durations"("action" "text", "duratio
 GRANT ALL ON FUNCTION "public"."manage_extra_tasks"("action" "text", "task_id" "text", "new_hours" numeric) TO "anon";
 GRANT ALL ON FUNCTION "public"."manage_extra_tasks"("action" "text", "task_id" "text", "new_hours" numeric) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."manage_extra_tasks"("action" "text", "task_id" "text", "new_hours" numeric) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."normalize_ghana_phone_to_e164"("p_input" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."normalize_ghana_phone_to_e164"("p_input" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."normalize_ghana_phone_to_e164"("p_input" "text") TO "service_role";
 
 
 
@@ -14347,6 +14845,12 @@ GRANT ALL ON FUNCTION "public"."update_conversation_timestamp"() TO "service_rol
 GRANT ALL ON FUNCTION "public"."update_last_updated_column"() TO "anon";
 GRANT ALL ON FUNCTION "public"."update_last_updated_column"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."update_last_updated_column"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."update_own_cleaner_location"("p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."update_own_cleaner_location"("p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_own_cleaner_location"("p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer) TO "service_role";
 
 
 
