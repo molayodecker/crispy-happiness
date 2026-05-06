@@ -4240,7 +4240,8 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_application_drafts" (
     "payload" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "last_saved_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "last_saved_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "cleaner_application_drafts_email_normalized_chk" CHECK ((("email" = "lower"("email")) AND ("length"("btrim"("email")) > 0)))
 );
 
 
@@ -6181,6 +6182,22 @@ CREATE INDEX "idx_bookings_time_decimal" ON "public"."bookings" USING "btree" ("
 
 
 
+CREATE INDEX "idx_cleaner_application_drafts_updated_at_desc" ON "public"."cleaner_application_drafts" USING "btree" ("updated_at" DESC NULLS LAST);
+
+
+
+COMMENT ON INDEX "public"."idx_cleaner_application_drafts_updated_at_desc" IS 'Supports draft lists ordered by updated_at descending.';
+
+
+
+CREATE INDEX "idx_cleaner_applications_created_at_desc" ON "public"."cleaner_applications" USING "btree" ("created_at" DESC NULLS LAST);
+
+
+
+COMMENT ON INDEX "public"."idx_cleaner_applications_created_at_desc" IS 'Supports admin list sorted by created_at descending.';
+
+
+
 CREATE INDEX "idx_cleaner_applications_user_id" ON "public"."cleaner_applications" USING "btree" ("user_id");
 
 
@@ -6202,6 +6219,14 @@ CREATE INDEX "idx_cleaner_base_loc_gist" ON "public"."cleaner_data" USING "gist"
 
 
 CREATE INDEX "idx_cleaner_base_location_gist" ON "public"."cleaner_data" USING "gist" ("base_location");
+
+
+
+CREATE INDEX "idx_cleaner_data_active_updated_at_desc" ON "public"."cleaner_data" USING "btree" ("updated_at" DESC NULLS LAST) WHERE ("status" = 'active'::"public"."cleaner_status");
+
+
+
+COMMENT ON INDEX "public"."idx_cleaner_data_active_updated_at_desc" IS 'Partial index for active cleaners sorted by updated_at (admin active roster).';
 
 
 
@@ -6454,6 +6479,14 @@ CREATE INDEX "idx_transactions_user_id_status" ON "public"."transactions" USING 
 
 
 CREATE INDEX "idx_user_roles_role_id" ON "public"."user_roles" USING "btree" ("role_id");
+
+
+
+CREATE INDEX "idx_user_roles_role_id_user_id" ON "public"."user_roles" USING "btree" ("role_id", "user_id");
+
+
+
+COMMENT ON INDEX "public"."idx_user_roles_role_id_user_id" IS 'Speeds admin roster: fetch all user_ids where role_id = cleaner.';
 
 
 
