@@ -4241,11 +4241,16 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_application_drafts" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "last_saved_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "last_reminded_at" timestamp with time zone,
     CONSTRAINT "cleaner_application_drafts_email_normalized_chk" CHECK ((("email" = "lower"("email")) AND ("length"("btrim"("email")) > 0)))
 );
 
 
 ALTER TABLE "public"."cleaner_application_drafts" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."cleaner_application_drafts"."last_reminded_at" IS 'Last time admin bulk/single reminder was successfully delivered (at least one channel).';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."cleaner_applications" (
@@ -4285,12 +4290,23 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_applications" (
     "reference1_relationship" "text",
     "reference2_relationship" "text",
     "reference3_relationship" "text",
+    "has_cleaning_experience" boolean,
+    "years_of_experience" "text",
+    "previous_employers" "text",
+    "hours_per_week" "text",
+    "available_days" "text"[],
+    "additional_skills" "text"[],
+    "client_description" "text",
     CONSTRAINT "cleaner_applications_kyc_status_check" CHECK (("kyc_status" = ANY (ARRAY['not_started'::"text", 'pending'::"text", 'completed'::"text", 'rejected'::"text", 'on_hold'::"text"]))),
     CONSTRAINT "cleaner_applications_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'approved'::"text", 'rejected'::"text", 'requested_info'::"text"])))
 );
 
 
 ALTER TABLE "public"."cleaner_applications" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."cleaner_applications"."additional_skills" IS 'Free-form/additional skills from join form; cleaner_applications.skills holds specializations.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."cleaner_availability_exceptions" (
@@ -4686,11 +4702,16 @@ CREATE TABLE IF NOT EXISTS "public"."extra_tasks" (
     "label" "text" NOT NULL,
     "hours" numeric(3,1) NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "icon_key" "text"
 );
 
 
 ALTER TABLE "public"."extra_tasks" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."extra_tasks"."icon_key" IS 'Slug: oven, laundry, window, fridge, floor, dishes, bathroom, trash, bedding, wardrobe, upholstery, outdoor, ac, storage, clean. Null = derive from label and task id.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."feedback" (
