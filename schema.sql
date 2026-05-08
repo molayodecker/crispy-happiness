@@ -4378,6 +4378,14 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_leads" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "in_accra" boolean,
+    "current_step" "text" DEFAULT 'awaiting_apply'::"text" NOT NULL,
+    "step_history" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
+    "payload" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "email" "text",
+    "ghana_card_front_path" "text",
+    "ghana_card_back_path" "text",
+    "linked_user_id" "uuid",
+    "submitted_at" timestamp with time zone,
     CONSTRAINT "cleaner_leads_status_check" CHECK (("status" = ANY (ARRAY['new'::"text", 'screened'::"text", 'out_of_area'::"text"]))),
     CONSTRAINT "cleaner_leads_step_check" CHECK (("step" = ANY (ARRAY['start'::"text", 'awaiting_apply'::"text", 'name'::"text", 'accra_check'::"text", 'area'::"text", 'experience'::"text", 'availability'::"text", 'id_upload'::"text", 'completed'::"text", 'out_of_area'::"text"])))
 );
@@ -4386,6 +4394,10 @@ ALTER TABLE ONLY "public"."cleaner_leads" FORCE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."cleaner_leads" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."cleaner_leads"."payload" IS 'Structured pre-screen answers; claim into cleaner_application_drafts after signup.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."cleaner_payouts" (
@@ -6071,7 +6083,15 @@ CREATE INDEX "cleaner_leads_created_at_idx" ON "public"."cleaner_leads" USING "b
 
 
 
+CREATE INDEX "cleaner_leads_linked_user_id_idx" ON "public"."cleaner_leads" USING "btree" ("linked_user_id") WHERE ("linked_user_id" IS NOT NULL);
+
+
+
 CREATE UNIQUE INDEX "cleaner_leads_phone_uniq" ON "public"."cleaner_leads" USING "btree" ("phone");
+
+
+
+CREATE INDEX "cleaner_leads_status_current_step_idx" ON "public"."cleaner_leads" USING "btree" ("status", "current_step");
 
 
 
@@ -6728,6 +6748,11 @@ ALTER TABLE ONLY "public"."cleaner_data"
 
 ALTER TABLE ONLY "public"."cleaner_devices"
     ADD CONSTRAINT "cleaner_devices_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."cleaner_leads"
+    ADD CONSTRAINT "cleaner_leads_linked_user_id_fkey" FOREIGN KEY ("linked_user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
