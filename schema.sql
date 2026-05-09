@@ -4386,6 +4386,8 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_leads" (
     "ghana_card_back_path" "text",
     "linked_user_id" "uuid",
     "submitted_at" timestamp with time zone,
+    "web_continuation_code" "text",
+    "web_continuation_code_expires_at" timestamp with time zone,
     CONSTRAINT "cleaner_leads_status_check" CHECK (("status" = ANY (ARRAY['new'::"text", 'screened'::"text", 'out_of_area'::"text"]))),
     CONSTRAINT "cleaner_leads_step_check" CHECK (("step" = ANY (ARRAY['start'::"text", 'awaiting_apply'::"text", 'name'::"text", 'accra_check'::"text", 'area'::"text", 'experience'::"text", 'availability'::"text", 'id_upload'::"text", 'completed'::"text", 'out_of_area'::"text"])))
 );
@@ -4397,6 +4399,14 @@ ALTER TABLE "public"."cleaner_leads" OWNER TO "postgres";
 
 
 COMMENT ON COLUMN "public"."cleaner_leads"."payload" IS 'Structured pre-screen answers; claim into cleaner_application_drafts after signup.';
+
+
+
+COMMENT ON COLUMN "public"."cleaner_leads"."web_continuation_code" IS '8-char Crockford base32 (no dash) for WEB continue flow; regenerated when user requests website link.';
+
+
+
+COMMENT ON COLUMN "public"."cleaner_leads"."web_continuation_code_expires_at" IS 'TTL for web_continuation_code; enforced in app and Edge.';
 
 
 
@@ -4452,6 +4462,34 @@ ALTER TABLE "public"."cleaner_tracking" OWNER TO "postgres";
 
 COMMENT ON TABLE "public"."cleaner_tracking" IS 'GPS locations shared by cleaners during a booking for customer tracking';
 
+
+
+CREATE TABLE IF NOT EXISTS "public"."cleaner_upload_link_tokens" (
+    "upload_link_id" "uuid" NOT NULL,
+    "upload_token" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."cleaner_upload_link_tokens" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."cleaner_upload_links" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "short_code" "text" NOT NULL,
+    "lead_id" "uuid" NOT NULL,
+    "side" "text" NOT NULL,
+    "expires_at" timestamp with time zone NOT NULL,
+    "used_at" timestamp with time zone,
+    "revoked_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "cleaner_upload_links_expires_after_created_ck" CHECK (("expires_at" > "created_at")),
+    CONSTRAINT "cleaner_upload_links_short_code_format_ck" CHECK (("short_code" ~ '^[A-Za-z0-9]{6,12}$'::"text")),
+    CONSTRAINT "cleaner_upload_links_side_check" CHECK (("side" = ANY (ARRAY['front'::"text", 'back'::"text"])))
+);
+
+
+ALTER TABLE "public"."cleaner_upload_links" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."cleaner_verifications" (
@@ -5676,6 +5714,16 @@ ALTER TABLE ONLY "public"."cleaner_tracking"
 
 
 
+ALTER TABLE ONLY "public"."cleaner_upload_link_tokens"
+    ADD CONSTRAINT "cleaner_upload_link_tokens_pkey" PRIMARY KEY ("upload_link_id");
+
+
+
+ALTER TABLE ONLY "public"."cleaner_upload_links"
+    ADD CONSTRAINT "cleaner_upload_links_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."cleaner_verifications"
     ADD CONSTRAINT "cleaner_verifications_pkey" PRIMARY KEY ("id");
 
@@ -6099,6 +6147,10 @@ CREATE INDEX "cleaner_leads_status_idx" ON "public"."cleaner_leads" USING "btree
 
 
 
+CREATE UNIQUE INDEX "cleaner_leads_web_continuation_code_key" ON "public"."cleaner_leads" USING "btree" ("web_continuation_code") WHERE ("web_continuation_code" IS NOT NULL);
+
+
+
 CREATE INDEX "cleaner_payouts_transfer_code_idx" ON "public"."cleaner_payouts" USING "btree" ("paystack_transfer_code") WHERE ("paystack_transfer_code" IS NOT NULL);
 
 
@@ -6108,6 +6160,26 @@ CREATE INDEX "cleaner_payouts_user_created_idx" ON "public"."cleaner_payouts" US
 
 
 CREATE UNIQUE INDEX "cleaner_payouts_user_reference_uidx" ON "public"."cleaner_payouts" USING "btree" ("user_id", "reference");
+
+
+
+CREATE UNIQUE INDEX "cleaner_upload_link_tokens_upload_token_uidx" ON "public"."cleaner_upload_link_tokens" USING "btree" ("upload_token");
+
+
+
+CREATE UNIQUE INDEX "cleaner_upload_links_active_lead_side_uidx" ON "public"."cleaner_upload_links" USING "btree" ("lead_id", "side") WHERE (("used_at" IS NULL) AND ("revoked_at" IS NULL));
+
+
+
+CREATE INDEX "cleaner_upload_links_expires_at_idx" ON "public"."cleaner_upload_links" USING "btree" ("expires_at");
+
+
+
+CREATE INDEX "cleaner_upload_links_lead_id_idx" ON "public"."cleaner_upload_links" USING "btree" ("lead_id");
+
+
+
+CREATE UNIQUE INDEX "cleaner_upload_links_short_code_uidx" ON "public"."cleaner_upload_links" USING "btree" ("short_code");
 
 
 
@@ -6773,6 +6845,16 @@ ALTER TABLE ONLY "public"."cleaner_tracking"
 
 ALTER TABLE ONLY "public"."cleaner_tracking"
     ADD CONSTRAINT "cleaner_tracking_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."cleaner_upload_link_tokens"
+    ADD CONSTRAINT "cleaner_upload_link_tokens_upload_link_id_fkey" FOREIGN KEY ("upload_link_id") REFERENCES "public"."cleaner_upload_links"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."cleaner_upload_links"
+    ADD CONSTRAINT "cleaner_upload_links_lead_id_fkey" FOREIGN KEY ("lead_id") REFERENCES "public"."cleaner_leads"("id") ON DELETE CASCADE;
 
 
 
@@ -7561,6 +7643,16 @@ CREATE POLICY "cleaner_tracking_insert_policy" ON "public"."cleaner_tracking" FO
 CREATE POLICY "cleaner_tracking_select_policy" ON "public"."cleaner_tracking" FOR SELECT USING ((EXISTS ( SELECT 1
    FROM "public"."bookings" "b"
   WHERE (("b"."id" = "cleaner_tracking"."booking_id") AND (("b"."customer_id" = "auth"."uid"()) OR ("b"."cleaner_id" = "auth"."uid"()))))));
+
+
+
+ALTER TABLE "public"."cleaner_upload_link_tokens" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."cleaner_upload_links" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "cleaner_upload_links_select_active_public" ON "public"."cleaner_upload_links" FOR SELECT TO "authenticated", "anon" USING ((("used_at" IS NULL) AND ("revoked_at" IS NULL) AND ("expires_at" > "now"())));
 
 
 
@@ -15235,6 +15327,39 @@ GRANT ALL ON TABLE "public"."cleaner_schedules" TO "service_role";
 GRANT ALL ON TABLE "public"."cleaner_tracking" TO "anon";
 GRANT ALL ON TABLE "public"."cleaner_tracking" TO "authenticated";
 GRANT ALL ON TABLE "public"."cleaner_tracking" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."cleaner_upload_link_tokens" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."cleaner_upload_links" TO "service_role";
+
+
+
+GRANT SELECT("short_code") ON TABLE "public"."cleaner_upload_links" TO "anon";
+GRANT SELECT("short_code") ON TABLE "public"."cleaner_upload_links" TO "authenticated";
+
+
+
+GRANT SELECT("side") ON TABLE "public"."cleaner_upload_links" TO "anon";
+GRANT SELECT("side") ON TABLE "public"."cleaner_upload_links" TO "authenticated";
+
+
+
+GRANT SELECT("expires_at") ON TABLE "public"."cleaner_upload_links" TO "anon";
+GRANT SELECT("expires_at") ON TABLE "public"."cleaner_upload_links" TO "authenticated";
+
+
+
+GRANT SELECT("used_at") ON TABLE "public"."cleaner_upload_links" TO "anon";
+GRANT SELECT("used_at") ON TABLE "public"."cleaner_upload_links" TO "authenticated";
+
+
+
+GRANT SELECT("revoked_at") ON TABLE "public"."cleaner_upload_links" TO "anon";
+GRANT SELECT("revoked_at") ON TABLE "public"."cleaner_upload_links" TO "authenticated";
 
 
 
