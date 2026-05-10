@@ -5468,58 +5468,70 @@ END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.get_user_profile_data(p_user_id uuid, p_is_cleaner boolean)
+CREATE OR REPLACE FUNCTION public.get_user_profile_data(p_user_id uuid, p_is_cleaner boolean DEFAULT false)
  RETURNS json
  LANGUAGE plpgsql
  SECURITY DEFINER
+ SET search_path TO 'public'
 AS $function$
 DECLARE
-    v_profile json;
-    v_cleaner json;
-    v_notifications json;
+  v_profile json;
+  v_cleaner json;
+  v_notifications json;
+  v_roles json;
 BEGIN
-    -- 1. Fetch Profile Data
-    SELECT json_build_object(
-        'fullname', fullname,
-        'firstname', firstname,
-        'lastname', lastname,
-        'avatar_url', avatar_url,
-        'bio', bio,
-        'address', address
-    ) INTO v_profile
-    FROM public.profiles
-    WHERE id = p_user_id;
+  IF auth.uid() IS NULL OR auth.uid() <> p_user_id THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
 
-    -- 2. Fetch Cleaner Data (only if cleaner mode is active)
-    IF p_is_cleaner THEN
-        SELECT json_build_object(
-            'rating', rating,
-            'completed_jobs', completed_jobs,
-            'hourly_rate', hourly_rate,
-            'verified', verified
-        ) INTO v_cleaner
-        FROM public.cleaner_data
-        WHERE user_id = p_user_id;
-    ELSE
-        v_cleaner := null;
-    END IF;
+  SELECT json_build_object(
+    'fullname', fullname,
+    'firstname', firstname,
+    'lastname', lastname,
+    'avatar_url', avatar_url,
+    'bio', bio,
+    'address', address,
+    'deactivated_at', deactivated_at,
+    'deletion_status', deletion_status,
+    'deletion_requested_at', deletion_requested_at,
+    'deletion_scheduled_for', deletion_scheduled_for,
+    'deletion_started_at', deletion_started_at,
+    'deletion_completed_at', deletion_completed_at
+  )
+  INTO v_profile
+  FROM public.profiles
+  WHERE id = p_user_id;
 
-    -- 3. Fetch Top 5 Recent Notifications
-    SELECT json_agg(t) INTO v_notifications
-    FROM (
-        SELECT id, type, message, created_at
-        FROM public.notifications
-        WHERE user_id = p_user_id
-        ORDER BY created_at DESC
-        LIMIT 5
-    ) t;
+  SELECT json_build_object(
+    'rating', rating,
+    'completed_jobs', completed_jobs,
+    'hourly_rate', hourly_rate,
+    'verified', verified
+  )
+  INTO v_cleaner
+  FROM public.cleaner_data
+  WHERE user_id = p_user_id;
 
-    -- Return a combined JSON object
-    RETURN json_build_object(
-        'profile', v_profile,
-        'cleaner', v_cleaner,
-        'notifications', COALESCE(v_notifications, '[]'::json)
-    );
+  SELECT json_agg(role_id) INTO v_roles
+  FROM public.user_roles
+  WHERE user_id = p_user_id;
+
+  SELECT json_agg(t) INTO v_notifications
+  FROM (
+    SELECT id, type, message, created_at
+    FROM public.notifications
+    WHERE user_id = p_user_id
+    ORDER BY created_at DESC
+    LIMIT 5
+  ) t;
+
+  RETURN json_build_object(
+    'profile', COALESCE(v_profile, '{}'::json),
+    'profile_exists', v_profile IS NOT NULL,
+    'cleaner', v_cleaner,
+    'roles', COALESCE(v_roles, '[]'::json),
+    'notifications', COALESCE(v_notifications, '[]'::json)
+  );
 END;
 $function$
 
@@ -11207,6 +11219,17 @@ CREATE OR REPLACE FUNCTION public.time_dist(time without time zone, time without
 AS '$libdir/btree_gist', $function$time_dist$function$
 
 
+CREATE OR REPLACE FUNCTION public.touch_payout_methods_updated_at()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.trigger_paystack_on_approval()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -11833,6 +11856,8 @@ CREATE TRIGGER tr_on_cleaner_created AFTER INSERT ON cleaner_data FOR EACH ROW E
 CREATE TRIGGER geo_reverse_cache_set_updated_at BEFORE UPDATE ON geo_reverse_cache FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TRIGGER trigger_sync_convo_time AFTER INSERT ON messages FOR EACH ROW EXECUTE FUNCTION update_conversation_timestamp();
+
+CREATE TRIGGER payout_methods_touch_updated_at BEFORE UPDATE ON payout_methods FOR EACH ROW EXECUTE FUNCTION touch_payout_methods_updated_at();
 
 CREATE TRIGGER ensure_single_default_platform_fee_trigger BEFORE INSERT OR UPDATE ON platform_fees FOR EACH ROW WHEN (new.is_default = true) EXECUTE FUNCTION ensure_single_default_platform_fee();
 

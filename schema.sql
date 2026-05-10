@@ -2568,61 +2568,77 @@ $$;
 ALTER FUNCTION "public"."get_timezone_from_coordinates"("latitude" numeric, "longitude" numeric) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleaner" boolean) RETURNS json
+CREATE OR REPLACE FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleaner" boolean DEFAULT false) RETURNS json
     LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
     AS $$
 DECLARE
-    v_profile json;
-    v_cleaner json;
-    v_notifications json;
+  v_profile json;
+  v_cleaner json;
+  v_notifications json;
+  v_roles json;
 BEGIN
-    -- 1. Fetch Profile Data
-    SELECT json_build_object(
-        'fullname', fullname,
-        'firstname', firstname,
-        'lastname', lastname,
-        'avatar_url', avatar_url,
-        'bio', bio,
-        'address', address
-    ) INTO v_profile
-    FROM public.profiles
-    WHERE id = p_user_id;
+  IF auth.uid() IS NULL OR auth.uid() <> p_user_id THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
 
-    -- 2. Fetch Cleaner Data (only if cleaner mode is active)
-    IF p_is_cleaner THEN
-        SELECT json_build_object(
-            'rating', rating,
-            'completed_jobs', completed_jobs,
-            'hourly_rate', hourly_rate,
-            'verified', verified
-        ) INTO v_cleaner
-        FROM public.cleaner_data
-        WHERE user_id = p_user_id;
-    ELSE
-        v_cleaner := null;
-    END IF;
+  SELECT json_build_object(
+    'fullname', fullname,
+    'firstname', firstname,
+    'lastname', lastname,
+    'avatar_url', avatar_url,
+    'bio', bio,
+    'address', address,
+    'deactivated_at', deactivated_at,
+    'deletion_status', deletion_status,
+    'deletion_requested_at', deletion_requested_at,
+    'deletion_scheduled_for', deletion_scheduled_for,
+    'deletion_started_at', deletion_started_at,
+    'deletion_completed_at', deletion_completed_at
+  )
+  INTO v_profile
+  FROM public.profiles
+  WHERE id = p_user_id;
 
-    -- 3. Fetch Top 5 Recent Notifications
-    SELECT json_agg(t) INTO v_notifications
-    FROM (
-        SELECT id, type, message, created_at
-        FROM public.notifications
-        WHERE user_id = p_user_id
-        ORDER BY created_at DESC
-        LIMIT 5
-    ) t;
+  SELECT json_build_object(
+    'rating', rating,
+    'completed_jobs', completed_jobs,
+    'hourly_rate', hourly_rate,
+    'verified', verified
+  )
+  INTO v_cleaner
+  FROM public.cleaner_data
+  WHERE user_id = p_user_id;
 
-    -- Return a combined JSON object
-    RETURN json_build_object(
-        'profile', v_profile,
-        'cleaner', v_cleaner,
-        'notifications', COALESCE(v_notifications, '[]'::json)
-    );
+  SELECT json_agg(role_id) INTO v_roles
+  FROM public.user_roles
+  WHERE user_id = p_user_id;
+
+  SELECT json_agg(t) INTO v_notifications
+  FROM (
+    SELECT id, type, message, created_at
+    FROM public.notifications
+    WHERE user_id = p_user_id
+    ORDER BY created_at DESC
+    LIMIT 5
+  ) t;
+
+  RETURN json_build_object(
+    'profile', COALESCE(v_profile, '{}'::json),
+    'profile_exists', v_profile IS NOT NULL,
+    'cleaner', v_cleaner,
+    'roles', COALESCE(v_roles, '[]'::json),
+    'notifications', COALESCE(v_notifications, '[]'::json)
+  );
 END;
 $$;
 
 
 ALTER FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleaner" boolean) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleaner" boolean) IS 'Owner-only session/dashboard payload (profile lifecycle, roles, notifications). Unauthorized if auth.uid() <> p_user_id. Not for public profile lookup; add get_public_user_profile_data for listings/cards if needed.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."get_user_profile_stats"("p_user_id" "uuid", "p_is_cleaner" boolean DEFAULT false) RETURNS json
@@ -3675,6 +3691,23 @@ $$;
 ALTER FUNCTION "public"."sync_auth_user_to_public_user"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."touch_payout_methods_updated_at"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."touch_payout_methods_updated_at"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."touch_payout_methods_updated_at"() IS 'Keeps payout_methods.updated_at aligned with row mutations.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."trigger_paystack_on_approval"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public', 'pg_temp'
@@ -4583,11 +4616,47 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "preferences" "jsonb" DEFAULT '{}'::"jsonb",
     "notification_settings" "jsonb" DEFAULT '{"app": true, "sms": true, "email": true}'::"jsonb",
     "updated_at" timestamp with time zone DEFAULT "now"(),
-    "user_id" "uuid" NOT NULL
+    "user_id" "uuid" NOT NULL,
+    "deleted_at" timestamp with time zone,
+    "deactivated_at" timestamp with time zone,
+    "deletion_requested_at" timestamp with time zone,
+    "deletion_scheduled_for" timestamp with time zone,
+    "deletion_started_at" timestamp with time zone,
+    "deletion_completed_at" timestamp with time zone,
+    "deletion_status" "text" DEFAULT 'none'::"text" NOT NULL,
+    CONSTRAINT "profiles_deletion_status_check" CHECK (("deletion_status" = ANY (ARRAY['none'::"text", 'scheduled'::"text", 'cancelled'::"text", 'processing'::"text", 'completed'::"text"])))
 );
 
 
 ALTER TABLE "public"."profiles" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."profiles"."deleted_at" IS 'When set, legacy soft-delete: hidden from non-owners. Prefer deactivated_at + deletion_status for new flows.';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."deactivated_at" IS 'When set, profile is deactivated (hidden from others per RLS + app rules). Distinct from permanent deletion lifecycle.';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."deletion_requested_at" IS 'When the user requested permanent account deletion.';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."deletion_scheduled_for" IS 'End of the cancellation grace period; trusted deletion job may start at or after this time.';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."deletion_started_at" IS 'When the anonymization/removal job began for this account.';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."deletion_completed_at" IS 'When active-system anonymization completed; backups may persist longer (~90 days).';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."deletion_status" IS 'Lifecycle: none | scheduled | cancelled | processing | completed.';
+
 
 
 CREATE OR REPLACE VIEW "public"."conversation_list" AS
@@ -5144,11 +5213,20 @@ CREATE TABLE IF NOT EXISTS "public"."payout_methods" (
     "currency" "text" DEFAULT 'GHS'::"text",
     "is_primary" boolean DEFAULT false,
     "is_default" boolean DEFAULT false,
-    "created_at" timestamp with time zone DEFAULT "now"()
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
 );
 
 
 ALTER TABLE "public"."payout_methods" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."payout_methods" IS 'Cleaner payout destinations; client CRUD is owner-scoped via RLS. Service role / Edge Functions bypass RLS.';
+
+
+
+COMMENT ON COLUMN "public"."payout_methods"."updated_at" IS 'Maintained by BEFORE UPDATE trigger and default on INSERT.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."platform_fees" (
@@ -6527,6 +6605,14 @@ CREATE UNIQUE INDEX "idx_pricing_rules_single_active" ON "public"."pricing_rules
 
 
 
+CREATE INDEX "idx_profiles_deletion_scheduled_for" ON "public"."profiles" USING "btree" ("deletion_scheduled_for") WHERE ("deletion_status" = 'scheduled'::"text");
+
+
+
+CREATE INDEX "idx_profiles_deletion_status" ON "public"."profiles" USING "btree" ("deletion_status");
+
+
+
 CREATE INDEX "idx_profiles_id" ON "public"."profiles" USING "btree" ("id");
 
 
@@ -6679,6 +6765,14 @@ CREATE INDEX "kyc_profiles_user_id_idx" ON "public"."kyc_profiles" USING "btree"
 
 
 
+CREATE UNIQUE INDEX "one_default_payout_method_per_user" ON "public"."payout_methods" USING "btree" ("user_id") WHERE ("is_default" IS TRUE);
+
+
+
+COMMENT ON INDEX "public"."one_default_payout_method_per_user" IS 'At most one payout_methods row per user may have is_default TRUE. Fix duplicate defaults before applying if migration fails.';
+
+
+
 CREATE UNIQUE INDEX "profiles_user_id_key" ON "public"."profiles" USING "btree" ("user_id");
 
 
@@ -6728,6 +6822,10 @@ CREATE OR REPLACE TRIGGER "geo_reverse_cache_set_updated_at" BEFORE UPDATE ON "p
 
 
 CREATE OR REPLACE TRIGGER "on_booking_completed" AFTER UPDATE ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."handle_job_completion"();
+
+
+
+CREATE OR REPLACE TRIGGER "payout_methods_touch_updated_at" BEFORE UPDATE ON "public"."payout_methods" FOR EACH ROW EXECUTE FUNCTION "public"."touch_payout_methods_updated_at"();
 
 
 
@@ -7280,7 +7378,11 @@ CREATE POLICY "Profiles are viewable by everyone" ON "public"."profiles" FOR SEL
 
 
 
-CREATE POLICY "Public profiles are viewable" ON "public"."profiles" FOR SELECT TO "authenticated" USING (true);
+CREATE POLICY "Public profiles are viewable" ON "public"."profiles" FOR SELECT TO "authenticated" USING ((("auth"."uid"() = "id") OR (("deleted_at" IS NULL) AND ("deactivated_at" IS NULL) AND ("deletion_status" <> ALL (ARRAY['scheduled'::"text", 'processing'::"text", 'completed'::"text"])))));
+
+
+
+COMMENT ON POLICY "Public profiles are viewable" ON "public"."profiles" IS 'Owners always read their row; others skip deactivated, legacy-deleted, or deletion pipeline rows.';
 
 
 
@@ -7805,6 +7907,22 @@ ALTER TABLE "public"."payment_split_config" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."payout_methods" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "payout_methods_owner_delete" ON "public"."payout_methods" FOR DELETE TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "payout_methods_owner_insert" ON "public"."payout_methods" FOR INSERT TO "authenticated" WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "payout_methods_owner_select" ON "public"."payout_methods" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "payout_methods_owner_update" ON "public"."payout_methods" FOR UPDATE TO "authenticated" USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
+
 
 
 ALTER TABLE "public"."platform_fees" ENABLE ROW LEVEL SECURITY;
@@ -11213,6 +11331,7 @@ GRANT ALL ON FUNCTION "public"."get_timezone_from_coordinates"("latitude" numeri
 
 
 
+REVOKE ALL ON FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleaner" boolean) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleaner" boolean) TO "anon";
 GRANT ALL ON FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleaner" boolean) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_user_profile_data"("p_user_id" "uuid", "p_is_cleaner" boolean) TO "service_role";
@@ -14965,6 +15084,12 @@ GRANT ALL ON FUNCTION "public"."time_dist"(time without time zone, time without 
 GRANT ALL ON FUNCTION "public"."time_dist"(time without time zone, time without time zone) TO "anon";
 GRANT ALL ON FUNCTION "public"."time_dist"(time without time zone, time without time zone) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."time_dist"(time without time zone, time without time zone) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."touch_payout_methods_updated_at"() TO "anon";
+GRANT ALL ON FUNCTION "public"."touch_payout_methods_updated_at"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."touch_payout_methods_updated_at"() TO "service_role";
 
 
 
