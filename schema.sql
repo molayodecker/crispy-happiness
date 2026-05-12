@@ -5166,11 +5166,15 @@ CREATE TABLE IF NOT EXISTS "public"."kyc_profiles" (
     "last_event_created_at_ms" bigint,
     "last_webhook_payload" "jsonb",
     CONSTRAINT "kyc_profiles_kyc_status_check" CHECK (("kyc_status" = ANY (ARRAY['not_started'::"text", 'started'::"text", 'submitted'::"text", 'completed'::"text", 'approved'::"text", 'rejected'::"text", 'failed'::"text"]))),
-    CONSTRAINT "kyc_profiles_subject_type_check" CHECK (("subject_type" = ANY (ARRAY['user'::"text", 'cleaner'::"text"])))
+    CONSTRAINT "kyc_profiles_subject_type_check" CHECK (("subject_type" = ANY (ARRAY['customer'::"text", 'cleaner'::"text", 'user'::"text"])))
 );
 
 
 ALTER TABLE "public"."kyc_profiles" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."kyc_profiles"."subject_type" IS 'Canonical values: customer, cleaner. ''user'' is a legacy alias kept temporarily; remove once no writers emit it.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."notifications" (
