@@ -3220,6 +3220,37 @@ $$;
 ALTER FUNCTION "public"."manage_extra_tasks"("action" "text", "task_id" "text", "new_hours" numeric) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."normalize_ghana_mobile_e164_ts"("p_input" "text") RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE STRICT
+    AS $_$
+  WITH compact AS (
+    SELECT regexp_replace(trim(p_input), '[\s\-()]', '', 'g') AS c
+  ),
+  plus2330_fix AS (
+    SELECT
+      CASE
+        WHEN c ~ '^\+2330[2-5][0-9]{8}$'
+        THEN '+233' || substr(c, 6)
+        ELSE c
+      END AS c2
+    FROM compact
+  ),
+  extracted AS (
+    SELECT (regexp_match(c2, '^(?:\+?233|0)?([2-5][0-9]{8})$'))[1] AS nsn
+    FROM plus2330_fix
+  )
+  SELECT CASE WHEN nsn IS NULL THEN NULL ELSE '+233' || nsn END
+  FROM extracted;
+$_$;
+
+
+ALTER FUNCTION "public"."normalize_ghana_mobile_e164_ts"("p_input" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."normalize_ghana_mobile_e164_ts"("p_input" "text") IS 'Ghana mobile E.164 aligned with lib/phone-auth normalizeGhanaPhoneToE164 (+2330 collapse, NSN [2-5]…).';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."normalize_ghana_phone_to_e164"("p_input" "text") RETURNS "text"
     LANGUAGE "plpgsql" IMMUTABLE
     AS $_$
@@ -4330,6 +4361,8 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_applications" (
     "available_days" "text"[],
     "additional_skills" "text"[],
     "client_description" "text",
+    "equipment_status" "text",
+    "applicant_bio" "text",
     CONSTRAINT "cleaner_applications_kyc_status_check" CHECK (("kyc_status" = ANY (ARRAY['not_started'::"text", 'pending'::"text", 'completed'::"text", 'rejected'::"text", 'on_hold'::"text"]))),
     CONSTRAINT "cleaner_applications_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'approved'::"text", 'rejected'::"text", 'requested_info'::"text"])))
 );
@@ -4338,7 +4371,31 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_applications" (
 ALTER TABLE "public"."cleaner_applications" OWNER TO "postgres";
 
 
+COMMENT ON COLUMN "public"."cleaner_applications"."availability" IS 'Join form snapshot JSON: availableDays, preferredShifts, startDate, hoursPerWeek.';
+
+
+
+COMMENT ON COLUMN "public"."cleaner_applications"."reference1_relationship" IS 'Join form: relationship to reference / guarantor 1.';
+
+
+
+COMMENT ON COLUMN "public"."cleaner_applications"."reference2_relationship" IS 'Join form: relationship to reference / guarantor 2.';
+
+
+
+COMMENT ON COLUMN "public"."cleaner_applications"."reference3_relationship" IS 'Join form: relationship to reference / guarantor 3.';
+
+
+
 COMMENT ON COLUMN "public"."cleaner_applications"."additional_skills" IS 'Free-form/additional skills from join form; cleaner_applications.skills holds specializations.';
+
+
+
+COMMENT ON COLUMN "public"."cleaner_applications"."equipment_status" IS 'Join form: equipment answer label (web radio / WhatsApp mapped string).';
+
+
+
+COMMENT ON COLUMN "public"."cleaner_applications"."applicant_bio" IS 'Join form step 1: applicant-written bio (distinct from composed review summary in bio).';
 
 
 
@@ -11549,6 +11606,12 @@ GRANT ALL ON FUNCTION "public"."manage_base_durations"("action" "text", "duratio
 GRANT ALL ON FUNCTION "public"."manage_extra_tasks"("action" "text", "task_id" "text", "new_hours" numeric) TO "anon";
 GRANT ALL ON FUNCTION "public"."manage_extra_tasks"("action" "text", "task_id" "text", "new_hours" numeric) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."manage_extra_tasks"("action" "text", "task_id" "text", "new_hours" numeric) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."normalize_ghana_mobile_e164_ts"("p_input" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."normalize_ghana_mobile_e164_ts"("p_input" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."normalize_ghana_mobile_e164_ts"("p_input" "text") TO "service_role";
 
 
 

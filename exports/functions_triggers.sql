@@ -6274,6 +6274,32 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.normalize_ghana_mobile_e164_ts(p_input text)
+ RETURNS text
+ LANGUAGE sql
+ IMMUTABLE STRICT
+AS $function$
+  WITH compact AS (
+    SELECT regexp_replace(trim(p_input), '[\s\-()]', '', 'g') AS c
+  ),
+  plus2330_fix AS (
+    SELECT
+      CASE
+        WHEN c ~ '^\+2330[2-5][0-9]{8}$'
+        THEN '+233' || substr(c, 6)
+        ELSE c
+      END AS c2
+    FROM compact
+  ),
+  extracted AS (
+    SELECT (regexp_match(c2, '^(?:\+?233|0)?([2-5][0-9]{8})$'))[1] AS nsn
+    FROM plus2330_fix
+  )
+  SELECT CASE WHEN nsn IS NULL THEN NULL ELSE '+233' || nsn END
+  FROM extracted;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.normalize_ghana_phone_to_e164(p_input text)
  RETURNS text
  LANGUAGE plpgsql
