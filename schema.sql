@@ -4306,6 +4306,8 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_application_drafts" (
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "last_saved_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "last_reminded_at" timestamp with time zone,
+    "ops_started_notice_sent_at" timestamp with time zone,
+    "ops_stale_draft_reminder_sent_at" timestamp with time zone,
     CONSTRAINT "cleaner_application_drafts_email_normalized_chk" CHECK ((("email" = "lower"("email")) AND ("length"("btrim"("email")) > 0)))
 );
 
@@ -4314,6 +4316,14 @@ ALTER TABLE "public"."cleaner_application_drafts" OWNER TO "postgres";
 
 
 COMMENT ON COLUMN "public"."cleaner_application_drafts"."last_reminded_at" IS 'Last time admin bulk/single reminder was successfully delivered (at least one channel).';
+
+
+
+COMMENT ON COLUMN "public"."cleaner_application_drafts"."ops_started_notice_sent_at" IS 'First time ops list was notified this account saved a join-as-cleaner draft.';
+
+
+
+COMMENT ON COLUMN "public"."cleaner_application_drafts"."ops_stale_draft_reminder_sent_at" IS 'Last time ops list received the 48h stale-draft reminder; cleared on draft save so silence can re-trigger.';
 
 
 
@@ -4363,6 +4373,7 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_applications" (
     "client_description" "text",
     "equipment_status" "text",
     "applicant_bio" "text",
+    "ops_pending_review_reminder_sent_at" timestamp with time zone,
     CONSTRAINT "cleaner_applications_kyc_status_check" CHECK (("kyc_status" = ANY (ARRAY['not_started'::"text", 'pending'::"text", 'completed'::"text", 'rejected'::"text", 'on_hold'::"text"]))),
     CONSTRAINT "cleaner_applications_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'approved'::"text", 'rejected'::"text", 'requested_info'::"text"])))
 );
@@ -4396,6 +4407,10 @@ COMMENT ON COLUMN "public"."cleaner_applications"."equipment_status" IS 'Join fo
 
 
 COMMENT ON COLUMN "public"."cleaner_applications"."applicant_bio" IS 'Join form step 1: applicant-written bio (distinct from composed review summary in bio).';
+
+
+
+COMMENT ON COLUMN "public"."cleaner_applications"."ops_pending_review_reminder_sent_at" IS 'When ops list was emailed that this row was still pending review after 24h; cleared on each resubmit while pending.';
 
 
 
@@ -4478,6 +4493,7 @@ CREATE TABLE IF NOT EXISTS "public"."cleaner_leads" (
     "submitted_at" timestamp with time zone,
     "web_continuation_code" "text",
     "web_continuation_code_expires_at" timestamp with time zone,
+    "ops_started_notice_sent_at" timestamp with time zone,
     CONSTRAINT "cleaner_leads_status_check" CHECK (("status" = ANY (ARRAY['new'::"text", 'screened'::"text", 'out_of_area'::"text"]))),
     CONSTRAINT "cleaner_leads_step_check" CHECK (("step" = ANY (ARRAY['start'::"text", 'awaiting_apply'::"text", 'name'::"text", 'accra_check'::"text", 'area'::"text", 'experience'::"text", 'availability'::"text", 'id_upload'::"text", 'completed'::"text", 'out_of_area'::"text"])))
 );
@@ -4497,6 +4513,10 @@ COMMENT ON COLUMN "public"."cleaner_leads"."web_continuation_code" IS '8-char Cr
 
 
 COMMENT ON COLUMN "public"."cleaner_leads"."web_continuation_code_expires_at" IS 'TTL for web_continuation_code; enforced in app and Edge.';
+
+
+
+COMMENT ON COLUMN "public"."cleaner_leads"."ops_started_notice_sent_at" IS 'First time ops list was notified this WhatsApp lead began APPLY (left awaiting_apply).';
 
 
 
