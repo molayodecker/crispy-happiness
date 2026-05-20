@@ -4299,7 +4299,7 @@ COMMENT ON COLUMN "public"."bookings"."customer_rating" IS 'Cleaner rating of cu
 CREATE TABLE IF NOT EXISTS "public"."cleaner_application_drafts" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid" NOT NULL,
-    "email" "text" NOT NULL,
+    "email" "text",
     "current_step" integer DEFAULT 1 NOT NULL,
     "payload" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
@@ -4330,7 +4330,7 @@ COMMENT ON COLUMN "public"."cleaner_application_drafts"."ops_stale_draft_reminde
 CREATE TABLE IF NOT EXISTS "public"."cleaner_applications" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "name" "text" NOT NULL,
-    "email" "text" NOT NULL,
+    "email" "text",
     "phone" "text" NOT NULL,
     "bio" "text" NOT NULL,
     "skills" "text"[] DEFAULT '{}'::"text"[],
@@ -6270,7 +6270,7 @@ CREATE UNIQUE INDEX "cleaner_application_drafts_user_id_key" ON "public"."cleane
 
 
 
-CREATE UNIQUE INDEX "cleaner_applications_email_uniq" ON "public"."cleaner_applications" USING "btree" ("lower"("email"));
+CREATE UNIQUE INDEX "cleaner_applications_email_uniq" ON "public"."cleaner_applications" USING "btree" ("lower"(TRIM(BOTH FROM "email"))) WHERE ("email" IS NOT NULL);
 
 
 
