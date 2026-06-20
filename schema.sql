@@ -7779,6 +7779,19 @@ $$;
 ALTER FUNCTION "public"."touch_booking_refunds_updated_at"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."touch_message_delivery_attempt_updated_at"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."touch_message_delivery_attempt_updated_at"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."touch_payout_methods_updated_at"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -9751,6 +9764,33 @@ COMMENT ON COLUMN "public"."kyc_profiles"."subject_type" IS 'Canonical values: c
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."message_delivery_attempts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid",
+    "booking_id" "uuid",
+    "channel" "text" NOT NULL,
+    "provider" "text" DEFAULT 'twilio'::"text" NOT NULL,
+    "message_type" "text" NOT NULL,
+    "template_key" "text" NOT NULL,
+    "to_phone" "text" NOT NULL,
+    "provider_message_sid" "text",
+    "status" "text" DEFAULT 'queued'::"text" NOT NULL,
+    "error_code" "text",
+    "error_message" "text",
+    "template_variables" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "parent_attempt_id" "uuid",
+    "fallback_after" timestamp with time zone,
+    "fallback_checked_at" timestamp with time zone,
+    "fallback_sent_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "message_delivery_attempts_channel_check" CHECK (("channel" = ANY (ARRAY['sms'::"text", 'whatsapp'::"text", 'push'::"text"])))
+);
+
+
+ALTER TABLE "public"."message_delivery_attempts" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."notifications" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid",
@@ -10648,6 +10688,16 @@ ALTER TABLE ONLY "public"."kyc_profiles"
 
 
 
+ALTER TABLE ONLY "public"."message_delivery_attempts"
+    ADD CONSTRAINT "message_delivery_attempts_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."message_delivery_attempts"
+    ADD CONSTRAINT "message_delivery_attempts_provider_sid_unique" UNIQUE ("provider_message_sid");
+
+
+
 ALTER TABLE ONLY "public"."messages"
     ADD CONSTRAINT "messages_pkey" PRIMARY KEY ("id");
 
@@ -11325,6 +11375,18 @@ CREATE INDEX "idx_jobs_status" ON "public"."jobs" USING "btree" ("status");
 
 
 
+CREATE INDEX "idx_message_delivery_dedupe" ON "public"."message_delivery_attempts" USING "btree" ("user_id", "booking_id", "message_type", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_message_delivery_parent" ON "public"."message_delivery_attempts" USING "btree" ("parent_attempt_id") WHERE ("parent_attempt_id" IS NOT NULL);
+
+
+
+CREATE INDEX "idx_message_delivery_sms_fallback_pending" ON "public"."message_delivery_attempts" USING "btree" ("fallback_after") WHERE (("channel" = 'sms'::"text") AND ("fallback_sent_at" IS NULL) AND ("fallback_checked_at" IS NULL) AND ("fallback_after" IS NOT NULL) AND ("status" <> ALL (ARRAY['delivered'::"text", 'failed'::"text", 'undelivered'::"text"])));
+
+
+
 CREATE INDEX "idx_messages_conv_id" ON "public"."messages" USING "btree" ("conversation_id", "created_at" DESC);
 
 
@@ -11705,6 +11767,10 @@ CREATE OR REPLACE TRIGGER "trg_init_direct_assignment_on_paid" BEFORE INSERT OR 
 
 
 
+CREATE OR REPLACE TRIGGER "trg_message_delivery_attempts_updated_at" BEFORE UPDATE ON "public"."message_delivery_attempts" FOR EACH ROW EXECUTE FUNCTION "public"."touch_message_delivery_attempt_updated_at"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_profiles_fullname" BEFORE INSERT OR UPDATE OF "firstname", "middlename", "lastname" ON "public"."profiles" FOR EACH ROW EXECUTE FUNCTION "public"."fn_sync_profile_fullname"();
 
 
@@ -11973,6 +12039,21 @@ ALTER TABLE ONLY "public"."kyc_profiles"
 
 ALTER TABLE ONLY "public"."kyc_profiles"
     ADD CONSTRAINT "kyc_profiles_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."message_delivery_attempts"
+    ADD CONSTRAINT "message_delivery_attempts_booking_id_fkey" FOREIGN KEY ("booking_id") REFERENCES "public"."bookings"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."message_delivery_attempts"
+    ADD CONSTRAINT "message_delivery_attempts_parent_attempt_id_fkey" FOREIGN KEY ("parent_attempt_id") REFERENCES "public"."message_delivery_attempts"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."message_delivery_attempts"
+    ADD CONSTRAINT "message_delivery_attempts_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
@@ -12885,6 +12966,9 @@ CREATE POLICY "jobs_customer_select" ON "public"."jobs" FOR SELECT USING (("cust
 
 
 ALTER TABLE "public"."kyc_profiles" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."message_delivery_attempts" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."messages" ENABLE ROW LEVEL SECURITY;
@@ -16747,6 +16831,7 @@ GRANT ALL ON FUNCTION "public"."is_contained_2d"("public"."geometry", "public"."
 REVOKE ALL ON FUNCTION "public"."is_location_in_active_service_area"("p_lat" double precision, "p_lng" double precision) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."is_location_in_active_service_area"("p_lat" double precision, "p_lng" double precision) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_location_in_active_service_area"("p_lat" double precision, "p_lng" double precision) TO "service_role";
+GRANT ALL ON FUNCTION "public"."is_location_in_active_service_area"("p_lat" double precision, "p_lng" double precision) TO "anon";
 
 
 
@@ -20545,6 +20630,12 @@ GRANT ALL ON FUNCTION "public"."touch_booking_refunds_updated_at"() TO "service_
 
 
 
+GRANT ALL ON FUNCTION "public"."touch_message_delivery_attempt_updated_at"() TO "anon";
+GRANT ALL ON FUNCTION "public"."touch_message_delivery_attempt_updated_at"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."touch_message_delivery_attempt_updated_at"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."touch_payout_methods_updated_at"() TO "anon";
 GRANT ALL ON FUNCTION "public"."touch_payout_methods_updated_at"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."touch_payout_methods_updated_at"() TO "service_role";
@@ -21162,6 +21253,10 @@ GRANT ALL ON TABLE "public"."jobs" TO "service_role";
 GRANT ALL ON TABLE "public"."kyc_profiles" TO "anon";
 GRANT ALL ON TABLE "public"."kyc_profiles" TO "authenticated";
 GRANT ALL ON TABLE "public"."kyc_profiles" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."message_delivery_attempts" TO "service_role";
 
 
 
