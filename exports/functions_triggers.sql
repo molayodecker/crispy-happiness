@@ -54,6 +54,57 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public._customer_has_prior_booking(p_customer_id uuid, p_exclude_booking_id uuid DEFAULT NULL::uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.bookings b
+    WHERE b.customer_id = p_customer_id
+      AND b.status IS DISTINCT FROM 'cancelled'
+      AND (p_exclude_booking_id IS NULL OR b.id <> p_exclude_booking_id)
+  );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public._extra_task_hours_total(p_extra_task_ids text[])
+ RETURNS numeric
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT COALESCE(
+    (
+      SELECT SUM(et.hours)
+      FROM public.extra_tasks et
+      WHERE p_extra_task_ids IS NOT NULL
+        AND cardinality(p_extra_task_ids) > 0
+        AND et.id::text = ANY (p_extra_task_ids)
+    ),
+    0
+  )::numeric;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public._load_active_promotion(p_promotion_slug text)
+ RETURNS promotions
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT p.*
+  FROM public.promotions p
+  WHERE p.slug = p_promotion_slug
+    AND p.active = true
+    AND (p.valid_from IS NULL OR p.valid_from <= now())
+    AND (p.valid_to IS NULL OR p.valid_to >= now())
+  LIMIT 1;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public._postgis_deprecate(oldname text, newname text, version text)
  RETURNS void
  LANGUAGE plpgsql
@@ -123,6 +174,36 @@ CREATE OR REPLACE FUNCTION public._postgis_stats(tbl regclass, att_name text, te
  LANGUAGE c
  PARALLEL SAFE STRICT
 AS '$libdir/postgis-3', $function$_postgis_gserialized_stats$function$
+
+
+CREATE OR REPLACE FUNCTION public._promotion_service_eligible(p_eligible_service_ids integer[], p_service_id integer)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF p_service_id IS NULL OR p_service_id <= 0 THEN
+    RETURN false;
+  END IF;
+
+  IF p_eligible_service_ids IS NULL OR cardinality(p_eligible_service_ids) = 0 THEN
+    RETURN EXISTS (
+      SELECT 1
+      FROM public.service_types st
+      JOIN public.service_categories sc ON sc.id = st.category_id
+      WHERE st.id = p_service_id
+        AND COALESCE(st.active, true) = true
+        AND (
+          lower(COALESCE(sc.slug, '')) IN ('cleaning', 'indoor')
+          OR lower(st.name) SIMILAR TO '%(standard|regular|home)%clean%'
+        )
+    );
+  END IF;
+
+  RETURN p_service_id = ANY (p_eligible_service_ids);
+END;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public._st_3ddfullywithin(geom1 geometry, geom2 geometry, double precision)
@@ -389,6 +470,118 @@ CREATE OR REPLACE FUNCTION public._st_within(geom1 geometry, geom2 geometry)
  LANGUAGE sql
  IMMUTABLE PARALLEL SAFE
 AS $function$SELECT public._ST_Contains($2,$1)$function$
+
+
+CREATE OR REPLACE FUNCTION public._welcome_offer_eligibility_core(p_customer_id uuid, p_promotion_slug text, p_channel text, p_service_id integer DEFAULT NULL::integer, p_lat double precision DEFAULT NULL::double precision, p_lng double precision DEFAULT NULL::double precision, p_extra_task_ids text[] DEFAULT NULL::text[], p_is_recurring boolean DEFAULT false, p_booking_id uuid DEFAULT NULL::uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_promo public.promotions;
+BEGIN
+  IF p_channel IS NULL
+     OR btrim(p_channel) = ''
+     OR p_channel NOT IN ('mobile', 'web') THEN
+    RAISE EXCEPTION 'Invalid promotion channel: %', p_channel;
+  END IF;
+
+  SELECT * INTO v_promo FROM public._load_active_promotion(p_promotion_slug);
+
+  IF v_promo.id IS NULL THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'promotion_inactive');
+  END IF;
+
+  IF v_promo.channel NOT IN (p_channel, 'all') THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'promotion_inactive');
+  END IF;
+
+  IF p_is_recurring THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'recurring_not_eligible');
+  END IF;
+
+  IF public._customer_has_prior_booking(p_customer_id, p_booking_id) THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'existing_customer');
+  END IF;
+
+  IF public._welcome_promotion_has_active_claim(p_customer_id, v_promo.id, p_booking_id) THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'already_redeemed');
+  END IF;
+
+  IF p_service_id IS NOT NULL
+     AND NOT public._promotion_service_eligible(v_promo.eligible_service_ids, p_service_id) THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'service_not_eligible');
+  END IF;
+
+  IF v_promo.requires_service_area
+     AND p_lat IS NOT NULL
+     AND p_lng IS NOT NULL
+     AND NOT public.is_location_in_active_service_area(p_lat, p_lng) THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'outside_service_area');
+  END IF;
+
+  IF v_promo.exclude_extra_tasks
+     AND p_extra_task_ids IS NOT NULL
+     AND cardinality(p_extra_task_ids) > 0 THEN
+    RETURN jsonb_build_object(
+      'eligible', true,
+      'reason', 'extra_tasks_billed_separately',
+      'promotion', public._welcome_promotion_display_json(v_promo)
+    );
+  END IF;
+
+  RETURN jsonb_build_object(
+    'eligible', true,
+    'reason', NULL,
+    'promotion', public._welcome_promotion_display_json(v_promo)
+  );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public._welcome_promotion_display_json(p promotions)
+ RETURNS jsonb
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$
+  SELECT jsonb_build_object(
+    'id', p.id,
+    'slug', p.slug,
+    'channel', p.channel,
+    'type', p.type,
+    'value', p.value,
+    'headline', p.headline,
+    'banner_text', p.banner_text,
+    'review_hint', p.review_hint,
+    'terms_markdown', p.terms_markdown,
+    'exclude_extra_tasks', p.exclude_extra_tasks,
+    'max_duration_hours', p.max_duration_hours
+  );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public._welcome_promotion_has_active_claim(p_customer_id uuid, p_promotion_id uuid, p_booking_id uuid DEFAULT NULL::uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.promotion_redemptions r
+    WHERE r.user_id = p_customer_id
+      AND r.promotion_id = p_promotion_id
+      AND (
+        r.status = 'redeemed'
+        OR (
+          r.status = 'reserved'
+          AND (r.expires_at IS NULL OR r.expires_at > now())
+          AND (p_booking_id IS NULL OR r.booking_id IS DISTINCT FROM p_booking_id)
+        )
+      )
+  );
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.accept_booking_assignment(p_booking_id uuid)
@@ -2209,6 +2402,30 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.cleanup_expired_welcome_promotion_reservations()
+ RETURNS integer
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_released_count integer;
+BEGIN
+  UPDATE public.promotion_redemptions
+  SET
+    status = 'released',
+    expires_at = NULL
+  WHERE status = 'reserved'
+    AND expires_at IS NOT NULL
+    AND expires_at <= now();
+
+  GET DIAGNOSTICS v_released_count = ROW_COUNT;
+
+  RETURN v_released_count;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.compute_booking_pricing(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true)
  RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean)
  LANGUAGE plpgsql
@@ -2452,6 +2669,159 @@ BEGIN
     v_discount_bps,
     v_is_same_day,
     v_is_weekend;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.compute_booking_pricing_with_promotion(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_channel text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true, p_customer_id uuid DEFAULT NULL::uuid, p_promotion_slug text DEFAULT NULL::text, p_lat double precision DEFAULT NULL::double precision, p_lng double precision DEFAULT NULL::double precision, p_extra_task_ids text[] DEFAULT NULL::text[], p_booking_id uuid DEFAULT NULL::uuid)
+ RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, promotion_id uuid, promotion_slug text, promotion_discount_minor integer)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_base record;
+  v_promo public.promotions;
+  v_eligibility jsonb;
+  v_extra_hours numeric;
+  v_base_promo_hours numeric;
+  v_free_hours numeric;
+  v_promo_labor_minor integer;
+  v_labor_minor integer;
+  v_discount integer := 0;
+  v_final integer;
+  v_caller uuid := auth.uid();
+BEGIN
+  SELECT *
+  INTO v_base
+  FROM public.compute_booking_pricing(
+    p_service_id,
+    p_duration_hours_raw,
+    p_scheduled_date,
+    p_service_timezone,
+    p_recurrence_interval,
+    p_is_recurring,
+    p_include_booking_cover
+  )
+  LIMIT 1;
+
+  v_labor_minor := round(greatest(0, v_base.subtotal_labor_major) * 100)::integer;
+
+  IF p_promotion_slug IS NULL OR btrim(p_promotion_slug) = '' THEN
+    RETURN QUERY
+    SELECT
+      v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+      v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+      v_base.booking_cover_major, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+      v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+      v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+      v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+      v_base.final_amount_minor, v_base.recurring_amount_minor,
+      v_base.first_charge_amount_minor, v_base.discount_rate_bps,
+      v_base.is_same_day, v_base.is_weekend,
+      NULL::uuid, NULL::text, 0;
+    RETURN;
+  END IF;
+
+  IF p_channel IS NULL
+     OR btrim(p_channel) = ''
+     OR p_channel NOT IN ('mobile', 'web') THEN
+    RAISE EXCEPTION 'Invalid promotion channel: %', p_channel;
+  END IF;
+
+  IF p_customer_id IS NULL
+     OR p_is_recurring
+     OR (v_caller IS NOT NULL AND v_caller <> p_customer_id) THEN
+    RETURN QUERY
+    SELECT
+      v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+      v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+      v_base.booking_cover_major, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+      v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+      v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+      v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+      v_base.final_amount_minor, v_base.recurring_amount_minor,
+      v_base.first_charge_amount_minor, v_base.discount_rate_bps,
+      v_base.is_same_day, v_base.is_weekend,
+      NULL::uuid, NULL::text, 0;
+    RETURN;
+  END IF;
+
+  v_eligibility := public._welcome_offer_eligibility_core(
+    p_customer_id,
+    p_promotion_slug,
+    p_channel,
+    p_service_id,
+    p_lat,
+    p_lng,
+    p_extra_task_ids,
+    p_is_recurring,
+    p_booking_id
+  );
+
+  IF COALESCE((v_eligibility ->> 'eligible')::boolean, false) IS NOT TRUE THEN
+    RETURN QUERY
+    SELECT
+      v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+      v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+      v_base.booking_cover_major, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+      v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+      v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+      v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+      v_base.final_amount_minor, v_base.recurring_amount_minor,
+      v_base.first_charge_amount_minor, v_base.discount_rate_bps,
+      v_base.is_same_day, v_base.is_weekend,
+      NULL::uuid, NULL::text, 0;
+    RETURN;
+  END IF;
+
+  SELECT * INTO v_promo FROM public._load_active_promotion(p_promotion_slug);
+
+  IF v_promo.id IS NULL
+     OR v_promo.type <> 'free_hours'
+     OR v_promo.channel NOT IN (p_channel, 'all') THEN
+    RETURN QUERY
+    SELECT
+      v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+      v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+      v_base.booking_cover_major, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+      v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+      v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+      v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+      v_base.final_amount_minor, v_base.recurring_amount_minor,
+      v_base.first_charge_amount_minor, v_base.discount_rate_bps,
+      v_base.is_same_day, v_base.is_weekend,
+      NULL::uuid, NULL::text, 0;
+    RETURN;
+  END IF;
+
+  v_extra_hours := public._extra_task_hours_total(p_extra_task_ids);
+  v_base_promo_hours := greatest(0, v_base.duration_hours - v_extra_hours);
+
+  v_free_hours := least(
+    v_promo.value::numeric,
+    COALESCE(v_promo.max_duration_hours, v_promo.value::numeric),
+    v_base_promo_hours
+  );
+
+  v_promo_labor_minor := round(
+    greatest(0, v_free_hours * v_base.work_rate_ghs_per_hour * 100)
+  )::integer;
+
+  v_discount := least(v_promo_labor_minor, v_labor_minor);
+  v_final := greatest(0, v_base.final_amount_minor - v_discount);
+
+  RETURN QUERY
+  SELECT
+    v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+    v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+    v_base.booking_cover_major, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+    v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+    v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+    v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+    v_final, v_base.recurring_amount_minor, v_base.first_charge_amount_minor,
+    v_base.discount_rate_bps, v_base.is_same_day, v_base.is_weekend,
+    v_promo.id, v_promo.slug, v_discount;
 END;
 $function$
 
@@ -3226,6 +3596,112 @@ BEGIN
         'estimatedPayout', v_estimated,
         'total', v_total
     );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.finalize_promotion_redemption(p_booking_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_booking record;
+  v_updated integer;
+BEGIN
+  SELECT
+    b.id,
+    b.customer_id,
+    b.promotion_id,
+    b.promotion_slug,
+    b.promotion_discount_minor,
+    b.payment_status
+  INTO v_booking
+  FROM public.bookings b
+  WHERE b.id = p_booking_id;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_found');
+  END IF;
+
+  IF v_booking.promotion_id IS NULL OR COALESCE(v_booking.promotion_discount_minor, 0) <= 0 THEN
+    RETURN jsonb_build_object('success', true, 'skipped', true);
+  END IF;
+
+  IF v_booking.payment_status IS DISTINCT FROM 'paid' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_paid');
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.promotion_redemptions r
+    WHERE r.user_id = v_booking.customer_id
+      AND r.promotion_id = v_booking.promotion_id
+      AND r.status = 'redeemed'
+      AND r.booking_id = v_booking.id
+  ) THEN
+    RETURN jsonb_build_object('success', true, 'redeemed', true, 'already', true);
+  END IF;
+
+  UPDATE public.promotion_redemptions
+  SET
+    status = 'redeemed',
+    redeemed_at = now(),
+    discount_minor = COALESCE(v_booking.promotion_discount_minor, 0),
+    booking_id = v_booking.id
+  WHERE user_id = v_booking.customer_id
+    AND promotion_id = v_booking.promotion_id
+    AND status = 'reserved'
+    AND booking_id = v_booking.id;
+
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+
+  IF v_updated > 0 THEN
+    RETURN jsonb_build_object('success', true, 'redeemed', true);
+  END IF;
+
+  INSERT INTO public.promotion_redemptions (
+    user_id,
+    promotion_id,
+    booking_id,
+    discount_minor,
+    status,
+    reserved_at,
+    redeemed_at
+  )
+  VALUES (
+    v_booking.customer_id,
+    v_booking.promotion_id,
+    v_booking.id,
+    COALESCE(v_booking.promotion_discount_minor, 0),
+    'redeemed',
+    now(),
+    now()
+  )
+  ON CONFLICT (user_id, promotion_id) DO UPDATE
+  SET
+    status = 'redeemed',
+    booking_id = EXCLUDED.booking_id,
+    discount_minor = EXCLUDED.discount_minor,
+    redeemed_at = now()
+  WHERE
+    public.promotion_redemptions.status = 'released'
+    OR (
+      public.promotion_redemptions.status = 'reserved'
+      AND public.promotion_redemptions.booking_id = EXCLUDED.booking_id
+    );
+
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+
+  IF v_updated = 0 THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'promotion_claimed_by_another_booking'
+    );
+  END IF;
+
+  RETURN jsonb_build_object('success', true, 'redeemed', true);
 END;
 $function$
 
@@ -7738,6 +8214,34 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.get_welcome_offer_eligibility(p_customer_id uuid, p_promotion_slug text, p_channel text, p_service_id integer DEFAULT NULL::integer, p_lat double precision DEFAULT NULL::double precision, p_lng double precision DEFAULT NULL::double precision, p_extra_task_ids text[] DEFAULT NULL::text[], p_is_recurring boolean DEFAULT false, p_booking_id uuid DEFAULT NULL::uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_caller uuid := auth.uid();
+BEGIN
+  IF v_caller IS NULL OR v_caller <> p_customer_id THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'not_authenticated');
+  END IF;
+
+  RETURN public._welcome_offer_eligibility_core(
+    p_customer_id,
+    p_promotion_slug,
+    p_channel,
+    p_service_id,
+    p_lat,
+    p_lng,
+    p_extra_task_ids,
+    p_is_recurring,
+    p_booking_id
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.gettransactionid()
  RETURNS xid
  LANGUAGE c
@@ -10437,6 +10941,19 @@ CREATE OR REPLACE FUNCTION public.postgis_wagyu_version()
 AS '$libdir/postgis-3', $function$postgis_wagyu_version$function$
 
 
+CREATE OR REPLACE FUNCTION public.prevent_promotion_config_audit_mutation()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  RAISE EXCEPTION
+    'promotion_config_audit is append-only'
+    USING ERRCODE = '55000';
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.process_direct_assignment_holds()
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -10498,6 +11015,55 @@ BEGIN
     'released_count', v_released
   );
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.promotion_admin_row_to_jsonb(p_row promotions)
+ RETURNS jsonb
+ LANGUAGE sql
+ STABLE
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  SELECT jsonb_build_object(
+    'id', p_row.id,
+    'slug', p_row.slug,
+    'headline', p_row.headline,
+    'terms_markdown', p_row.terms_markdown,
+    'type', p_row.type,
+    'value', p_row.value,
+    'max_duration_hours', p_row.max_duration_hours,
+    'eligible_service_ids', to_jsonb(p_row.eligible_service_ids),
+    'exclude_extra_tasks', p_row.exclude_extra_tasks,
+    'requires_service_area', p_row.requires_service_area,
+    'active', p_row.active,
+    'valid_from', p_row.valid_from,
+    'valid_to', p_row.valid_to,
+    'updated_at', p_row.updated_at,
+    'created_at', p_row.created_at
+  );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.promotion_row_audit_snapshot(p_slug text, p_headline text, p_terms_markdown text, p_type text, p_value numeric, p_max_duration_hours numeric, p_eligible_service_ids integer[], p_exclude_extra_tasks boolean, p_requires_service_area boolean, p_active boolean, p_valid_from timestamp with time zone, p_valid_to timestamp with time zone)
+ RETURNS jsonb
+ LANGUAGE sql
+ STABLE
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  SELECT jsonb_build_object(
+    'slug', p_slug,
+    'headline', p_headline,
+    'terms_markdown', p_terms_markdown,
+    'type', p_type,
+    'value', p_value,
+    'max_duration_hours', p_max_duration_hours,
+    'eligible_service_ids', to_jsonb(p_eligible_service_ids),
+    'exclude_extra_tasks', p_exclude_extra_tasks,
+    'requires_service_area', p_requires_service_area,
+    'active', p_active,
+    'valid_from', p_valid_from,
+    'valid_to', p_valid_to
+  );
 $function$
 
 
@@ -11023,6 +11589,67 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.release_own_welcome_promotion_reservation(p_booking_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_caller uuid := auth.uid();
+  v_updated integer;
+BEGIN
+  IF v_caller IS NULL THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'not_authenticated'
+    );
+  END IF;
+
+  UPDATE public.promotion_redemptions r
+  SET
+    status = 'released',
+    expires_at = NULL
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+    AND b.customer_id = v_caller
+    AND r.booking_id = b.id
+    AND r.status = 'reserved';
+
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'released', v_updated > 0
+  );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.release_welcome_promotion_reservation(p_booking_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_updated integer;
+BEGIN
+  UPDATE public.promotion_redemptions
+  SET status = 'released'
+  WHERE booking_id = p_booking_id
+    AND status = 'reserved';
+
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'released', v_updated > 0
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.remove_co_cleaner_from_team(p_co_cleaner_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -11058,6 +11685,120 @@ BEGIN
   END IF;
 
   RETURN jsonb_build_object('success', true, 'co_cleaner_id', p_co_cleaner_id);
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.reserve_welcome_promotion_for_booking(p_booking_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_caller uuid := auth.uid();
+  v_booking record;
+  v_existing record;
+BEGIN
+  IF v_caller IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  SELECT
+    b.id,
+    b.customer_id,
+    b.promotion_id,
+    b.promotion_discount_minor,
+    b.cleaner_hold_expires_at
+  INTO v_booking
+  FROM public.bookings b
+  WHERE b.id = p_booking_id;
+
+  IF NOT FOUND OR v_booking.customer_id <> v_caller THEN
+    RETURN jsonb_build_object('success', false, 'error', 'forbidden');
+  END IF;
+
+  IF v_booking.promotion_id IS NULL OR COALESCE(v_booking.promotion_discount_minor, 0) <= 0 THEN
+    RETURN jsonb_build_object('success', true, 'skipped', true);
+  END IF;
+
+  PERFORM public.cleanup_expired_welcome_promotion_reservations();
+
+  SELECT r.status, r.booking_id, r.expires_at
+  INTO v_existing
+  FROM public.promotion_redemptions r
+  WHERE r.user_id = v_booking.customer_id
+    AND r.promotion_id = v_booking.promotion_id;
+
+  IF FOUND THEN
+    IF v_existing.status = 'redeemed' THEN
+      RETURN jsonb_build_object('success', false, 'error', 'already_claimed');
+    END IF;
+
+    IF v_existing.status = 'reserved'
+       AND v_existing.booking_id IS DISTINCT FROM p_booking_id
+       AND (v_existing.expires_at IS NULL OR v_existing.expires_at > now()) THEN
+      RETURN jsonb_build_object('success', false, 'error', 'already_claimed');
+    END IF;
+
+    IF v_existing.status = 'reserved'
+       AND v_existing.booking_id = p_booking_id
+       AND (v_existing.expires_at IS NULL OR v_existing.expires_at > now()) THEN
+      RETURN jsonb_build_object('success', true, 'already_reserved', true);
+    END IF;
+
+    IF v_existing.status IN ('released', 'reserved') THEN
+      UPDATE public.promotion_redemptions
+      SET
+        status = 'reserved',
+        booking_id = p_booking_id,
+        discount_minor = v_booking.promotion_discount_minor,
+        reserved_at = now(),
+        expires_at = COALESCE(v_booking.cleaner_hold_expires_at, now() + interval '48 hours')
+      WHERE user_id = v_booking.customer_id
+        AND promotion_id = v_booking.promotion_id
+        AND (
+          status = 'released'
+          OR (
+            status = 'reserved'
+            AND expires_at IS NOT NULL
+            AND expires_at <= now()
+          )
+        );
+
+      IF FOUND THEN
+        RETURN jsonb_build_object('success', true);
+      END IF;
+
+      RETURN jsonb_build_object('success', false, 'error', 'already_claimed');
+    END IF;
+  END IF;
+
+  BEGIN
+    INSERT INTO public.promotion_redemptions (
+      user_id,
+      promotion_id,
+      booking_id,
+      discount_minor,
+      status,
+      reserved_at,
+      expires_at
+    )
+    VALUES (
+      v_booking.customer_id,
+      v_booking.promotion_id,
+      v_booking.id,
+      v_booking.promotion_discount_minor,
+      'reserved',
+      now(),
+      COALESCE(v_booking.cleaner_hold_expires_at, now() + interval '48 hours')
+    );
+
+    RETURN jsonb_build_object('success', true);
+  EXCEPTION
+    WHEN unique_violation THEN
+      RETURN jsonb_build_object('success', false, 'error', 'already_claimed');
+  END;
 END;
 $function$
 
@@ -15211,6 +15952,22 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.trg_release_promotion_on_booking_cancelled()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF NEW.status = 'cancelled'::public.booking_status
+     AND OLD.status IS DISTINCT FROM 'cancelled'::public.booking_status THEN
+    PERFORM public.release_welcome_promotion_reservation(NEW.id);
+  END IF;
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.trigger_paystack_on_approval()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -15621,6 +16378,196 @@ AS $function$
 BEGIN
   NEW.updated_at = NOW();
   RETURN NEW;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.update_promotion_config_admin(p_promotion_id uuid, p_expected_updated_at timestamp with time zone, p_headline text, p_terms_markdown text, p_type text, p_value numeric, p_max_duration_hours numeric, p_eligible_service_ids integer[], p_exclude_extra_tasks boolean, p_requires_service_area boolean, p_active boolean, p_valid_from timestamp with time zone, p_valid_to timestamp with time zone, p_changed_by uuid, p_changed_by_email text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_now timestamptz := now();
+  v_headline text := btrim(coalesce(p_headline, ''));
+  v_type text := btrim(coalesce(p_type, ''));
+  v_terms_markdown text := NULLIF(btrim(coalesce(p_terms_markdown, '')), '');
+  v_active boolean := coalesce(p_active, false);
+  v_audit_action text;
+  v_row public.promotions%ROWTYPE;
+  v_candidate public.promotions%ROWTYPE;
+  v_updated public.promotions%ROWTYPE;
+  v_previous jsonb;
+  v_next jsonb;
+  v_missing integer[];
+BEGIN
+  IF p_promotion_id IS NULL THEN
+    RAISE EXCEPTION 'promotion_id_required' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_expected_updated_at IS NULL THEN
+    RAISE EXCEPTION 'expected_updated_at_required' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_changed_by IS NULL THEN
+    RAISE EXCEPTION 'changed_by_required' USING ERRCODE = '22023';
+  END IF;
+
+  IF v_headline = '' THEN
+    RAISE EXCEPTION 'headline_required' USING ERRCODE = '22023';
+  END IF;
+
+  IF v_type <> 'free_hours' THEN
+    RAISE EXCEPTION 'unsupported_promotion_type' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_value IS NULL OR p_value <= 0 THEN
+    RAISE EXCEPTION 'invalid_free_hours_value' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_max_duration_hours IS NULL
+     OR p_max_duration_hours <= 0
+     OR p_max_duration_hours > p_value THEN
+    RAISE EXCEPTION 'invalid_max_duration_hours' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_valid_from IS NULL THEN
+    RAISE EXCEPTION 'valid_from_required' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_valid_to IS NOT NULL AND p_valid_to <= p_valid_from THEN
+    RAISE EXCEPTION 'valid_to_must_follow_valid_from' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_eligible_service_ids IS NOT NULL
+     AND cardinality(p_eligible_service_ids) > 0 THEN
+    SELECT array_agg(sid.id ORDER BY sid.id)
+    INTO v_missing
+    FROM unnest(p_eligible_service_ids) AS sid(id)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM public.service_types st
+      WHERE st.id = sid.id
+        AND st.active IS TRUE
+    );
+
+    IF v_missing IS NOT NULL THEN
+      RAISE EXCEPTION 'invalid_eligible_service_ids: %', v_missing::text
+        USING ERRCODE = '22023';
+    END IF;
+  END IF;
+
+  SELECT *
+  INTO v_row
+  FROM public.promotions
+  WHERE id = p_promotion_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'promotion_not_found' USING ERRCODE = 'P0002';
+  END IF;
+
+  IF v_row.updated_at IS DISTINCT FROM p_expected_updated_at THEN
+    RAISE EXCEPTION 'stale_promotion_config'
+      USING ERRCODE = '55000',
+            HINT = 'Reload the campaign and try again';
+  END IF;
+
+  v_previous := public.promotion_row_audit_snapshot(
+    v_row.slug,
+    v_row.headline,
+    v_row.terms_markdown,
+    v_row.type::text,
+    v_row.value,
+    v_row.max_duration_hours,
+    v_row.eligible_service_ids,
+    v_row.exclude_extra_tasks,
+    v_row.requires_service_area,
+    v_row.active,
+    v_row.valid_from,
+    v_row.valid_to
+  );
+
+  v_next := public.promotion_row_audit_snapshot(
+    v_row.slug,
+    v_headline,
+    v_terms_markdown,
+    v_type,
+    p_value,
+    p_max_duration_hours,
+    p_eligible_service_ids,
+    coalesce(p_exclude_extra_tasks, false),
+    coalesce(p_requires_service_area, false),
+    v_active,
+    p_valid_from,
+    p_valid_to
+  );
+
+  IF v_previous = v_next THEN
+    RETURN public.promotion_admin_row_to_jsonb(v_row);
+  END IF;
+
+  v_audit_action :=
+    CASE
+      WHEN v_row.active IS DISTINCT FROM v_active AND v_active IS TRUE
+        THEN 'activated'
+      WHEN v_row.active IS DISTINCT FROM v_active AND v_active IS FALSE
+        THEN 'deactivated'
+      ELSE 'updated'
+    END;
+
+  v_candidate := v_row;
+  v_candidate.headline := v_headline;
+  v_candidate.terms_markdown := v_terms_markdown;
+  v_candidate.type := v_type;
+  v_candidate.value := p_value;
+  v_candidate.max_duration_hours := p_max_duration_hours;
+  v_candidate.eligible_service_ids := p_eligible_service_ids;
+  v_candidate.exclude_extra_tasks := coalesce(p_exclude_extra_tasks, false);
+  v_candidate.requires_service_area := coalesce(p_requires_service_area, false);
+  v_candidate.active := v_active;
+  v_candidate.valid_from := p_valid_from;
+  v_candidate.valid_to := p_valid_to;
+  v_candidate.updated_at := v_now;
+
+  UPDATE public.promotions
+  SET
+    headline = v_candidate.headline,
+    terms_markdown = v_candidate.terms_markdown,
+    type = v_candidate.type,
+    value = v_candidate.value,
+    max_duration_hours = v_candidate.max_duration_hours,
+    eligible_service_ids = v_candidate.eligible_service_ids,
+    exclude_extra_tasks = v_candidate.exclude_extra_tasks,
+    requires_service_area = v_candidate.requires_service_area,
+    active = v_candidate.active,
+    valid_from = v_candidate.valid_from,
+    valid_to = v_candidate.valid_to,
+    updated_at = v_candidate.updated_at
+  WHERE id = p_promotion_id
+  RETURNING * INTO v_updated;
+
+  INSERT INTO public.promotion_config_audit (
+    promotion_id,
+    promotion_slug,
+    changed_by,
+    changed_by_email,
+    action,
+    previous_config,
+    new_config
+  )
+  VALUES (
+    v_updated.id,
+    v_updated.slug,
+    p_changed_by,
+    NULLIF(btrim(coalesce(p_changed_by_email, '')), ''),
+    v_audit_action,
+    v_previous,
+    v_next
+  );
+
+  RETURN public.promotion_admin_row_to_jsonb(v_updated);
 END;
 $function$
 
@@ -16085,6 +17032,8 @@ CREATE TRIGGER bookings_compute_scheduled_at_utc BEFORE INSERT OR UPDATE OF sche
 
 CREATE TRIGGER bookings_guard_payment_status BEFORE UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION guard_booking_payment_status_writes();
 
+CREATE TRIGGER release_promotion_on_booking_cancelled AFTER UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION trg_release_promotion_on_booking_cancelled();
+
 CREATE TRIGGER tr_log_booking_status_change AFTER UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION fn_log_status_change();
 
 CREATE TRIGGER trg_bookings_guard_payment_status BEFORE UPDATE OF payment_status ON bookings FOR EACH ROW EXECUTE FUNCTION bookings_guard_payment_status();
@@ -16124,6 +17073,10 @@ CREATE TRIGGER ensure_single_default_platform_fee_trigger BEFORE INSERT OR UPDAT
 CREATE TRIGGER update_platform_fees_updated_at BEFORE UPDATE ON platform_fees FOR EACH ROW EXECUTE FUNCTION update_platform_fees_updated_at();
 
 CREATE TRIGGER trg_profiles_fullname BEFORE INSERT OR UPDATE OF firstname, middlename, lastname ON profiles FOR EACH ROW EXECUTE FUNCTION fn_sync_profile_fullname();
+
+CREATE TRIGGER promotion_config_audit_no_delete BEFORE DELETE ON promotion_config_audit FOR EACH ROW EXECUTE FUNCTION prevent_promotion_config_audit_mutation();
+
+CREATE TRIGGER promotion_config_audit_no_update BEFORE UPDATE ON promotion_config_audit FOR EACH ROW EXECUTE FUNCTION prevent_promotion_config_audit_mutation();
 
 
 -- === EVENT TRIGGERS (summary; DDL in schema.sql) ===
