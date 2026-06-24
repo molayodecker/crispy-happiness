@@ -1431,6 +1431,20 @@ $$;
 ALTER FUNCTION "public"."booking_cover_major_from_booking"("p_cover_amount" numeric) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."booking_final_amount_minor"("p_final_amount_minor" integer, "p_total_price" numeric) RETURNS integer
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT COALESCE(
+    NULLIF(p_final_amount_minor, 0),
+    NULLIF(p_total_price, 0)::integer,
+    0
+  )::integer;
+$$;
+
+
+ALTER FUNCTION "public"."booking_final_amount_minor"("p_final_amount_minor" integer, "p_total_price" numeric) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."bookings_guard_payment_status"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1741,6 +1755,127 @@ $$;
 ALTER FUNCTION "public"."can_view_user_via_bookings"("target_user" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."capture_booking_payment_split_snapshot"("p_booking_id" "uuid", "p_amount_minor" integer) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_customer_id uuid;
+  v_split_type text;
+  v_split_code text;
+  v_tax_pct numeric;
+  v_vendor_pct numeric;
+  v_tax_bps integer;
+  v_vendor_bps integer;
+  v_tax_minor integer;
+  v_vendor_minor integer;
+  v_platform_minor integer;
+BEGIN
+  IF p_amount_minor IS NULL OR p_amount_minor <= 0 THEN
+    RETURN;
+  END IF;
+
+  v_customer_id := auth.uid();
+  IF v_customer_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT NULLIF(btrim(text_value), '')
+  INTO v_split_code
+  FROM public.payment_split_config
+  WHERE key = 'paystack_split_code';
+
+  IF v_split_code IS NOT NULL THEN
+    UPDATE public.bookings
+    SET
+      payment_split_type = 'split_code',
+      paystack_split_code = v_split_code,
+      tax_share_minor = NULL,
+      vendor_share_minor = NULL,
+      platform_share_minor = NULL,
+      tax_percentage_bps = NULL,
+      vendor_percentage_bps = NULL,
+      tax_paystack_share = NULL,
+      vendor_paystack_share = NULL,
+      updated_at = now()
+    WHERE id = p_booking_id
+      AND customer_id = v_customer_id
+      AND payment_split_type IS NULL;
+    RETURN;
+  END IF;
+
+  SELECT COALESCE(NULLIF(btrim(text_value), ''), 'percentage')
+  INTO v_split_type
+  FROM public.payment_split_config
+  WHERE key = 'split_type';
+
+  IF v_split_type NOT IN ('percentage', 'flat') THEN
+    v_split_type := 'percentage';
+  END IF;
+
+  SELECT value INTO v_tax_pct FROM public.payment_split_config WHERE key = 'tax_percentage';
+  SELECT value INTO v_vendor_pct FROM public.payment_split_config WHERE key = 'vendor_percentage';
+
+  v_tax_pct := COALESCE(v_tax_pct, 0.15);
+  v_vendor_pct := COALESCE(v_vendor_pct, 0.10);
+
+  IF v_tax_pct < 0 OR v_vendor_pct < 0 OR (v_tax_pct + v_vendor_pct) > 1 THEN
+    RAISE EXCEPTION 'Invalid payment split configuration: tax and vendor percentages must be non-negative and sum to at most 1';
+  END IF;
+
+  v_tax_bps := round(v_tax_pct * 10000)::integer;
+  v_vendor_bps := round(v_vendor_pct * 10000)::integer;
+
+  IF v_split_type = 'flat' THEN
+    v_tax_minor := floor(p_amount_minor * v_tax_pct)::integer;
+    v_vendor_minor := floor(p_amount_minor * v_vendor_pct)::integer;
+
+    IF v_tax_minor + v_vendor_minor > p_amount_minor THEN
+      RAISE EXCEPTION 'Payment split exceeds booking amount';
+    END IF;
+
+    v_platform_minor := p_amount_minor - v_tax_minor - v_vendor_minor;
+
+    UPDATE public.bookings
+    SET
+      payment_split_type = 'flat',
+      paystack_split_code = NULL,
+      tax_share_minor = v_tax_minor,
+      vendor_share_minor = v_vendor_minor,
+      platform_share_minor = v_platform_minor,
+      tax_percentage_bps = v_tax_bps,
+      vendor_percentage_bps = v_vendor_bps,
+      tax_paystack_share = v_tax_minor::text,
+      vendor_paystack_share = v_vendor_minor::text,
+      updated_at = now()
+    WHERE id = p_booking_id
+      AND customer_id = v_customer_id
+      AND payment_split_type IS NULL;
+    RETURN;
+  END IF;
+
+  UPDATE public.bookings
+  SET
+    payment_split_type = 'percentage',
+    paystack_split_code = NULL,
+    tax_share_minor = NULL,
+    vendor_share_minor = NULL,
+    platform_share_minor = NULL,
+    tax_percentage_bps = v_tax_bps,
+    vendor_percentage_bps = v_vendor_bps,
+    tax_paystack_share = (round(v_tax_pct * 100))::text,
+    vendor_paystack_share = (round(v_vendor_pct * 100))::text,
+    updated_at = now()
+  WHERE id = p_booking_id
+    AND customer_id = v_customer_id
+    AND payment_split_type IS NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."capture_booking_payment_split_snapshot"("p_booking_id" "uuid", "p_amount_minor" integer) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1797,6 +1932,92 @@ $$;
 
 
 ALTER FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."claim_subscription_paystack_plan"("p_subscription_id" "uuid", "p_customer_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_sub public.subscriptions%ROWTYPE;
+  v_interval text;
+  v_currency text;
+  v_amount integer;
+  v_token uuid;
+  v_stale_creating interval := interval '2 minutes';
+BEGIN
+  IF p_customer_id IS NULL THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'not_authenticated');
+  END IF;
+
+  SELECT *
+  INTO v_sub
+  FROM public.subscriptions
+  WHERE id = p_subscription_id
+    AND customer_id = p_customer_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'subscription_not_found');
+  END IF;
+
+  IF v_sub.recurrence_interval = 'weekly' THEN
+    v_interval := 'weekly';
+  ELSIF v_sub.recurrence_interval = 'monthly' THEN
+    v_interval := 'monthly';
+  ELSE
+    RETURN jsonb_build_object('action', 'error', 'error', 'unsupported_interval');
+  END IF;
+
+  v_currency := upper(coalesce(nullif(btrim(v_sub.currency), ''), 'GHS'));
+  v_amount := round(coalesce(v_sub.recurring_amount_minor, v_sub.amount)::numeric)::integer;
+
+  IF v_amount IS NULL OR v_amount <= 0 THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'invalid_amount');
+  END IF;
+
+  IF v_sub.paystack_plan_code IS NOT NULL
+     AND v_sub.paystack_plan_amount_minor = v_amount
+     AND upper(coalesce(nullif(btrim(v_sub.paystack_plan_currency), ''), '')) = v_currency
+     AND v_sub.paystack_plan_interval = v_interval
+     AND coalesce(v_sub.paystack_plan_status, 'ready') = 'ready' THEN
+    RETURN jsonb_build_object(
+      'action', 'reuse',
+      'plan_code', v_sub.paystack_plan_code,
+      'amount_minor', v_amount,
+      'currency', v_currency,
+      'interval', v_interval
+    );
+  END IF;
+
+  IF v_sub.paystack_plan_status = 'creating'
+     AND v_sub.paystack_plan_generation_started_at IS NOT NULL
+     AND v_sub.paystack_plan_generation_started_at > now() - v_stale_creating THEN
+    RETURN jsonb_build_object('action', 'wait', 'retry_after_ms', 2000);
+  END IF;
+
+  v_token := gen_random_uuid();
+
+  UPDATE public.subscriptions
+  SET
+    paystack_plan_status = 'creating',
+    paystack_plan_generation_token = v_token,
+    paystack_plan_generation_started_at = now(),
+    updated_at = now()
+  WHERE id = p_subscription_id;
+
+  RETURN jsonb_build_object(
+    'action', 'create',
+    'generation_token', v_token,
+    'amount_minor', v_amount,
+    'currency', v_currency,
+    'interval', v_interval
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."claim_subscription_paystack_plan"("p_subscription_id" "uuid", "p_customer_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."cleaner_display_rating"("p_rating" numeric, "p_review_count" integer) RETURNS double precision
@@ -2160,6 +2381,78 @@ $$;
 
 
 ALTER FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."complete_subscription_paystack_plan"("p_subscription_id" "uuid", "p_customer_id" "uuid", "p_generation_token" "uuid", "p_plan_code" "text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_sub public.subscriptions%ROWTYPE;
+  v_interval text;
+  v_currency text;
+  v_amount integer;
+BEGIN
+  IF p_customer_id IS NULL THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'not_authenticated');
+  END IF;
+
+  IF p_plan_code IS NULL OR btrim(p_plan_code) = '' THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'invalid_plan_code');
+  END IF;
+
+  SELECT *
+  INTO v_sub
+  FROM public.subscriptions
+  WHERE id = p_subscription_id
+    AND customer_id = p_customer_id
+    AND paystack_plan_status = 'creating'
+    AND paystack_plan_generation_token = p_generation_token
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('action', 'lost_claim');
+  END IF;
+
+  IF v_sub.recurrence_interval = 'weekly' THEN
+    v_interval := 'weekly';
+  ELSIF v_sub.recurrence_interval = 'monthly' THEN
+    v_interval := 'monthly';
+  ELSE
+    RETURN jsonb_build_object('action', 'error', 'error', 'unsupported_interval');
+  END IF;
+
+  v_currency := upper(coalesce(nullif(btrim(v_sub.currency), ''), 'GHS'));
+  v_amount := round(coalesce(v_sub.recurring_amount_minor, v_sub.amount)::numeric)::integer;
+
+  IF v_amount IS NULL OR v_amount <= 0 THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'invalid_amount');
+  END IF;
+
+  UPDATE public.subscriptions
+  SET
+    paystack_plan_code = btrim(p_plan_code),
+    paystack_plan_amount_minor = v_amount,
+    paystack_plan_currency = v_currency,
+    paystack_plan_interval = v_interval,
+    paystack_plan_status = 'ready',
+    paystack_plan_generation_token = NULL,
+    paystack_plan_generation_started_at = NULL,
+    updated_at = now()
+  WHERE id = p_subscription_id;
+
+  RETURN jsonb_build_object(
+    'action', 'ready',
+    'plan_code', btrim(p_plan_code),
+    'amount_minor', v_amount,
+    'currency', v_currency,
+    'interval', v_interval
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."complete_subscription_paystack_plan"("p_subscription_id" "uuid", "p_customer_id" "uuid", "p_generation_token" "uuid", "p_plan_code" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text" DEFAULT NULL::"text", "p_is_recurring" boolean DEFAULT false, "p_include_booking_cover" boolean DEFAULT true, "p_cleaner_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("pricing_version" "text", "currency" "text", "work_rate_ghs_per_hour" numeric, "duration_hours" numeric, "subtotal_labor_major" numeric, "platform_fee_major" numeric, "booking_cover_major" numeric, "core_amount_minor" integer, "same_day_surcharge_bps" integer, "weekend_surcharge_bps" integer, "recurring_weekly_discount_bps" integer, "recurring_monthly_discount_bps" integer, "same_day_surcharge_minor" integer, "weekend_surcharge_minor" integer, "recurring_discount_minor" integer, "final_amount_minor" integer, "recurring_amount_minor" integer, "first_charge_amount_minor" integer, "discount_rate_bps" integer, "is_same_day" boolean, "is_weekend" boolean, "minimum_duration_hours" numeric)
@@ -3226,6 +3519,32 @@ $$;
 
 
 ALTER FUNCTION "public"."expire_stale_pending_bookings"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."fail_subscription_paystack_plan_creation"("p_subscription_id" "uuid", "p_customer_id" "uuid", "p_generation_token" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF p_customer_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  UPDATE public.subscriptions
+  SET
+    paystack_plan_status = 'failed',
+    paystack_plan_generation_token = NULL,
+    paystack_plan_generation_started_at = NULL,
+    updated_at = now()
+  WHERE id = p_subscription_id
+    AND customer_id = p_customer_id
+    AND paystack_plan_status = 'creating'
+    AND paystack_plan_generation_token = p_generation_token;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."fail_subscription_paystack_plan_creation"("p_subscription_id" "uuid", "p_customer_id" "uuid", "p_generation_token" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."fetch_cleaner_earnings"("p_user_id" "uuid", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone) RETURNS json
@@ -4587,6 +4906,34 @@ $$;
 ALTER FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."get_booking_payment_snapshot"("p_booking_id" "uuid") RETURNS TABLE("booking_id" "uuid", "final_amount_minor" integer, "currency" "text", "payment_status" "text", "status" "public"."booking_status", "booking_cover" boolean, "booking_cover_amount" numeric, "platform_fee" numeric, "work_rate_ghs_per_hour" numeric, "pricing_version" "text", "promotion_id" "uuid", "promotion_slug" "text", "promotion_discount_minor" integer)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    b.id,
+    public.booking_final_amount_minor(b.final_amount_minor, b.total_price),
+    COALESCE(NULLIF(btrim(b.currency), ''), 'GHS'),
+    b.payment_status,
+    b.status,
+    COALESCE(b.booking_cover, true),
+    b.booking_cover_amount,
+    b.platform_fee,
+    b.work_rate_ghs_per_hour,
+    b.pricing_version,
+    b.promotion_id,
+    b.promotion_slug,
+    COALESCE(b.promotion_discount_minor, 0)
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+    AND b.customer_id = auth.uid()
+  LIMIT 1;
+$$;
+
+
+ALTER FUNCTION "public"."get_booking_payment_snapshot"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."get_cleaner_availability_by_id"("p_cleaner_id" "uuid", "p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_timezone" "text" DEFAULT 'UTC'::"text", "p_exclude_booking_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "fullname" "text", "avatar_url" "text", "hourly_rate" numeric, "is_available" boolean)
     LANGUAGE "plpgsql" STABLE
     AS $$
@@ -5474,6 +5821,81 @@ COMMENT ON FUNCTION "public"."get_own_cleaner_location"() IS 'Authenticated user
 
 
 
+CREATE OR REPLACE FUNCTION "public"."get_payable_booking_snapshot"("p_booking_id" "uuid") RETURNS TABLE("booking_id" "uuid", "customer_id" "uuid", "final_amount_minor" integer, "currency" "text", "payment_status" "text", "booking_status" "public"."booking_status", "payment_reference" "text", "payment_split_type" "text", "paystack_split_code" "text", "tax_share_minor" integer, "vendor_share_minor" integer, "platform_share_minor" integer, "tax_percentage_bps" integer, "vendor_percentage_bps" integer, "tax_paystack_share" "text", "vendor_paystack_share" "text")
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_row public.bookings%ROWTYPE;
+  v_amount integer;
+BEGIN
+  SELECT *
+  INTO v_row
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+    AND b.customer_id = auth.uid()
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF v_row.status IS DISTINCT FROM 'pending'::public.booking_status THEN
+    RETURN;
+  END IF;
+
+  IF lower(COALESCE(v_row.payment_status, '')) NOT IN ('pending', 'failed') THEN
+    RETURN;
+  END IF;
+
+  IF v_row.subscription_id IS NOT NULL THEN
+    RETURN;
+  END IF;
+
+  v_amount := public.booking_final_amount_minor(v_row.final_amount_minor, v_row.total_price);
+  IF v_amount <= 0 THEN
+    RETURN;
+  END IF;
+
+  IF v_row.payment_split_type IS NULL THEN
+    PERFORM public.capture_booking_payment_split_snapshot(p_booking_id, v_amount);
+
+    SELECT *
+    INTO v_row
+    FROM public.bookings b
+    WHERE b.id = p_booking_id
+      AND b.customer_id = auth.uid();
+  END IF;
+
+  IF v_row.payment_split_type IS NULL THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    v_row.id,
+    v_row.customer_id,
+    v_amount,
+    COALESCE(NULLIF(btrim(v_row.currency), ''), 'GHS'),
+    v_row.payment_status,
+    v_row.status,
+    v_row.reference,
+    v_row.payment_split_type,
+    v_row.paystack_split_code,
+    v_row.tax_share_minor,
+    v_row.vendor_share_minor,
+    v_row.platform_share_minor,
+    v_row.tax_percentage_bps,
+    v_row.vendor_percentage_bps,
+    v_row.tax_paystack_share,
+    v_row.vendor_paystack_share;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_payable_booking_snapshot"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."get_payment_split_config"() RETURNS "jsonb"
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -5512,7 +5934,7 @@ $$;
 ALTER FUNCTION "public"."get_payout_system_logs"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_pending_booking_for_edit"("p_customer_id" "uuid", "p_booking_id" "uuid") RETURNS TABLE("id" "uuid", "customer_id" "uuid", "cleaner_id" "uuid", "service_id" integer, "title" "text", "scheduled_date" "date", "scheduled_time" time without time zone, "duration_hours" numeric, "address" "text", "special_instructions" "text", "status" "public"."booking_status", "payment_status" "text", "subscription_id" "uuid", "home_size" "text", "extra_task_ids" "text"[], "duration_adjustment" numeric, "duration_computed" numeric, "duration_final" numeric, "timezone_name" "text", "cleaner_assigned_at" timestamp with time zone, "service_duration_option_id" "uuid", "location_latitude" double precision, "location_longitude" double precision, "service" "jsonb")
+CREATE OR REPLACE FUNCTION "public"."get_pending_booking_for_edit"("p_customer_id" "uuid", "p_booking_id" "uuid") RETURNS TABLE("id" "uuid", "customer_id" "uuid", "cleaner_id" "uuid", "service_id" integer, "title" "text", "scheduled_date" "date", "scheduled_time" time without time zone, "duration_hours" numeric, "address" "text", "special_instructions" "text", "status" "public"."booking_status", "payment_status" "text", "subscription_id" "uuid", "home_size" "text", "extra_task_ids" "text"[], "duration_adjustment" numeric, "duration_computed" numeric, "duration_final" numeric, "timezone_name" "text", "cleaner_assigned_at" timestamp with time zone, "service_duration_option_id" "uuid", "location_latitude" double precision, "location_longitude" double precision, "booking_cover" boolean, "booking_cover_amount" numeric, "platform_fee" numeric, "work_rate_ghs_per_hour" numeric, "pricing_version" "text", "currency" "text", "promotion_id" "uuid", "promotion_slug" "text", "promotion_discount_minor" integer, "final_amount_minor" integer, "service" "jsonb")
     LANGUAGE "sql" STABLE
     SET "search_path" TO 'public'
     AS $$
@@ -5548,11 +5970,23 @@ CREATE OR REPLACE FUNCTION "public"."get_pending_booking_for_edit"("p_customer_i
         THEN ST_X(b.location_coordinates::geometry)
       ELSE NULL
     END AS location_longitude,
+    COALESCE(b.booking_cover, true) AS booking_cover,
+    b.booking_cover_amount,
+    b.platform_fee,
+    b.work_rate_ghs_per_hour,
+    b.pricing_version,
+    b.currency,
+    b.promotion_id,
+    b.promotion_slug,
+    COALESCE(b.promotion_discount_minor, 0) AS promotion_discount_minor,
+    -- Modern checkout writes both columns in pesewas; prefer final_amount_minor.
+    COALESCE(NULLIF(b.final_amount_minor, 0), NULLIF(b.total_price, 0), 0) AS final_amount_minor,
     to_jsonb(s.*) AS service
   FROM public.bookings b
   JOIN public.service_types s
     ON s.id = b.service_id
   WHERE b.id = p_booking_id
+    AND b.customer_id = auth.uid()
     AND b.customer_id = p_customer_id
     AND b.status IN ('pending', 'confirmed', 'scheduled')
     AND b.subscription_id IS NULL
@@ -9359,6 +9793,35 @@ COMMENT ON FUNCTION "public"."touch_payout_methods_updated_at"() IS 'Keeps payou
 
 
 
+CREATE OR REPLACE FUNCTION "public"."trg_bookings_clear_payment_split_on_amount_change"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF TG_OP = 'UPDATE'
+    AND (
+      OLD.final_amount_minor IS DISTINCT FROM NEW.final_amount_minor
+      OR OLD.total_price IS DISTINCT FROM NEW.total_price
+    )
+  THEN
+    NEW.payment_split_type := NULL;
+    NEW.paystack_split_code := NULL;
+    NEW.tax_share_minor := NULL;
+    NEW.vendor_share_minor := NULL;
+    NEW.platform_share_minor := NULL;
+    NEW.tax_percentage_bps := NULL;
+    NEW.vendor_percentage_bps := NULL;
+    NEW.tax_paystack_share := NULL;
+    NEW.vendor_paystack_share := NULL;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."trg_bookings_clear_payment_split_on_amount_change"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."trg_init_direct_assignment_on_paid"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -10527,6 +10990,15 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "work_rate_ghs_per_hour" numeric,
     "cancelled_by_role" "text",
     "cancellation_reason_code" "text",
+    "payment_split_type" "text",
+    "paystack_split_code" "text",
+    "tax_share_minor" integer,
+    "vendor_share_minor" integer,
+    "platform_share_minor" integer,
+    "tax_percentage_bps" integer,
+    "vendor_percentage_bps" integer,
+    "tax_paystack_share" "text",
+    "vendor_paystack_share" "text",
     CONSTRAINT "bookings_assignment_phase_check" CHECK ((("assignment_phase" IS NULL) OR ("assignment_phase" = ANY (ARRAY['exclusive'::"text", 'broadcast'::"text", 'accepted'::"text"])))),
     CONSTRAINT "bookings_cancellation_tier_check" CHECK ((("cancellation_tier" IS NULL) OR ("cancellation_tier" = ANY (ARRAY['full_refund'::"text", 'partial_refund'::"text", 'no_refund'::"text"])))),
     CONSTRAINT "bookings_cancelled_by_role_check" CHECK ((("cancelled_by_role" IS NULL) OR ("cancelled_by_role" = ANY (ARRAY['customer'::"text", 'cleaner'::"text", 'admin'::"text", 'platform'::"text"])))),
@@ -10536,10 +11008,13 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     CONSTRAINT "bookings_customer_rating_range" CHECK ((("customer_rating" IS NULL) OR (("customer_rating" >= 1) AND ("customer_rating" <= 5)))),
     CONSTRAINT "bookings_duration_hours_valid" CHECK ((("duration_hours" > (0)::numeric) AND ("duration_hours" <= (24)::numeric))),
     CONSTRAINT "bookings_final_amount_nonnegative_check" CHECK ((("final_amount_minor" IS NULL) OR ("final_amount_minor" >= 0))),
+    CONSTRAINT "bookings_payment_split_type_check" CHECK ((("payment_split_type" IS NULL) OR ("payment_split_type" = ANY (ARRAY['split_code'::"text", 'percentage'::"text", 'flat'::"text"])))),
     CONSTRAINT "bookings_payment_status_check" CHECK ((("payment_status" IS NULL) OR ("payment_status" = ANY (ARRAY['pending'::"text", 'failed'::"text", 'paid'::"text", 'refunded'::"text", 'partially_refunded'::"text"])))),
     CONSTRAINT "bookings_recurrence_interval_check" CHECK ((("recurrence_interval" IS NULL) OR ("recurrence_interval" = ANY (ARRAY['weekly'::"text", 'bi-weekly'::"text", 'monthly'::"text"])))),
     CONSTRAINT "bookings_recurring_discount_nonnegative_check" CHECK (("recurring_discount_minor" >= 0)),
     CONSTRAINT "bookings_same_day_surcharge_nonnegative_check" CHECK (("same_day_surcharge_minor" >= 0)),
+    CONSTRAINT "bookings_split_bps_check" CHECK (((COALESCE("tax_percentage_bps", 0) >= 0) AND (COALESCE("vendor_percentage_bps", 0) >= 0) AND ((COALESCE("tax_percentage_bps", 0) + COALESCE("vendor_percentage_bps", 0)) <= 10000))),
+    CONSTRAINT "bookings_split_shares_nonnegative_check" CHECK (((COALESCE("tax_share_minor", 0) >= 0) AND (COALESCE("vendor_share_minor", 0) >= 0) AND (COALESCE("platform_share_minor", 0) >= 0))),
     CONSTRAINT "bookings_weekend_surcharge_nonnegative_check" CHECK (("weekend_surcharge_minor" >= 0))
 );
 
@@ -10600,6 +11075,18 @@ COMMENT ON COLUMN "public"."bookings"."booking_source" IS 'Acquisition channel f
 
 
 COMMENT ON COLUMN "public"."bookings"."work_rate_ghs_per_hour" IS 'Labor rate (GHS/hour) applied at booking create/update; snapshot from pricing RPC.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."payment_split_type" IS 'Paystack split mode captured for this booking: split_code, percentage, or flat.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."tax_paystack_share" IS 'Ready-to-send Paystack subaccount share string for tax (percent points or flat pesewas).';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."vendor_paystack_share" IS 'Ready-to-send Paystack subaccount share string for vendor (percent points or flat pesewas).';
 
 
 
@@ -11680,11 +12167,20 @@ CREATE TABLE IF NOT EXISTS "public"."payment_split_config" (
     "key" "text" NOT NULL,
     "value" numeric NOT NULL,
     "description" "text",
-    "updated_at" timestamp with time zone DEFAULT "now"()
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "text_value" "text"
 );
 
 
 ALTER TABLE "public"."payment_split_config" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."payment_split_config" IS 'Paystack settlement config (service_role / SECURITY DEFINER only). tax_percentage → PAYSTACK_TAX_SUBACCOUNT; vendor_percentage → PAYSTACK_VENDOR_SUBACCOUNT (platform settlement share, not cleaner earnings). Remainder stays on main account.';
+
+
+
+COMMENT ON COLUMN "public"."payment_split_config"."text_value" IS 'Non-numeric config (e.g. paystack_split_code, split_type).';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."payout_methods" (
@@ -12063,9 +12559,16 @@ CREATE TABLE IF NOT EXISTS "public"."subscriptions" (
     "recurring_amount_minor" integer,
     "discount_type" "text",
     "discount_rate_bps" integer DEFAULT 0,
+    "paystack_plan_amount_minor" integer,
+    "paystack_plan_currency" "text",
+    "paystack_plan_interval" "text",
+    "paystack_plan_status" "text",
+    "paystack_plan_generation_token" "uuid",
+    "paystack_plan_generation_started_at" timestamp with time zone,
     CONSTRAINT "subscriptions_discount_rate_bps_range_check" CHECK ((("discount_rate_bps" >= 0) AND ("discount_rate_bps" <= 10000))),
     CONSTRAINT "subscriptions_discount_type_check" CHECK (("discount_type" = ANY (ARRAY['none'::"text", 'weekly'::"text", 'bi-weekly'::"text", 'monthly'::"text"]))),
     CONSTRAINT "subscriptions_first_charge_amount_nonnegative_check" CHECK ((("first_charge_amount_minor" IS NULL) OR ("first_charge_amount_minor" >= 0))),
+    CONSTRAINT "subscriptions_paystack_plan_status_check" CHECK ((("paystack_plan_status" IS NULL) OR ("paystack_plan_status" = ANY (ARRAY['creating'::"text", 'ready'::"text", 'failed'::"text"])))),
     CONSTRAINT "subscriptions_recurrence_interval_check" CHECK (("recurrence_interval" = ANY (ARRAY['weekly'::"text", 'bi-weekly'::"text", 'monthly'::"text"]))),
     CONSTRAINT "subscriptions_recurring_amount_nonnegative_check" CHECK ((("recurring_amount_minor" IS NULL) OR ("recurring_amount_minor" >= 0))),
     CONSTRAINT "subscriptions_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'active'::"text", 'cancelled'::"text", 'completed'::"text"])))
@@ -12076,6 +12579,18 @@ ALTER TABLE "public"."subscriptions" OWNER TO "postgres";
 
 
 COMMENT ON TABLE "public"."subscriptions" IS 'Recurring cleaning plans; each occurrence is a row in bookings with subscription_id set.';
+
+
+
+COMMENT ON COLUMN "public"."subscriptions"."paystack_plan_amount_minor" IS 'Minor-unit amount used when paystack_plan_code was created or last refreshed.';
+
+
+
+COMMENT ON COLUMN "public"."subscriptions"."paystack_plan_currency" IS 'Currency used when paystack_plan_code was created or last refreshed.';
+
+
+
+COMMENT ON COLUMN "public"."subscriptions"."paystack_plan_interval" IS 'Paystack billing interval (weekly|monthly) when paystack_plan_code was created or last refreshed.';
 
 
 
@@ -13752,6 +14267,10 @@ CREATE OR REPLACE TRIGGER "trg_booking_refunds_updated_at" BEFORE UPDATE ON "pub
 
 
 
+CREATE OR REPLACE TRIGGER "trg_bookings_clear_payment_split_on_amount_change" BEFORE UPDATE ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."trg_bookings_clear_payment_split_on_amount_change"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_bookings_guard_payment_status" BEFORE UPDATE OF "payment_status" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."bookings_guard_payment_status"();
 
 
@@ -14368,14 +14887,6 @@ CREATE POLICY "Allow public read access" ON "public"."base_durations" FOR SELECT
 
 
 CREATE POLICY "Allow public read access" ON "public"."extra_tasks" FOR SELECT USING (true);
-
-
-
-CREATE POLICY "Allow read for authenticated" ON "public"."payment_split_config" FOR SELECT TO "authenticated" USING (true);
-
-
-
-CREATE POLICY "Allow read for service role" ON "public"."payment_split_config" FOR SELECT TO "service_role" USING (true);
 
 
 
@@ -16377,6 +16888,13 @@ GRANT ALL ON FUNCTION "public"."booking_cover_major_from_booking"("p_cover_amoun
 
 
 
+REVOKE ALL ON FUNCTION "public"."booking_final_amount_minor"("p_final_amount_minor" integer, "p_total_price" numeric) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."booking_final_amount_minor"("p_final_amount_minor" integer, "p_total_price" numeric) TO "anon";
+GRANT ALL ON FUNCTION "public"."booking_final_amount_minor"("p_final_amount_minor" integer, "p_total_price" numeric) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."booking_final_amount_minor"("p_final_amount_minor" integer, "p_total_price" numeric) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."bookings_guard_payment_status"() TO "anon";
 GRANT ALL ON FUNCTION "public"."bookings_guard_payment_status"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."bookings_guard_payment_status"() TO "service_role";
@@ -16428,6 +16946,13 @@ GRANT ALL ON FUNCTION "public"."can_view_user_via_bookings"("target_user" "uuid"
 
 
 
+REVOKE ALL ON FUNCTION "public"."capture_booking_payment_split_snapshot"("p_booking_id" "uuid", "p_amount_minor" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."capture_booking_payment_split_snapshot"("p_booking_id" "uuid", "p_amount_minor" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."capture_booking_payment_split_snapshot"("p_booking_id" "uuid", "p_amount_minor" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."capture_booking_payment_split_snapshot"("p_booking_id" "uuid", "p_amount_minor" integer) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."cash_dist"("money", "money") TO "postgres";
 GRANT ALL ON FUNCTION "public"."cash_dist"("money", "money") TO "anon";
 GRANT ALL ON FUNCTION "public"."cash_dist"("money", "money") TO "authenticated";
@@ -16459,6 +16984,11 @@ GRANT ALL ON FUNCTION "public"."checkauthtrigger"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."claim_subscription_paystack_plan"("p_subscription_id" "uuid", "p_customer_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."claim_subscription_paystack_plan"("p_subscription_id" "uuid", "p_customer_id" "uuid") TO "service_role";
 
 
 
@@ -16569,6 +17099,11 @@ REVOKE ALL ON FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"
 GRANT ALL ON FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"() TO "anon";
 GRANT ALL ON FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."complete_subscription_paystack_plan"("p_subscription_id" "uuid", "p_customer_id" "uuid", "p_generation_token" "uuid", "p_plan_code" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."complete_subscription_paystack_plan"("p_subscription_id" "uuid", "p_customer_id" "uuid", "p_generation_token" "uuid", "p_plan_code" "text") TO "service_role";
 
 
 
@@ -16748,6 +17283,11 @@ GRANT ALL ON FUNCTION "public"."escalate_unassigned_paid_bookings_past_grace"() 
 GRANT ALL ON FUNCTION "public"."expire_stale_pending_bookings"() TO "anon";
 GRANT ALL ON FUNCTION "public"."expire_stale_pending_bookings"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."expire_stale_pending_bookings"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."fail_subscription_paystack_plan_creation"("p_subscription_id" "uuid", "p_customer_id" "uuid", "p_generation_token" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."fail_subscription_paystack_plan_creation"("p_subscription_id" "uuid", "p_customer_id" "uuid", "p_generation_token" "uuid") TO "service_role";
 
 
 
@@ -18722,6 +19262,13 @@ GRANT ALL ON FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid"
 
 
 
+REVOKE ALL ON FUNCTION "public"."get_booking_payment_snapshot"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_booking_payment_snapshot"("p_booking_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_booking_payment_snapshot"("p_booking_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_booking_payment_snapshot"("p_booking_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."get_cleaner_availability_by_id"("p_cleaner_id" "uuid", "p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_timezone" "text", "p_exclude_booking_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."get_cleaner_availability_by_id"("p_cleaner_id" "uuid", "p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_timezone" "text", "p_exclude_booking_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_cleaner_availability_by_id"("p_cleaner_id" "uuid", "p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_timezone" "text", "p_exclude_booking_id" "uuid") TO "service_role";
@@ -18822,8 +19369,14 @@ GRANT ALL ON FUNCTION "public"."get_own_cleaner_location"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_payment_split_config"() TO "anon";
-GRANT ALL ON FUNCTION "public"."get_payment_split_config"() TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."get_payable_booking_snapshot"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_payable_booking_snapshot"("p_booking_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_payable_booking_snapshot"("p_booking_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_payable_booking_snapshot"("p_booking_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."get_payment_split_config"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_payment_split_config"() TO "service_role";
 
 
@@ -18834,6 +19387,7 @@ GRANT ALL ON FUNCTION "public"."get_payout_system_logs"() TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."get_pending_booking_for_edit"("p_customer_id" "uuid", "p_booking_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_pending_booking_for_edit"("p_customer_id" "uuid", "p_booking_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."get_pending_booking_for_edit"("p_customer_id" "uuid", "p_booking_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_pending_booking_for_edit"("p_customer_id" "uuid", "p_booking_id" "uuid") TO "service_role";
@@ -22930,6 +23484,13 @@ GRANT ALL ON FUNCTION "public"."touch_payout_methods_updated_at"() TO "service_r
 
 
 
+REVOKE ALL ON FUNCTION "public"."trg_bookings_clear_payment_split_on_amount_change"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."trg_bookings_clear_payment_split_on_amount_change"() TO "anon";
+GRANT ALL ON FUNCTION "public"."trg_bookings_clear_payment_split_on_amount_change"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trg_bookings_clear_payment_split_on_amount_change"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."trg_init_direct_assignment_on_paid"() TO "anon";
 GRANT ALL ON FUNCTION "public"."trg_init_direct_assignment_on_paid"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."trg_init_direct_assignment_on_paid"() TO "service_role";
@@ -23583,8 +24144,6 @@ GRANT ALL ON TABLE "public"."ops_events" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."payment_split_config" TO "anon";
-GRANT ALL ON TABLE "public"."payment_split_config" TO "authenticated";
 GRANT ALL ON TABLE "public"."payment_split_config" TO "service_role";
 
 

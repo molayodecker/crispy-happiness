@@ -1793,6 +1793,19 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.booking_final_amount_minor(p_final_amount_minor integer, p_total_price numeric)
+ RETURNS integer
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$
+  SELECT COALESCE(
+    NULLIF(p_final_amount_minor, 0),
+    NULLIF(p_total_price, 0)::integer,
+    0
+  )::integer;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.bookings_guard_payment_status()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -2194,6 +2207,126 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.capture_booking_payment_split_snapshot(p_booking_id uuid, p_amount_minor integer)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_customer_id uuid;
+  v_split_type text;
+  v_split_code text;
+  v_tax_pct numeric;
+  v_vendor_pct numeric;
+  v_tax_bps integer;
+  v_vendor_bps integer;
+  v_tax_minor integer;
+  v_vendor_minor integer;
+  v_platform_minor integer;
+BEGIN
+  IF p_amount_minor IS NULL OR p_amount_minor <= 0 THEN
+    RETURN;
+  END IF;
+
+  v_customer_id := auth.uid();
+  IF v_customer_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT NULLIF(btrim(text_value), '')
+  INTO v_split_code
+  FROM public.payment_split_config
+  WHERE key = 'paystack_split_code';
+
+  IF v_split_code IS NOT NULL THEN
+    UPDATE public.bookings
+    SET
+      payment_split_type = 'split_code',
+      paystack_split_code = v_split_code,
+      tax_share_minor = NULL,
+      vendor_share_minor = NULL,
+      platform_share_minor = NULL,
+      tax_percentage_bps = NULL,
+      vendor_percentage_bps = NULL,
+      tax_paystack_share = NULL,
+      vendor_paystack_share = NULL,
+      updated_at = now()
+    WHERE id = p_booking_id
+      AND customer_id = v_customer_id
+      AND payment_split_type IS NULL;
+    RETURN;
+  END IF;
+
+  SELECT COALESCE(NULLIF(btrim(text_value), ''), 'percentage')
+  INTO v_split_type
+  FROM public.payment_split_config
+  WHERE key = 'split_type';
+
+  IF v_split_type NOT IN ('percentage', 'flat') THEN
+    v_split_type := 'percentage';
+  END IF;
+
+  SELECT value INTO v_tax_pct FROM public.payment_split_config WHERE key = 'tax_percentage';
+  SELECT value INTO v_vendor_pct FROM public.payment_split_config WHERE key = 'vendor_percentage';
+
+  v_tax_pct := COALESCE(v_tax_pct, 0.15);
+  v_vendor_pct := COALESCE(v_vendor_pct, 0.10);
+
+  IF v_tax_pct < 0 OR v_vendor_pct < 0 OR (v_tax_pct + v_vendor_pct) > 1 THEN
+    RAISE EXCEPTION 'Invalid payment split configuration: tax and vendor percentages must be non-negative and sum to at most 1';
+  END IF;
+
+  v_tax_bps := round(v_tax_pct * 10000)::integer;
+  v_vendor_bps := round(v_vendor_pct * 10000)::integer;
+
+  IF v_split_type = 'flat' THEN
+    v_tax_minor := floor(p_amount_minor * v_tax_pct)::integer;
+    v_vendor_minor := floor(p_amount_minor * v_vendor_pct)::integer;
+
+    IF v_tax_minor + v_vendor_minor > p_amount_minor THEN
+      RAISE EXCEPTION 'Payment split exceeds booking amount';
+    END IF;
+
+    v_platform_minor := p_amount_minor - v_tax_minor - v_vendor_minor;
+
+    UPDATE public.bookings
+    SET
+      payment_split_type = 'flat',
+      paystack_split_code = NULL,
+      tax_share_minor = v_tax_minor,
+      vendor_share_minor = v_vendor_minor,
+      platform_share_minor = v_platform_minor,
+      tax_percentage_bps = v_tax_bps,
+      vendor_percentage_bps = v_vendor_bps,
+      tax_paystack_share = v_tax_minor::text,
+      vendor_paystack_share = v_vendor_minor::text,
+      updated_at = now()
+    WHERE id = p_booking_id
+      AND customer_id = v_customer_id
+      AND payment_split_type IS NULL;
+    RETURN;
+  END IF;
+
+  UPDATE public.bookings
+  SET
+    payment_split_type = 'percentage',
+    paystack_split_code = NULL,
+    tax_share_minor = NULL,
+    vendor_share_minor = NULL,
+    platform_share_minor = NULL,
+    tax_percentage_bps = v_tax_bps,
+    vendor_percentage_bps = v_vendor_bps,
+    tax_paystack_share = (round(v_tax_pct * 100))::text,
+    vendor_paystack_share = (round(v_vendor_pct * 100))::text,
+    updated_at = now()
+  WHERE id = p_booking_id
+    AND customer_id = v_customer_id
+    AND payment_split_type IS NULL;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.cash_dist(money, money)
  RETURNS money
  LANGUAGE c
@@ -2294,6 +2427,91 @@ BEGIN
   RETURN jsonb_build_object(
     'success', true,
     'job', to_jsonb((SELECT j FROM jobs j WHERE j.id = p_job_id))
+  );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.claim_subscription_paystack_plan(p_subscription_id uuid, p_customer_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_sub public.subscriptions%ROWTYPE;
+  v_interval text;
+  v_currency text;
+  v_amount integer;
+  v_token uuid;
+  v_stale_creating interval := interval '2 minutes';
+BEGIN
+  IF p_customer_id IS NULL THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'not_authenticated');
+  END IF;
+
+  SELECT *
+  INTO v_sub
+  FROM public.subscriptions
+  WHERE id = p_subscription_id
+    AND customer_id = p_customer_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'subscription_not_found');
+  END IF;
+
+  IF v_sub.recurrence_interval = 'weekly' THEN
+    v_interval := 'weekly';
+  ELSIF v_sub.recurrence_interval = 'monthly' THEN
+    v_interval := 'monthly';
+  ELSE
+    RETURN jsonb_build_object('action', 'error', 'error', 'unsupported_interval');
+  END IF;
+
+  v_currency := upper(coalesce(nullif(btrim(v_sub.currency), ''), 'GHS'));
+  v_amount := round(coalesce(v_sub.recurring_amount_minor, v_sub.amount)::numeric)::integer;
+
+  IF v_amount IS NULL OR v_amount <= 0 THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'invalid_amount');
+  END IF;
+
+  IF v_sub.paystack_plan_code IS NOT NULL
+     AND v_sub.paystack_plan_amount_minor = v_amount
+     AND upper(coalesce(nullif(btrim(v_sub.paystack_plan_currency), ''), '')) = v_currency
+     AND v_sub.paystack_plan_interval = v_interval
+     AND coalesce(v_sub.paystack_plan_status, 'ready') = 'ready' THEN
+    RETURN jsonb_build_object(
+      'action', 'reuse',
+      'plan_code', v_sub.paystack_plan_code,
+      'amount_minor', v_amount,
+      'currency', v_currency,
+      'interval', v_interval
+    );
+  END IF;
+
+  IF v_sub.paystack_plan_status = 'creating'
+     AND v_sub.paystack_plan_generation_started_at IS NOT NULL
+     AND v_sub.paystack_plan_generation_started_at > now() - v_stale_creating THEN
+    RETURN jsonb_build_object('action', 'wait', 'retry_after_ms', 2000);
+  END IF;
+
+  v_token := gen_random_uuid();
+
+  UPDATE public.subscriptions
+  SET
+    paystack_plan_status = 'creating',
+    paystack_plan_generation_token = v_token,
+    paystack_plan_generation_started_at = now(),
+    updated_at = now()
+  WHERE id = p_subscription_id;
+
+  RETURN jsonb_build_object(
+    'action', 'create',
+    'generation_token', v_token,
+    'amount_minor', v_amount,
+    'currency', v_currency,
+    'interval', v_interval
   );
 END;
 $function$
@@ -2639,6 +2857,77 @@ BEGIN
   GET DIAGNOSTICS v_released_count = ROW_COUNT;
 
   RETURN v_released_count;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.complete_subscription_paystack_plan(p_subscription_id uuid, p_customer_id uuid, p_generation_token uuid, p_plan_code text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_sub public.subscriptions%ROWTYPE;
+  v_interval text;
+  v_currency text;
+  v_amount integer;
+BEGIN
+  IF p_customer_id IS NULL THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'not_authenticated');
+  END IF;
+
+  IF p_plan_code IS NULL OR btrim(p_plan_code) = '' THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'invalid_plan_code');
+  END IF;
+
+  SELECT *
+  INTO v_sub
+  FROM public.subscriptions
+  WHERE id = p_subscription_id
+    AND customer_id = p_customer_id
+    AND paystack_plan_status = 'creating'
+    AND paystack_plan_generation_token = p_generation_token
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('action', 'lost_claim');
+  END IF;
+
+  IF v_sub.recurrence_interval = 'weekly' THEN
+    v_interval := 'weekly';
+  ELSIF v_sub.recurrence_interval = 'monthly' THEN
+    v_interval := 'monthly';
+  ELSE
+    RETURN jsonb_build_object('action', 'error', 'error', 'unsupported_interval');
+  END IF;
+
+  v_currency := upper(coalesce(nullif(btrim(v_sub.currency), ''), 'GHS'));
+  v_amount := round(coalesce(v_sub.recurring_amount_minor, v_sub.amount)::numeric)::integer;
+
+  IF v_amount IS NULL OR v_amount <= 0 THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'invalid_amount');
+  END IF;
+
+  UPDATE public.subscriptions
+  SET
+    paystack_plan_code = btrim(p_plan_code),
+    paystack_plan_amount_minor = v_amount,
+    paystack_plan_currency = v_currency,
+    paystack_plan_interval = v_interval,
+    paystack_plan_status = 'ready',
+    paystack_plan_generation_token = NULL,
+    paystack_plan_generation_started_at = NULL,
+    updated_at = now()
+  WHERE id = p_subscription_id;
+
+  RETURN jsonb_build_object(
+    'action', 'ready',
+    'plan_code', btrim(p_plan_code),
+    'amount_minor', v_amount,
+    'currency', v_currency,
+    'interval', v_interval
+  );
 END;
 $function$
 
@@ -3936,6 +4225,31 @@ BEGIN
 
   GET DIAGNOSTICS affected = ROW_COUNT;
   RETURN affected;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.fail_subscription_paystack_plan_creation(p_subscription_id uuid, p_customer_id uuid, p_generation_token uuid)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF p_customer_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  UPDATE public.subscriptions
+  SET
+    paystack_plan_status = 'failed',
+    paystack_plan_generation_token = NULL,
+    paystack_plan_generation_started_at = NULL,
+    updated_at = now()
+  WHERE id = p_subscription_id
+    AND customer_id = p_customer_id
+    AND paystack_plan_status = 'creating'
+    AND paystack_plan_generation_token = p_generation_token;
 END;
 $function$
 
@@ -7397,6 +7711,33 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.get_booking_payment_snapshot(p_booking_id uuid)
+ RETURNS TABLE(booking_id uuid, final_amount_minor integer, currency text, payment_status text, status booking_status, booking_cover boolean, booking_cover_amount numeric, platform_fee numeric, work_rate_ghs_per_hour numeric, pricing_version text, promotion_id uuid, promotion_slug text, promotion_discount_minor integer)
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT
+    b.id,
+    public.booking_final_amount_minor(b.final_amount_minor, b.total_price),
+    COALESCE(NULLIF(btrim(b.currency), ''), 'GHS'),
+    b.payment_status,
+    b.status,
+    COALESCE(b.booking_cover, true),
+    b.booking_cover_amount,
+    b.platform_fee,
+    b.work_rate_ghs_per_hour,
+    b.pricing_version,
+    b.promotion_id,
+    b.promotion_slug,
+    COALESCE(b.promotion_discount_minor, 0)
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+    AND b.customer_id = auth.uid()
+  LIMIT 1;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.get_cleaner_availability_by_id(p_cleaner_id uuid, p_date date, p_time time without time zone, p_duration numeric, p_timezone text DEFAULT 'UTC'::text, p_exclude_booking_id uuid DEFAULT NULL::uuid)
  RETURNS TABLE(id uuid, fullname text, avatar_url text, hourly_rate numeric, is_available boolean)
  LANGUAGE plpgsql
@@ -8263,6 +8604,80 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.get_payable_booking_snapshot(p_booking_id uuid)
+ RETURNS TABLE(booking_id uuid, customer_id uuid, final_amount_minor integer, currency text, payment_status text, booking_status booking_status, payment_reference text, payment_split_type text, paystack_split_code text, tax_share_minor integer, vendor_share_minor integer, platform_share_minor integer, tax_percentage_bps integer, vendor_percentage_bps integer, tax_paystack_share text, vendor_paystack_share text)
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_row public.bookings%ROWTYPE;
+  v_amount integer;
+BEGIN
+  SELECT *
+  INTO v_row
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+    AND b.customer_id = auth.uid()
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF v_row.status IS DISTINCT FROM 'pending'::public.booking_status THEN
+    RETURN;
+  END IF;
+
+  IF lower(COALESCE(v_row.payment_status, '')) NOT IN ('pending', 'failed') THEN
+    RETURN;
+  END IF;
+
+  IF v_row.subscription_id IS NOT NULL THEN
+    RETURN;
+  END IF;
+
+  v_amount := public.booking_final_amount_minor(v_row.final_amount_minor, v_row.total_price);
+  IF v_amount <= 0 THEN
+    RETURN;
+  END IF;
+
+  IF v_row.payment_split_type IS NULL THEN
+    PERFORM public.capture_booking_payment_split_snapshot(p_booking_id, v_amount);
+
+    SELECT *
+    INTO v_row
+    FROM public.bookings b
+    WHERE b.id = p_booking_id
+      AND b.customer_id = auth.uid();
+  END IF;
+
+  IF v_row.payment_split_type IS NULL THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    v_row.id,
+    v_row.customer_id,
+    v_amount,
+    COALESCE(NULLIF(btrim(v_row.currency), ''), 'GHS'),
+    v_row.payment_status,
+    v_row.status,
+    v_row.reference,
+    v_row.payment_split_type,
+    v_row.paystack_split_code,
+    v_row.tax_share_minor,
+    v_row.vendor_share_minor,
+    v_row.platform_share_minor,
+    v_row.tax_percentage_bps,
+    v_row.vendor_percentage_bps,
+    v_row.tax_paystack_share,
+    v_row.vendor_paystack_share;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.get_payment_split_config()
  RETURNS jsonb
  LANGUAGE sql
@@ -8300,7 +8715,7 @@ $function$
 
 
 CREATE OR REPLACE FUNCTION public.get_pending_booking_for_edit(p_customer_id uuid, p_booking_id uuid)
- RETURNS TABLE(id uuid, customer_id uuid, cleaner_id uuid, service_id integer, title text, scheduled_date date, scheduled_time time without time zone, duration_hours numeric, address text, special_instructions text, status booking_status, payment_status text, subscription_id uuid, home_size text, extra_task_ids text[], duration_adjustment numeric, duration_computed numeric, duration_final numeric, timezone_name text, cleaner_assigned_at timestamp with time zone, service_duration_option_id uuid, location_latitude double precision, location_longitude double precision, service jsonb)
+ RETURNS TABLE(id uuid, customer_id uuid, cleaner_id uuid, service_id integer, title text, scheduled_date date, scheduled_time time without time zone, duration_hours numeric, address text, special_instructions text, status booking_status, payment_status text, subscription_id uuid, home_size text, extra_task_ids text[], duration_adjustment numeric, duration_computed numeric, duration_final numeric, timezone_name text, cleaner_assigned_at timestamp with time zone, service_duration_option_id uuid, location_latitude double precision, location_longitude double precision, booking_cover boolean, booking_cover_amount numeric, platform_fee numeric, work_rate_ghs_per_hour numeric, pricing_version text, currency text, promotion_id uuid, promotion_slug text, promotion_discount_minor integer, final_amount_minor integer, service jsonb)
  LANGUAGE sql
  STABLE
  SET search_path TO 'public'
@@ -8337,11 +8752,23 @@ AS $function$
         THEN ST_X(b.location_coordinates::geometry)
       ELSE NULL
     END AS location_longitude,
+    COALESCE(b.booking_cover, true) AS booking_cover,
+    b.booking_cover_amount,
+    b.platform_fee,
+    b.work_rate_ghs_per_hour,
+    b.pricing_version,
+    b.currency,
+    b.promotion_id,
+    b.promotion_slug,
+    COALESCE(b.promotion_discount_minor, 0) AS promotion_discount_minor,
+    -- Modern checkout writes both columns in pesewas; prefer final_amount_minor.
+    COALESCE(NULLIF(b.final_amount_minor, 0), NULLIF(b.total_price, 0), 0) AS final_amount_minor,
     to_jsonb(s.*) AS service
   FROM public.bookings b
   JOIN public.service_types s
     ON s.id = b.service_id
   WHERE b.id = p_booking_id
+    AND b.customer_id = auth.uid()
     AND b.customer_id = p_customer_id
     AND b.status IN ('pending', 'confirmed', 'scheduled')
     AND b.subscription_id IS NULL
@@ -16632,6 +17059,33 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.trg_bookings_clear_payment_split_on_amount_change()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF TG_OP = 'UPDATE'
+    AND (
+      OLD.final_amount_minor IS DISTINCT FROM NEW.final_amount_minor
+      OR OLD.total_price IS DISTINCT FROM NEW.total_price
+    )
+  THEN
+    NEW.payment_split_type := NULL;
+    NEW.paystack_split_code := NULL;
+    NEW.tax_share_minor := NULL;
+    NEW.vendor_share_minor := NULL;
+    NEW.platform_share_minor := NULL;
+    NEW.tax_percentage_bps := NULL;
+    NEW.vendor_percentage_bps := NULL;
+    NEW.tax_paystack_share := NULL;
+    NEW.vendor_paystack_share := NULL;
+  END IF;
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.trg_init_direct_assignment_on_paid()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -17783,6 +18237,8 @@ CREATE TRIGGER bookings_guard_payment_status BEFORE UPDATE ON bookings FOR EACH 
 CREATE TRIGGER release_promotion_on_booking_cancelled AFTER UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION trg_release_promotion_on_booking_cancelled();
 
 CREATE TRIGGER tr_log_booking_status_change AFTER UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION fn_log_status_change();
+
+CREATE TRIGGER trg_bookings_clear_payment_split_on_amount_change BEFORE UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION trg_bookings_clear_payment_split_on_amount_change();
 
 CREATE TRIGGER trg_bookings_guard_payment_status BEFORE UPDATE OF payment_status ON bookings FOR EACH ROW EXECUTE FUNCTION bookings_guard_payment_status();
 
