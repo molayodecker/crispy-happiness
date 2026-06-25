@@ -1301,6 +1301,9 @@ DECLARE
   v_now                timestamptz := now();
   v_roles_inserted     int := 0;
   v_service_categories public.service_category[];
+  v_language_ids       text[];
+  v_languages          text[];
+  v_pets_comfort       text;
 BEGIN
   SELECT * INTO v_app
   FROM public.cleaner_applications
@@ -1342,13 +1345,19 @@ BEGIN
     RAISE EXCEPTION 'user_not_found' USING ERRCODE = 'P0002';
   END IF;
 
-  -- Offered categories from the application's service_type_ids. NULL when the
-  -- application listed no services, so existing cleaner_data is not clobbered.
   SELECT array_agg(DISTINCT st.category)
   INTO v_service_categories
   FROM unnest(COALESCE(v_app.service_type_ids, '{}'::int[])) AS sid
   JOIN public.service_types st ON st.id = sid
   WHERE st.category IS NOT NULL;
+
+  v_language_ids := public.resolve_cleaner_application_language_ids(v_app);
+  v_languages := CASE
+    WHEN cardinality(v_language_ids) > 0
+      THEN public.cleaner_language_labels_from_application(v_language_ids)
+    ELSE NULL
+  END;
+  v_pets_comfort := public.resolve_cleaner_application_pets_comfort(v_app);
 
   v_first_name := NULLIF(split_part(trim(coalesce(v_app.name, '')), ' ', 1), '');
 
@@ -1398,6 +1407,8 @@ BEGIN
     service_areas,
     service_categories,
     hourly_rate,
+    languages,
+    pets_comfort,
     status,
     verified,
     updated_at
@@ -1410,6 +1421,8 @@ BEGIN
     v_app.service_areas,
     v_service_categories,
     v_app.hourly_rate,
+    COALESCE(v_languages, ARRAY['English']::text[]),
+    v_pets_comfort,
     'active',
     true,
     v_now
@@ -1421,6 +1434,12 @@ BEGIN
     service_areas      = COALESCE(EXCLUDED.service_areas, public.cleaner_data.service_areas),
     service_categories = COALESCE(EXCLUDED.service_categories, public.cleaner_data.service_categories),
     hourly_rate        = COALESCE(EXCLUDED.hourly_rate, public.cleaner_data.hourly_rate),
+    languages          = COALESCE(
+      v_languages,
+      public.cleaner_data.languages,
+      ARRAY['English']::text[]
+    ),
+    pets_comfort       = COALESCE(v_pets_comfort, public.cleaner_data.pets_comfort),
     status = CASE
       WHEN public.cleaner_data.status = 'suspended'
       THEN public.cleaner_data.status
@@ -2562,6 +2581,76 @@ BEGIN
 
   RETURN GREATEST(0, (v_earnings_major * 100)::integer);
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.cleaner_has_booking_conflict(p_cleaner_id uuid, p_booking_start timestamp with time zone, p_booking_end timestamp with time zone, p_exclude_booking_id uuid DEFAULT NULL::uuid, p_buffer_minutes integer DEFAULT NULL::integer)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.bookings b
+    WHERE b.cleaner_id = p_cleaner_id
+      AND b.status NOT IN ('cancelled', 'completed')
+      AND (
+        p_exclude_booking_id IS NULL
+        OR b.id <> p_exclude_booking_id
+      )
+      AND b.booking_period IS NOT NULL
+      AND tstzrange(
+        lower(b.booking_period)
+          - make_interval(
+            mins => GREATEST(
+              COALESCE(p_buffer_minutes, public.resolve_cleaner_job_buffer_minutes()),
+              0
+            )
+          ),
+        upper(b.booking_period)
+          + make_interval(
+            mins => GREATEST(
+              COALESCE(p_buffer_minutes, public.resolve_cleaner_job_buffer_minutes()),
+              0
+            )
+          ),
+        '[)'
+      ) && tstzrange(
+        p_booking_start,
+        p_booking_end,
+        '[)'
+      )
+  );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.cleaner_language_labels_from_application(p_language_ids text[])
+ RETURNS text[]
+ LANGUAGE sql
+ STABLE
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  SELECT COALESCE(
+    (
+      SELECT array_agg(DISTINCT label ORDER BY label)
+      FROM (
+        SELECT 'English'::text AS label
+        UNION ALL
+        SELECT CASE lower(trim(id))
+          WHEN 'twi' THEN 'Twi'
+          WHEN 'ga' THEN 'Ga'
+          WHEN 'ewe' THEN 'Ewe'
+          WHEN 'hausa' THEN 'Hausa'
+          ELSE initcap(trim(id))
+        END AS label
+        FROM unnest(COALESCE(p_language_ids, ARRAY[]::text[])) AS id
+        WHERE nullif(trim(id), '') IS NOT NULL
+          AND lower(trim(id)) <> 'english'
+      ) mapped
+    ),
+    ARRAY['English']::text[]
+  );
 $function$
 
 
@@ -3867,6 +3956,114 @@ BEGIN
   END IF;
 
   RETURN jsonb_build_object('success', true, 'booking_id', p_booking_id);
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.default_service_timezone()
+ RETURNS text
+ LANGUAGE sql
+ IMMUTABLE PARALLEL SAFE
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  SELECT 'Africa/Accra'::text;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.diagnose_cleaner_booking_unavailability(p_cleaner_id uuid, p_booking_date date, p_start_time time without time zone, p_duration_hours numeric, p_latitude double precision, p_longitude double precision, p_max_distance_meters integer, p_requested_category service_category, p_requested_specialty_slugs text[], p_exclude_booking_id uuid, p_customer_id uuid)
+ RETURNS text
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_longitude, p_latitude), 4326)::geography;
+  v_cd public.cleaner_data%ROWTYPE;
+  v_profile public.profiles%ROWTYPE;
+  v_dist double precision;
+  v_effective_max integer;
+  v_proposed_start timestamptz;
+  v_proposed_end timestamptz;
+BEGIN
+  SELECT cd.* INTO v_cd
+  FROM public.cleaner_data cd
+  WHERE cd.user_id = p_cleaner_id;
+
+  IF NOT FOUND THEN
+    RETURN 'not_available';
+  END IF;
+
+  SELECT p.* INTO v_profile
+  FROM public.profiles p
+  WHERE p.user_id = p_cleaner_id
+  LIMIT 1;
+
+  IF v_cd.status IS DISTINCT FROM 'active' OR v_cd.verified IS DISTINCT FROM true THEN
+    RETURN 'not_active';
+  END IF;
+
+  IF v_profile.user_id IS NULL OR NOT public.is_profile_discoverable_by_others(v_profile) THEN
+    RETURN 'not_discoverable';
+  END IF;
+
+  IF p_customer_id IS NOT NULL AND v_cd.user_id = p_customer_id THEN
+    RETURN 'self_booking_not_allowed';
+  END IF;
+
+  IF p_requested_category IS NOT NULL
+     AND NOT (p_requested_category = ANY(COALESCE(v_cd.service_categories, ARRAY[]::public.service_category[]))) THEN
+    RETURN 'category_mismatch';
+  END IF;
+
+  IF cardinality(COALESCE(p_requested_specialty_slugs, ARRAY[]::text[])) > 0
+     AND NOT EXISTS (
+       SELECT 1
+       FROM unnest(p_requested_specialty_slugs) s
+       WHERE s = ANY(COALESCE(v_cd.specialties, ARRAY[]::text[]))
+     ) THEN
+    RETURN 'specialty_mismatch';
+  END IF;
+
+  IF COALESCE(v_cd.base_location::geography, v_profile.location_wkt) IS NULL THEN
+    RETURN 'location_unavailable';
+  END IF;
+
+  v_dist := ST_Distance(
+    COALESCE(v_cd.base_location::geography, v_profile.location_wkt),
+    v_cust_loc
+  )::float;
+
+  v_effective_max := LEAST(
+    COALESCE(v_cd.max_travel_distance_meters, p_max_distance_meters),
+    p_max_distance_meters
+  );
+
+  IF v_dist > v_effective_max THEN
+    RETURN 'distance_out_of_range';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.cleaner_availability_exceptions cae
+    WHERE cae.cleaner_id = p_cleaner_id
+      AND cae.exception_date = p_booking_date
+  ) THEN
+    RETURN 'availability_exception';
+  END IF;
+
+  v_proposed_start := public.service_schedule_timestamptz(p_booking_date, p_start_time);
+  v_proposed_end := v_proposed_start + (p_duration_hours || ' hours')::interval;
+
+  IF public.cleaner_has_booking_conflict(
+    p_cleaner_id,
+    v_proposed_start,
+    v_proposed_end,
+    p_exclude_booking_id
+  ) THEN
+    RETURN 'overlapping_booking';
+  END IF;
+
+  RETURN 'not_available';
 END;
 $function$
 
@@ -7030,6 +7227,198 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.get_available_cleaners_for_booking(p_customer_id uuid, p_booking_date date, p_start_time time without time zone, p_duration_hours numeric, p_latitude double precision, p_longitude double precision, p_max_distance_meters integer, p_requested_category service_category DEFAULT NULL::service_category, p_requested_specialty_slugs text[] DEFAULT '{}'::text[], p_exclude_booking_id uuid DEFAULT NULL::uuid, p_selected_cleaner_id uuid DEFAULT NULL::uuid, p_search_query text DEFAULT NULL::text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_duration numeric;
+  v_safe_exclude_booking_id uuid := NULL;
+  v_available jsonb := '[]'::jsonb;
+  v_selected jsonb := NULL;
+  v_selected_available boolean := false;
+  v_selected_reason text := NULL;
+  v_use_search boolean := false;
+BEGIN
+  IF p_customer_id IS NULL THEN
+    RAISE EXCEPTION 'Not authorized' USING ERRCODE = '42501';
+  END IF;
+
+  IF auth.uid() IS DISTINCT FROM p_customer_id
+     AND current_setting('app.system_cleaner_discovery', true) IS DISTINCT FROM '1'
+  THEN
+    RAISE EXCEPTION 'Not authorized' USING ERRCODE = '42501';
+  END IF;
+
+  IF p_exclude_booking_id IS NOT NULL THEN
+    SELECT b.id
+    INTO v_safe_exclude_booking_id
+    FROM public.bookings b
+    WHERE b.id = p_exclude_booking_id
+      AND b.customer_id = p_customer_id
+      AND b.status IN ('pending', 'confirmed')
+      AND COALESCE(b.payment_status, 'pending') NOT IN ('paid', 'success')
+    LIMIT 1;
+
+    IF v_safe_exclude_booking_id IS NULL THEN
+      RAISE EXCEPTION 'Invalid exclude booking id' USING ERRCODE = '42501';
+    END IF;
+  END IF;
+
+  v_duration := LEAST(24, GREATEST(1, COALESCE(p_duration_hours, 2)));
+  v_use_search := NULLIF(BTRIM(p_search_query), '') IS NOT NULL;
+
+  IF v_use_search THEN
+    SELECT COALESCE(
+      jsonb_agg(row_to_json(x)::jsonb ORDER BY x.distance_meters ASC NULLS LAST),
+      '[]'::jsonb
+    )
+    INTO v_available
+    FROM (
+      SELECT
+        s.cleaner_id,
+        true AS available,
+        NULL::text AS unavailable_reason,
+        s.distance_meters,
+        NULL::double precision AS ranking_score,
+        NULL::numeric AS hourly_rate,
+        COALESCE(s.specialties, ARRAY[]::text[]) AS specialties,
+        s.cleaner_name,
+        s.avatar_url,
+        NULL::text AS bio,
+        s.rating,
+        s.company_name,
+        s.team_size,
+        s.team_role
+      FROM public.search_available_cleaners(
+        p_latitude,
+        p_longitude,
+        p_booking_date,
+        p_start_time,
+        v_duration::double precision,
+        COALESCE(p_requested_specialty_slugs, ARRAY[]::text[]),
+        p_max_distance_meters::double precision,
+        v_safe_exclude_booking_id,
+        p_requested_category,
+        p_search_query
+      ) s
+    ) x;
+  ELSE
+    SELECT COALESCE(
+      jsonb_agg(row_to_json(x)::jsonb ORDER BY x.ranking_score DESC NULLS LAST, x.distance_meters ASC NULLS LAST),
+      '[]'::jsonb
+    )
+    INTO v_available
+    FROM (
+      SELECT
+        g.cleaner_id,
+        true AS available,
+        NULL::text AS unavailable_reason,
+        g.distance_meters,
+        g.final_score AS ranking_score,
+        g.hourly_rate,
+        COALESCE(g.specialties, ARRAY[]::text[]) AS specialties,
+        g.cleaner_name,
+        g.avatar_url,
+        g.bio,
+        g.rating,
+        g.company_name,
+        g.team_size,
+        g.team_role
+      FROM public.get_best_available_cleaners(
+        p_booking_date,
+        p_start_time,
+        v_duration,
+        p_latitude,
+        p_longitude,
+        p_max_distance_meters,
+        COALESCE(p_requested_specialty_slugs, ARRAY[]::text[]),
+        v_safe_exclude_booking_id,
+        p_requested_category
+      ) g
+    ) x;
+
+    IF jsonb_array_length(v_available) = 0 THEN
+      SELECT COALESCE(
+        jsonb_agg(row_to_json(x)::jsonb ORDER BY x.distance_meters ASC NULLS LAST),
+        '[]'::jsonb
+      )
+      INTO v_available
+      FROM (
+        SELECT
+          s.cleaner_id,
+          true AS available,
+          NULL::text AS unavailable_reason,
+          s.distance_meters,
+          NULL::double precision AS ranking_score,
+          NULL::numeric AS hourly_rate,
+          COALESCE(s.specialties, ARRAY[]::text[]) AS specialties,
+          s.cleaner_name,
+          s.avatar_url,
+          NULL::text AS bio,
+          s.rating,
+          s.company_name,
+          s.team_size,
+          s.team_role
+        FROM public.search_available_cleaners(
+          p_latitude,
+          p_longitude,
+          p_booking_date,
+          p_start_time,
+          v_duration::double precision,
+          COALESCE(p_requested_specialty_slugs, ARRAY[]::text[]),
+          p_max_distance_meters::double precision,
+          v_safe_exclude_booking_id,
+          p_requested_category,
+          NULL
+        ) s
+      ) x;
+    END IF;
+  END IF;
+
+  IF p_selected_cleaner_id IS NOT NULL THEN
+    SELECT EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(v_available) elem
+      WHERE (elem->>'cleaner_id')::uuid = p_selected_cleaner_id
+    )
+    INTO v_selected_available;
+
+    IF v_selected_available THEN
+      v_selected_reason := NULL;
+    ELSE
+      v_selected_reason := public.diagnose_cleaner_booking_unavailability(
+        p_selected_cleaner_id,
+        p_booking_date,
+        p_start_time,
+        v_duration,
+        p_latitude,
+        p_longitude,
+        p_max_distance_meters,
+        p_requested_category,
+        COALESCE(p_requested_specialty_slugs, ARRAY[]::text[]),
+        v_safe_exclude_booking_id,
+        p_customer_id
+      );
+    END IF;
+
+    v_selected := jsonb_build_object(
+      'cleaner_id', p_selected_cleaner_id,
+      'available', v_selected_available,
+      'reason', v_selected_reason
+    );
+  END IF;
+
+  RETURN jsonb_build_object(
+    'available_cleaners', v_available,
+    'selected_cleaner', v_selected
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.get_available_timeslots(p_booking_date date, p_timezone text DEFAULT 'UTC'::text, p_duration_hours numeric DEFAULT NULL::numeric, p_exclude_booking_id uuid DEFAULT NULL::uuid)
  RETURNS TABLE(time_12h text, time_24h text, same_day_cutoff numeric, travel_buffer numeric, work_day_start numeric, work_day_end numeric, slot_interval_minutes integer, duration_hours numeric, disable_same_day_booking boolean, is_meta_row boolean)
  LANGUAGE plpgsql
@@ -7400,6 +7789,7 @@ CREATE OR REPLACE FUNCTION public.get_best_available_cleaners(p_date date, p_tim
 AS $function$
 DECLARE
   v_cust_id uuid := auth.uid();
+  v_booking_start timestamptz;
   v_booking_range tstzrange;
   v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
 BEGIN
@@ -7409,9 +7799,10 @@ BEGIN
     RAISE EXCEPTION 'Not authorized';
   END IF;
 
+  v_booking_start := public.service_schedule_timestamptz(p_date, p_time);
   v_booking_range := tstzrange(
-    (p_date + p_time)::timestamptz,
-    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
+    v_booking_start,
+    v_booking_start + (p_duration || ' hours')::interval,
     '[)'
   );
 
@@ -7470,16 +7861,11 @@ BEGIN
           WHERE s = ANY(COALESCE(cd.specialties, ARRAY[]::text[]))
         )
       )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM public.bookings b
-        WHERE b.cleaner_id = cd.user_id
-          AND b.booking_period && v_booking_range
-          AND b.status != 'cancelled'
-          AND (
-            p_exclude_booking_id IS NULL
-            OR b.id <> p_exclude_booking_id
-          )
+      AND NOT public.cleaner_has_booking_conflict(
+        cd.user_id,
+        lower(v_booking_range),
+        upper(v_booking_range),
+        p_exclude_booking_id
       )
       AND NOT EXISTS (
         SELECT 1
@@ -13038,6 +13424,69 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.resolve_cleaner_application_language_ids(p_app cleaner_applications)
+ RETURNS text[]
+ LANGUAGE sql
+ STABLE
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  SELECT COALESCE(
+    NULLIF(p_app.languages, ARRAY[]::text[]),
+    ARRAY(
+      SELECT token
+      FROM unnest(COALESCE(p_app.additional_skills, ARRAY[]::text[])) AS token
+      WHERE lower(trim(token)) IN ('twi', 'ga', 'ewe', 'hausa', 'english')
+    ),
+    ARRAY[]::text[]
+  );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.resolve_cleaner_application_pets_comfort(p_app cleaner_applications)
+ RETURNS text
+ LANGUAGE sql
+ STABLE
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  SELECT COALESCE(
+    NULLIF(trim(p_app.pets_comfort), ''),
+    CASE
+      WHEN 'Can you work around dogs?' = ANY(COALESCE(p_app.additional_skills, ARRAY[]::text[]))
+        THEN 'yes_dogs'
+      WHEN 'Can you work around cats?' = ANY(COALESCE(p_app.additional_skills, ARRAY[]::text[]))
+        THEN 'yes_cats'
+      WHEN 'No, I prefer pet-free homes' = ANY(COALESCE(p_app.additional_skills, ARRAY[]::text[]))
+        THEN 'no'
+      ELSE NULL
+    END
+  );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.resolve_cleaner_job_buffer_minutes()
+ RETURNS integer
+ LANGUAGE sql
+ STABLE
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  SELECT COALESCE(
+    (
+      SELECT GREATEST(bs.value_numeric::integer, 0)
+      FROM public.booking_settings bs
+      WHERE bs.key = 'minimum_job_buffer_minutes'
+      LIMIT 1
+    ),
+    (
+      SELECT GREATEST((bs.value_numeric * 60)::integer, 0)
+      FROM public.booking_settings bs
+      WHERE bs.key = 'travel_buffer'
+      LIMIT 1
+    ),
+    45
+  );
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.revoke_co_cleaner_invite(p_invite_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -13143,11 +13592,8 @@ CREATE OR REPLACE FUNCTION public.search_available_cleaners(p_lat double precisi
 AS $function$
 DECLARE
   v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
-  v_booking_range tstzrange := tstzrange(
-    (p_date + p_time)::timestamptz,
-    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
-    '[)'
-  );
+  v_booking_start timestamptz;
+  v_booking_range tstzrange;
   v_search text := public.sanitize_cleaner_search_query(p_search_query);
 BEGIN
   IF auth.uid() IS NULL
@@ -13155,6 +13601,13 @@ BEGIN
   THEN
     RAISE EXCEPTION 'Not authorized';
   END IF;
+
+  v_booking_start := public.service_schedule_timestamptz(p_date, p_time);
+  v_booking_range := tstzrange(
+    v_booking_start,
+    v_booking_start + (p_duration || ' hours')::interval,
+    '[)'
+  );
 
   RETURN QUERY
   SELECT
@@ -13202,16 +13655,17 @@ BEGIN
         WHERE s = ANY(COALESCE(cd.specialties, ARRAY[]::text[]))
       )
     )
+    AND NOT public.cleaner_has_booking_conflict(
+      cd.user_id,
+      lower(v_booking_range),
+      upper(v_booking_range),
+      p_exclude_booking_id
+    )
     AND NOT EXISTS (
       SELECT 1
-      FROM public.bookings b
-      WHERE b.cleaner_id = cd.user_id
-        AND b.booking_period && v_booking_range
-        AND b.status != 'cancelled'
-        AND (
-          p_exclude_booking_id IS NULL
-          OR b.id <> p_exclude_booking_id
-        )
+      FROM public.cleaner_availability_exceptions cae
+      WHERE cae.cleaner_id = cd.user_id
+        AND cae.exception_date = p_date
     )
     AND (
       v_search IS NULL
@@ -13270,6 +13724,17 @@ BEGIN
     )
   ORDER BY cd.base_location::geography <-> v_cust_loc ASC;
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.service_schedule_timestamptz(p_schedule_date date, p_schedule_time time without time zone, p_timezone text DEFAULT NULL::text)
+ RETURNS timestamp with time zone
+ LANGUAGE sql
+ STABLE PARALLEL SAFE
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  SELECT (p_schedule_date + p_schedule_time)
+    AT TIME ZONE COALESCE(NULLIF(trim(p_timezone), ''), public.default_service_timezone());
 $function$
 
 
