@@ -9609,6 +9609,18 @@ BEGIN
     RETURN;
   END IF;
 
+  -- One-off bookings: require a live cleaner hold before exposing a payable snapshot.
+  IF v_row.subscription_id IS NULL THEN
+    IF v_row.cleaner_id IS NULL AND v_row.cleaner_assigned_at IS NOT NULL THEN
+      RETURN;
+    END IF;
+
+    IF v_row.cleaner_hold_expires_at IS NOT NULL
+       AND v_row.cleaner_hold_expires_at < now() THEN
+      RETURN;
+    END IF;
+  END IF;
+
   IF v_row.subscription_id IS NOT NULL THEN
     SELECT s.status
     INTO v_subscription_status
