@@ -5947,6 +5947,16 @@ CREATE OR REPLACE FUNCTION "public"."get_booking_payment_snapshot"("p_booking_id
   LEFT JOIN public.subscriptions s ON s.id = b.subscription_id
   WHERE b.id = p_booking_id
     AND b.customer_id = auth.uid()
+    AND (
+      b.subscription_id IS NOT NULL
+      OR (
+        NOT (b.cleaner_id IS NULL AND b.cleaner_assigned_at IS NOT NULL)
+        AND NOT (
+          b.cleaner_hold_expires_at IS NOT NULL
+          AND b.cleaner_hold_expires_at < now()
+        )
+      )
+    )
   LIMIT 1;
 $$;
 
