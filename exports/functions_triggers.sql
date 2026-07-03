@@ -2878,6 +2878,86 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.cleaner_booking_full_location_available(p_status booking_status, p_scheduled_at_utc timestamp with time zone, p_scheduled_date date, p_scheduled_time time without time zone, p_timezone_name text, p_now timestamp with time zone DEFAULT now())
+ RETURNS boolean
+ LANGUAGE plpgsql
+ STABLE
+AS $function$
+DECLARE
+  v_tz text;
+  v_now_date date;
+  v_start_at timestamptz;
+BEGIN
+  IF p_status IS NULL
+     OR p_status IN ('completed', 'cancelled', 'pending') THEN
+    RETURN false;
+  END IF;
+
+  v_tz := COALESCE(NULLIF(btrim(p_timezone_name), ''), 'Africa/Accra');
+
+  IF p_status IN ('en_route', 'arrived', 'in_progress') THEN
+    IF p_scheduled_date IS NULL THEN
+      RETURN true;
+    END IF;
+    v_now_date := (timezone(v_tz, p_now))::date;
+    IF p_scheduled_date <> v_now_date THEN
+      RETURN false;
+    END IF;
+    RETURN true;
+  END IF;
+
+  IF p_status NOT IN ('confirmed', 'scheduled') THEN
+    RETURN false;
+  END IF;
+
+  v_start_at := COALESCE(
+    p_scheduled_at_utc,
+    CASE
+      WHEN p_scheduled_date IS NOT NULL AND p_scheduled_time IS NOT NULL THEN
+        timezone(v_tz, (p_scheduled_date + p_scheduled_time))
+      ELSE NULL
+    END
+  );
+
+  IF v_start_at IS NULL OR p_scheduled_date IS NULL THEN
+    RETURN false;
+  END IF;
+
+  IF p_now < (v_start_at - interval '1 hour') THEN
+    RETURN false;
+  END IF;
+
+  v_now_date := (timezone(v_tz, p_now))::date;
+  IF p_scheduled_date <> v_now_date THEN
+    RETURN false;
+  END IF;
+
+  RETURN true;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.cleaner_can_read_booking_location(p_booking_id uuid, p_cleaner_id uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.bookings b
+    WHERE b.id = p_booking_id
+      AND (
+        b.cleaner_id = p_cleaner_id
+        OR b.direct_assigned_cleaner_id = p_cleaner_id
+        OR b.id IN (
+          SELECT public.list_broadcast_assignments_for_cleaner(p_cleaner_id)
+        )
+      )
+  );
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.cleaner_display_rating(p_rating numeric, p_review_count integer)
  RETURNS double precision
  LANGUAGE sql
@@ -3510,7 +3590,319 @@ END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.compute_booking_pricing(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true, p_supplies_option text DEFAULT 'customer_provided'::text, p_cleaner_id uuid DEFAULT NULL::uuid)
+CREATE OR REPLACE FUNCTION public.compute_booking_pricing(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true, p_cleaner_id uuid DEFAULT NULL::uuid)
+ RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, minimum_duration_hours numeric, cleaner_earnings_minor integer)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  c_default_platform_fee_bps constant integer := 1500;
+  c_default_booking_cover_minor constant integer := 2100;
+  v_rate numeric;
+  v_service_rate numeric;
+  v_service_active boolean;
+  v_min_duration_hours numeric;
+  v_max_duration_hours numeric;
+  v_duration_increment_hours numeric;
+  v_cleaner_rate numeric;
+  v_using_cleaner_rate boolean := false;
+  v_discount_pct numeric;
+  v_duration_hours numeric;
+  v_labor_major numeric;
+  v_labor_minor integer;
+
+  v_settings_platform_raw numeric;
+  v_settings_cover_raw numeric;
+  v_platform_bps integer;
+  v_cover_minor integer;
+  v_platform_fee_major numeric;
+  v_cover_major numeric;
+  v_core_minor integer;
+
+  v_pricing_version text;
+  v_currency text;
+  v_same_day_bps integer;
+  v_weekend_bps integer;
+  v_recurring_weekly_bps integer;
+  v_recurring_monthly_discount_bps integer;
+
+  v_service_timezone text;
+  v_today date;
+  v_is_same_day boolean;
+  v_is_weekend boolean;
+  v_same_day_minor integer;
+  v_after_same integer;
+  v_weekend_minor integer;
+  v_final_minor integer;
+
+  v_discount_bps integer;
+  v_recurring_amount_minor integer;
+  v_first_charge_minor integer;
+  v_recurring_discount_minor integer;
+  v_cleaner_earnings_minor integer;
+BEGIN
+  IF p_duration_hours_raw IS NULL OR p_duration_hours_raw <> p_duration_hours_raw THEN
+    RAISE EXCEPTION 'Invalid duration';
+  END IF;
+
+  SELECT
+    st.price,
+    COALESCE(st.active, true),
+    st.minimum_duration_hours,
+    st.maximum_duration_hours,
+    st.duration_increment_hours
+  INTO
+    v_service_rate,
+    v_service_active,
+    v_min_duration_hours,
+    v_max_duration_hours,
+    v_duration_increment_hours
+  FROM public.service_types st
+  WHERE st.id = p_service_id;
+
+  IF NOT FOUND OR v_service_active IS DISTINCT FROM true THEN
+    RAISE EXCEPTION 'Invalid or inactive service';
+  END IF;
+
+  IF v_service_rate IS NULL OR v_service_rate < 0 THEN
+    RAISE EXCEPTION 'Invalid service price';
+  END IF;
+
+  IF v_min_duration_hours IS NULL OR v_min_duration_hours <= 0 THEN
+    RAISE EXCEPTION 'Service has invalid minimum duration configuration';
+  END IF;
+
+  IF v_max_duration_hours IS NULL OR v_max_duration_hours <= 0 THEN
+    RAISE EXCEPTION 'Service has invalid maximum duration configuration';
+  END IF;
+
+  IF v_max_duration_hours < v_min_duration_hours THEN
+    RAISE EXCEPTION 'Service maximum duration is below minimum duration';
+  END IF;
+
+  IF v_duration_increment_hours IS NULL OR v_duration_increment_hours <= 0 THEN
+    RAISE EXCEPTION 'Service has invalid duration increment configuration';
+  END IF;
+
+  v_duration_hours :=
+    round(p_duration_hours_raw / v_duration_increment_hours) * v_duration_increment_hours;
+
+  IF v_duration_hours < v_min_duration_hours THEN
+    RAISE EXCEPTION 'Minimum duration for this service is % hours', v_min_duration_hours;
+  END IF;
+
+  IF v_duration_hours > v_max_duration_hours THEN
+    RAISE EXCEPTION 'Maximum duration for this service is % hours', v_max_duration_hours;
+  END IF;
+
+  v_rate := v_service_rate;
+
+  IF p_cleaner_id IS NOT NULL THEN
+    SELECT cd.hourly_rate
+    INTO v_cleaner_rate
+    FROM public.cleaner_data cd
+    WHERE cd.user_id = p_cleaner_id;
+
+    IF NOT FOUND OR v_cleaner_rate IS NULL OR v_cleaner_rate <= 0 THEN
+      RAISE EXCEPTION 'Selected cleaner does not have a valid hourly rate';
+    END IF;
+
+    v_rate := round(v_cleaner_rate::numeric, 2);
+    v_using_cleaner_rate := true;
+  END IF;
+
+  -- Catalog discount applies only when using service_types.price (no cleaner selected).
+  IF NOT v_using_cleaner_rate THEN
+    SELECT d.amount
+    INTO v_discount_pct
+    FROM public.discounts d
+    WHERE d.active = true
+      AND d.service_type_id = p_service_id
+      AND d.valid_from <= now()
+      AND d.valid_to >= now()
+    ORDER BY d.id DESC
+    LIMIT 1;
+
+    IF FOUND AND v_discount_pct IS NOT NULL THEN
+      v_discount_pct := greatest(0, least(100, v_discount_pct));
+      v_rate := round((v_rate * (1 - v_discount_pct / 100.0))::numeric, 2);
+    END IF;
+  END IF;
+
+  SELECT
+    pr.pricing_version,
+    pr.currency,
+    pr.same_day_surcharge_bps,
+    pr.weekend_surcharge_bps,
+    pr.recurring_weekly_discount_bps,
+    pr.recurring_monthly_discount_bps
+  INTO
+    v_pricing_version,
+    v_currency,
+    v_same_day_bps,
+    v_weekend_bps,
+    v_recurring_weekly_bps,
+    v_recurring_monthly_discount_bps
+  FROM public.get_active_pricing_rule() pr
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    v_pricing_version := 'v1';
+    v_currency := 'GHS';
+    v_same_day_bps := 500;
+    v_weekend_bps := 500;
+    v_recurring_weekly_bps := 700;
+    v_recurring_monthly_discount_bps := 1200;
+  END IF;
+
+  v_pricing_version := COALESCE(v_pricing_version, 'v1');
+  v_currency := COALESCE(v_currency, 'GHS');
+  v_same_day_bps := COALESCE(v_same_day_bps, 500);
+  v_weekend_bps := COALESCE(v_weekend_bps, 500);
+  v_recurring_weekly_bps := COALESCE(v_recurring_weekly_bps, 700);
+  v_recurring_monthly_discount_bps := COALESCE(v_recurring_monthly_discount_bps, 1200);
+
+  v_same_day_bps := greatest(0, least(10000, v_same_day_bps));
+  v_weekend_bps := greatest(0, least(10000, v_weekend_bps));
+  v_recurring_weekly_bps := greatest(0, least(10000, v_recurring_weekly_bps));
+  v_recurring_monthly_discount_bps := greatest(0, least(10000, v_recurring_monthly_discount_bps));
+
+  SELECT bs.value_numeric
+  INTO v_settings_platform_raw
+  FROM public.booking_settings bs
+  WHERE bs.key = 'platform_fee_percentage';
+
+  IF v_settings_platform_raw IS NULL OR v_settings_platform_raw < 0 THEN
+    v_platform_bps := c_default_platform_fee_bps;
+  ELSIF v_settings_platform_raw = 0 THEN
+    v_platform_bps := 0;
+  ELSIF v_settings_platform_raw <= 100 THEN
+    v_platform_bps := round(v_settings_platform_raw * 100)::integer;
+  ELSE
+    v_platform_bps := round(v_settings_platform_raw)::integer;
+  END IF;
+
+  v_platform_bps := greatest(0, least(10000, COALESCE(v_platform_bps, c_default_platform_fee_bps)));
+
+  SELECT bs.value_numeric
+  INTO v_settings_cover_raw
+  FROM public.booking_settings bs
+  WHERE bs.key = 'booking_cover_amount';
+
+  IF v_settings_cover_raw IS NULL OR v_settings_cover_raw < 0 THEN
+    v_cover_minor := c_default_booking_cover_minor;
+  ELSIF v_settings_cover_raw = 0 THEN
+    v_cover_minor := 0;
+  ELSIF v_settings_cover_raw <= 100 THEN
+    v_cover_minor := round(v_settings_cover_raw * 100)::integer;
+  ELSE
+    v_cover_minor := round(v_settings_cover_raw)::integer;
+  END IF;
+
+  v_labor_major := greatest(0, v_rate * v_duration_hours);
+  v_labor_minor := round(greatest(0, v_labor_major) * 100)::integer;
+
+  IF v_platform_bps <= 0 OR v_labor_minor <= 0 THEN
+    v_platform_fee_major := 0;
+  ELSE
+    v_platform_fee_major := (round(v_labor_minor * v_platform_bps / 10000.0) / 100.0)::numeric;
+  END IF;
+
+  IF p_include_booking_cover THEN
+    v_cover_major := (greatest(0, v_cover_minor) / 100.0)::numeric;
+  ELSE
+    v_cover_major := 0;
+  END IF;
+
+  v_core_minor := round(
+    greatest(0, v_labor_major + v_platform_fee_major + v_cover_major) * 100
+  )::integer;
+
+  SELECT name
+  INTO v_service_timezone
+  FROM pg_timezone_names
+  WHERE name = COALESCE(NULLIF(trim(p_service_timezone), ''), 'Africa/Accra')
+  LIMIT 1;
+
+  v_service_timezone := COALESCE(v_service_timezone, 'Africa/Accra');
+
+  v_today := (now() AT TIME ZONE v_service_timezone)::date;
+  v_is_same_day := p_scheduled_date IS NOT NULL AND p_scheduled_date = v_today;
+  v_is_weekend := p_scheduled_date IS NOT NULL
+    AND EXTRACT(ISODOW FROM p_scheduled_date::timestamp) IN (6, 7);
+
+  v_same_day_minor := CASE
+    WHEN v_is_same_day THEN round(v_core_minor * v_same_day_bps / 10000.0)::integer
+    ELSE 0
+  END;
+
+  v_after_same := v_core_minor + v_same_day_minor;
+
+  v_weekend_minor := CASE
+    WHEN v_is_weekend AND p_scheduled_date IS NOT NULL THEN
+      round(v_after_same * v_weekend_bps / 10000.0)::integer
+    ELSE 0
+  END;
+
+  v_final_minor := v_core_minor + v_same_day_minor + v_weekend_minor;
+
+  v_discount_bps := NULL;
+  v_recurring_amount_minor := NULL;
+  v_first_charge_minor := NULL;
+  v_recurring_discount_minor := 0;
+
+  IF p_is_recurring AND p_recurrence_interval IS NOT NULL THEN
+    v_discount_bps := CASE
+      WHEN p_recurrence_interval = 'monthly' THEN v_recurring_monthly_discount_bps
+      ELSE v_recurring_weekly_bps
+    END;
+    v_discount_bps := greatest(0, least(10000, COALESCE(v_discount_bps, 0)));
+
+    v_recurring_amount_minor := round(v_core_minor * (10000 - v_discount_bps) / 10000.0)::integer;
+    v_first_charge_minor := v_final_minor;
+    v_recurring_discount_minor := greatest(0, v_core_minor - v_recurring_amount_minor);
+  END IF;
+
+  v_cleaner_earnings_minor := public.cleaner_earnings_minor_from_pricing_snapshot(
+    v_final_minor,
+    v_final_minor / 100.0,
+    v_platform_fee_major,
+    p_include_booking_cover,
+    v_cover_major,
+    v_core_minor
+  );
+
+  RETURN QUERY
+  SELECT
+    v_pricing_version,
+    v_currency,
+    v_rate,
+    v_duration_hours,
+    v_labor_major,
+    v_platform_fee_major,
+    v_cover_major,
+    v_core_minor,
+    v_same_day_bps,
+    v_weekend_bps,
+    v_recurring_weekly_bps,
+    v_recurring_monthly_discount_bps,
+    v_same_day_minor,
+    v_weekend_minor,
+    v_recurring_discount_minor,
+    v_final_minor,
+    v_recurring_amount_minor,
+    v_first_charge_minor,
+    v_discount_bps,
+    v_is_same_day,
+    v_is_weekend,
+    v_min_duration_hours,
+    v_cleaner_earnings_minor;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.compute_booking_pricing(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true, p_supplies_option text DEFAULT 'customer_provided'::text, p_cleaner_id uuid DEFAULT NULL::uuid, p_extra_task_ids text[] DEFAULT NULL::text[])
  RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, supplies_option text, supplies_allowance_minor integer, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, minimum_duration_hours numeric, cleaner_earnings_minor integer, catalog_discount_pct numeric, catalog_discount_minor integer)
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
@@ -3529,6 +3921,9 @@ DECLARE
   v_using_cleaner_rate boolean := false;
   v_discount_pct numeric;
   v_duration_hours numeric;
+  v_extra_hours numeric;
+  v_base_duration_raw numeric;
+  v_rounded_base numeric;
   v_labor_major numeric;
   v_labor_minor integer;
 
@@ -3609,56 +4004,31 @@ BEGIN
     RAISE EXCEPTION 'Service has invalid duration increment configuration';
   END IF;
 
-  v_duration_hours :=
-    round(p_duration_hours_raw / v_duration_increment_hours) * v_duration_increment_hours;
+  v_extra_hours := COALESCE(public._extra_task_hours_total(p_extra_task_ids), 0);
+  v_base_duration_raw := greatest(0, p_duration_hours_raw - v_extra_hours);
 
-  IF v_duration_hours < v_min_duration_hours THEN
+  v_rounded_base :=
+    round(v_base_duration_raw / v_duration_increment_hours) * v_duration_increment_hours;
+
+  IF v_rounded_base < v_min_duration_hours THEN
     RAISE EXCEPTION 'Minimum duration for this service is % hours', v_min_duration_hours;
   END IF;
+
+  v_duration_hours := v_rounded_base + v_extra_hours;
 
   IF v_duration_hours > v_max_duration_hours THEN
     RAISE EXCEPTION 'Maximum duration for this service is % hours', v_max_duration_hours;
   END IF;
 
-  v_rate := v_service_rate;
+  SELECT wr.work_rate, wr.work_rate_before_discount, wr.catalog_discount_pct
+  INTO v_rate, v_rate_before_discount, v_discount_pct
+  FROM public._resolve_booking_work_rate(p_service_id, p_cleaner_id) AS wr;
 
-  IF p_cleaner_id IS NOT NULL THEN
-    SELECT cd.hourly_rate
-    INTO v_cleaner_rate
-    FROM public.cleaner_data cd
-    WHERE cd.user_id = p_cleaner_id;
-
-    IF NOT FOUND OR v_cleaner_rate IS NULL OR v_cleaner_rate <= 0 THEN
-      RAISE EXCEPTION 'Selected cleaner does not have a valid hourly rate';
-    END IF;
-
-    v_rate := round(v_cleaner_rate::numeric, 2);
-    v_using_cleaner_rate := true;
-  END IF;
-
-  v_rate_before_discount := v_rate;
-  v_discount_pct := NULL;
-
-  SELECT d.amount
-  INTO v_discount_pct
-  FROM public.discounts d
-  WHERE d.active = true
-    AND d.service_type_id = p_service_id
-    AND d.valid_from IS NOT NULL
-    AND d.valid_to IS NOT NULL
-    AND d.valid_from <= CURRENT_DATE
-    AND d.valid_to >= CURRENT_DATE
-  ORDER BY d.id DESC
-  LIMIT 1;
-
-  IF FOUND AND v_discount_pct IS NOT NULL THEN
-    v_discount_pct := greatest(0, least(100, v_discount_pct));
-    v_rate := round((v_rate * (1 - v_discount_pct / 100.0))::numeric, 2);
+  IF v_discount_pct IS NOT NULL THEN
     v_catalog_discount_minor := round(
       greatest(0, (v_rate_before_discount - v_rate) * v_duration_hours * 100)
     )::integer;
   ELSE
-    v_discount_pct := NULL;
     v_catalog_discount_minor := 0;
   END IF;
 
@@ -3806,7 +4176,6 @@ BEGIN
     v_recurring_amount_minor := round(v_core_minor * (10000 - v_discount_bps) / 10000.0)::integer;
     v_first_charge_minor := v_final_minor;
     v_recurring_discount_minor := greatest(0, v_core_minor - v_recurring_amount_minor);
-    -- Future subscription visits use discounted core only; same-day/weekend surcharges apply on first charge only.
   END IF;
 
   v_cleaner_earnings_minor := public.cleaner_earnings_minor_from_pricing_snapshot(
@@ -4198,6 +4567,338 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.compute_booking_pricing_with_promotion(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_cleaner_id uuid DEFAULT NULL::uuid, p_channel text DEFAULT NULL::text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true, p_customer_id uuid DEFAULT NULL::uuid, p_promotion_slug text DEFAULT NULL::text, p_lat double precision DEFAULT NULL::double precision, p_lng double precision DEFAULT NULL::double precision, p_extra_task_ids text[] DEFAULT NULL::text[], p_booking_id uuid DEFAULT NULL::uuid)
+ RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, minimum_duration_hours numeric, cleaner_earnings_minor integer, promotion_id uuid, promotion_slug text, promotion_discount_minor integer)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_base record;
+  v_promo public.promotions;
+  v_eligibility jsonb;
+  v_extra_hours numeric;
+  v_base_promo_hours numeric;
+  v_free_hours numeric;
+  v_promo_labor_minor integer;
+  v_labor_minor integer;
+  v_discount integer := 0;
+  v_final integer;
+  v_cleaner_earnings_minor integer;
+  v_caller uuid := auth.uid();
+BEGIN
+  SELECT *
+  INTO v_base
+  FROM public.compute_booking_pricing(
+    p_service_id,
+    p_duration_hours_raw,
+    p_scheduled_date,
+    p_service_timezone,
+    p_recurrence_interval,
+    p_is_recurring,
+    p_include_booking_cover,
+    p_cleaner_id
+  )
+  LIMIT 1;
+
+  v_labor_minor := round(greatest(0, v_base.subtotal_labor_major) * 100)::integer;
+
+  IF p_promotion_slug IS NULL OR btrim(p_promotion_slug) = '' THEN
+    RETURN QUERY
+    SELECT
+      v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+      v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+      v_base.booking_cover_major, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+      v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+      v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+      v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+      v_base.final_amount_minor, v_base.recurring_amount_minor,
+      v_base.first_charge_amount_minor, v_base.discount_rate_bps,
+      v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
+      v_base.cleaner_earnings_minor,
+      NULL::uuid, NULL::text, 0;
+    RETURN;
+  END IF;
+
+  IF p_channel IS NULL
+     OR btrim(p_channel) = ''
+     OR p_channel NOT IN ('mobile', 'web') THEN
+    RAISE EXCEPTION 'Invalid promotion channel: %', p_channel;
+  END IF;
+
+  IF p_customer_id IS NULL
+     OR p_is_recurring
+     OR (v_caller IS NOT NULL AND v_caller <> p_customer_id) THEN
+    RETURN QUERY
+    SELECT
+      v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+      v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+      v_base.booking_cover_major, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+      v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+      v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+      v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+      v_base.final_amount_minor, v_base.recurring_amount_minor,
+      v_base.first_charge_amount_minor, v_base.discount_rate_bps,
+      v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
+      v_base.cleaner_earnings_minor,
+      NULL::uuid, NULL::text, 0;
+    RETURN;
+  END IF;
+
+  v_eligibility := public._welcome_offer_eligibility_core(
+    p_customer_id,
+    p_promotion_slug,
+    p_channel,
+    p_service_id,
+    p_lat,
+    p_lng,
+    p_extra_task_ids,
+    p_is_recurring,
+    p_booking_id
+  );
+
+  IF COALESCE((v_eligibility ->> 'eligible')::boolean, false) IS NOT TRUE THEN
+    RETURN QUERY
+    SELECT
+      v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+      v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+      v_base.booking_cover_major, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+      v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+      v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+      v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+      v_base.final_amount_minor, v_base.recurring_amount_minor,
+      v_base.first_charge_amount_minor, v_base.discount_rate_bps,
+      v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
+      v_base.cleaner_earnings_minor,
+      NULL::uuid, NULL::text, 0;
+    RETURN;
+  END IF;
+
+  SELECT * INTO v_promo FROM public._load_active_promotion(p_promotion_slug);
+
+  IF v_promo.id IS NULL
+     OR v_promo.type <> 'free_hours'
+     OR v_promo.channel NOT IN (p_channel, 'all') THEN
+    RETURN QUERY
+    SELECT
+      v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+      v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+      v_base.booking_cover_major, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+      v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+      v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+      v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+      v_base.final_amount_minor, v_base.recurring_amount_minor,
+      v_base.first_charge_amount_minor, v_base.discount_rate_bps,
+      v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
+      v_base.cleaner_earnings_minor,
+      NULL::uuid, NULL::text, 0;
+    RETURN;
+  END IF;
+
+  v_extra_hours := public._extra_task_hours_total(p_extra_task_ids);
+  v_base_promo_hours := greatest(0, v_base.duration_hours - v_extra_hours);
+
+  v_free_hours := least(
+    v_promo.value::numeric,
+    COALESCE(v_promo.max_duration_hours, v_promo.value::numeric),
+    v_base_promo_hours
+  );
+
+  v_promo_labor_minor := round(
+    greatest(0, v_free_hours * v_base.work_rate_ghs_per_hour * 100)
+  )::integer;
+
+  v_discount := least(v_promo_labor_minor, v_labor_minor);
+  v_final := greatest(0, v_base.final_amount_minor - v_discount);
+
+  -- Platform-funded promotions reduce customer payable only; cleaner economics stay at base.
+  v_cleaner_earnings_minor := v_base.cleaner_earnings_minor;
+
+  RETURN QUERY
+  SELECT
+    v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+    v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+    v_base.booking_cover_major, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+    v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+    v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+    v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+    v_final, v_base.recurring_amount_minor, v_base.first_charge_amount_minor,
+    v_base.discount_rate_bps, v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
+    v_cleaner_earnings_minor,
+    v_promo.id, v_promo.slug, v_discount;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.compute_booking_pricing_with_promotion(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_cleaner_id uuid DEFAULT NULL::uuid, p_channel text DEFAULT NULL::text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true, p_supplies_option text DEFAULT 'customer_provided'::text, p_customer_id uuid DEFAULT NULL::uuid, p_promotion_slug text DEFAULT NULL::text, p_lat double precision DEFAULT NULL::double precision, p_lng double precision DEFAULT NULL::double precision, p_extra_task_ids text[] DEFAULT NULL::text[], p_booking_id uuid DEFAULT NULL::uuid)
+ RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, supplies_option text, supplies_allowance_minor integer, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, minimum_duration_hours numeric, cleaner_earnings_minor integer, catalog_discount_pct numeric, catalog_discount_minor integer, promotion_id uuid, promotion_slug text, promotion_discount_minor integer)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_base record;
+  v_promo public.promotions;
+  v_eligibility jsonb;
+  v_extra_hours numeric;
+  v_base_promo_hours numeric;
+  v_free_hours numeric;
+  v_promo_labor_minor integer;
+  v_labor_minor integer;
+  v_discount integer := 0;
+  v_final integer;
+  v_cleaner_earnings_minor integer;
+  v_caller uuid := auth.uid();
+BEGIN
+  SELECT *
+  INTO v_base
+  FROM public.compute_booking_pricing(
+    p_service_id,
+    p_duration_hours_raw,
+    p_scheduled_date,
+    p_service_timezone,
+    p_recurrence_interval,
+    p_is_recurring,
+    p_include_booking_cover,
+    p_supplies_option,
+    p_cleaner_id,
+    p_extra_task_ids
+  )
+  LIMIT 1;
+
+  v_labor_minor := round(greatest(0, v_base.subtotal_labor_major) * 100)::integer;
+
+  IF p_promotion_slug IS NULL OR btrim(p_promotion_slug) = '' THEN
+    RETURN QUERY
+    SELECT
+      v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+      v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+      v_base.booking_cover_major, v_base.supplies_option, v_base.supplies_allowance_minor, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+      v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+      v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+      v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+      v_base.final_amount_minor, v_base.recurring_amount_minor,
+      v_base.first_charge_amount_minor, v_base.discount_rate_bps,
+      v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
+      v_base.cleaner_earnings_minor,
+      v_base.catalog_discount_pct, v_base.catalog_discount_minor,
+      NULL::uuid, NULL::text, 0;
+    RETURN;
+  END IF;
+
+  IF p_channel IS NULL
+     OR btrim(p_channel) = ''
+     OR p_channel NOT IN ('mobile', 'web') THEN
+    RAISE EXCEPTION 'Invalid promotion channel: %', p_channel;
+  END IF;
+
+  IF p_customer_id IS NULL
+     OR p_is_recurring
+     OR (v_caller IS NOT NULL AND v_caller <> p_customer_id) THEN
+    RETURN QUERY
+    SELECT
+      v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+      v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+      v_base.booking_cover_major, v_base.supplies_option, v_base.supplies_allowance_minor, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+      v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+      v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+      v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+      v_base.final_amount_minor, v_base.recurring_amount_minor,
+      v_base.first_charge_amount_minor, v_base.discount_rate_bps,
+      v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
+      v_base.cleaner_earnings_minor,
+      v_base.catalog_discount_pct, v_base.catalog_discount_minor,
+      NULL::uuid, NULL::text, 0;
+    RETURN;
+  END IF;
+
+  v_eligibility := public.get_welcome_offer_eligibility(
+    p_customer_id,
+    p_promotion_slug,
+    p_channel,
+    p_service_id,
+    p_lat,
+    p_lng,
+    p_extra_task_ids,
+    p_is_recurring,
+    p_booking_id
+  );
+
+  IF COALESCE((v_eligibility ->> 'eligible')::boolean, false) IS NOT TRUE THEN
+    RETURN QUERY
+    SELECT
+      v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+      v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+      v_base.booking_cover_major, v_base.supplies_option, v_base.supplies_allowance_minor, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+      v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+      v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+      v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+      v_base.final_amount_minor, v_base.recurring_amount_minor,
+      v_base.first_charge_amount_minor, v_base.discount_rate_bps,
+      v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
+      v_base.cleaner_earnings_minor,
+      v_base.catalog_discount_pct, v_base.catalog_discount_minor,
+      NULL::uuid, NULL::text, 0;
+    RETURN;
+  END IF;
+
+  SELECT * INTO v_promo FROM public._load_active_promotion(p_promotion_slug);
+
+  IF v_promo.id IS NULL
+     OR v_promo.type <> 'free_hours'
+     OR v_promo.channel NOT IN (p_channel, 'all') THEN
+    RETURN QUERY
+    SELECT
+      v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+      v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+      v_base.booking_cover_major, v_base.supplies_option, v_base.supplies_allowance_minor, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+      v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+      v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+      v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+      v_base.final_amount_minor, v_base.recurring_amount_minor,
+      v_base.first_charge_amount_minor, v_base.discount_rate_bps,
+      v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
+      v_base.cleaner_earnings_minor,
+      v_base.catalog_discount_pct, v_base.catalog_discount_minor,
+      NULL::uuid, NULL::text, 0;
+    RETURN;
+  END IF;
+
+  v_extra_hours := public._extra_task_hours_total(p_extra_task_ids);
+  v_base_promo_hours := greatest(0, v_base.duration_hours - v_extra_hours);
+
+  v_free_hours := least(
+    v_promo.value::numeric,
+    COALESCE(v_promo.max_duration_hours, v_promo.value::numeric),
+    v_base_promo_hours
+  );
+
+  v_promo_labor_minor := round(
+    greatest(0, v_free_hours * v_base.work_rate_ghs_per_hour * 100)
+  )::integer;
+
+  v_discount := least(v_promo_labor_minor, v_labor_minor);
+  v_final := greatest(0, v_base.final_amount_minor - v_discount);
+
+  v_cleaner_earnings_minor := v_base.cleaner_earnings_minor;
+
+  RETURN QUERY
+  SELECT
+    v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+    v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+    v_base.booking_cover_major, v_base.supplies_option, v_base.supplies_allowance_minor, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+    v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+    v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+    v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+    v_final, v_base.recurring_amount_minor, v_base.first_charge_amount_minor,
+    v_base.discount_rate_bps, v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
+    v_cleaner_earnings_minor,
+    v_base.catalog_discount_pct, v_base.catalog_discount_minor,
+    v_promo.id, v_promo.slug, v_discount;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.compute_booking_pricing_with_promotion(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_cleaner_id uuid DEFAULT NULL::uuid, p_channel text DEFAULT NULL::text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true, p_supplies_option text DEFAULT 'customer_provided'::text, p_customer_id uuid DEFAULT NULL::uuid, p_promotion_slug text DEFAULT NULL::text, p_lat double precision DEFAULT NULL::double precision, p_lng double precision DEFAULT NULL::double precision, p_extra_task_ids text[] DEFAULT NULL::text[], p_booking_id uuid DEFAULT NULL::uuid, p_service_duration_option_id uuid DEFAULT NULL::uuid)
  RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, supplies_option text, supplies_allowance_minor integer, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, minimum_duration_hours numeric, cleaner_earnings_minor integer, catalog_discount_pct numeric, catalog_discount_minor integer, promotion_id uuid, promotion_slug text, promotion_discount_minor integer)
  LANGUAGE plpgsql
@@ -4514,7 +5215,7 @@ $function$
 
 
 CREATE OR REPLACE FUNCTION public.compute_extra_task_labor_quotes(p_service_id integer, p_cleaner_id uuid DEFAULT NULL::uuid, p_task_ids text[] DEFAULT NULL::text[])
- RETURNS TABLE(task_id text, labor_major numeric, pricing_mode text)
+ RETURNS TABLE(task_id text, labor_major numeric)
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
  SET search_path TO 'public'
@@ -4533,15 +5234,7 @@ BEGIN
   RETURN QUERY
   SELECT
     et.id::text,
-    public._extra_task_labor_major_single(
-      v_rate,
-      et.hours,
-      et.pricing_mode,
-      et.flat_price_minor,
-      et.minimum_price_minor,
-      et.maximum_price_minor
-    ),
-    et.pricing_mode
+    round(greatest(0, v_rate * et.hours)::numeric, 2)
   FROM public.extra_tasks et
   WHERE et.id::text = ANY (p_task_ids);
 END;
@@ -5459,6 +6152,55 @@ BEGIN
 
   GET DIAGNOSTICS affected = ROW_COUNT;
   RETURN affected;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.extract_area_label_from_address(p_address text)
+ RETURNS text
+ LANGUAGE plpgsql
+ IMMUTABLE
+AS $function$
+DECLARE
+  v_trimmed text;
+  v_parts text[];
+  v_count integer;
+  v_last text;
+  v_last_lower text;
+BEGIN
+  v_trimmed := btrim(COALESCE(p_address, ''));
+  IF v_trimmed = '' THEN
+    RETURN NULL;
+  END IF;
+
+  v_parts := regexp_split_to_array(v_trimmed, '\s*,\s*');
+  v_parts := array(
+    SELECT btrim(part)
+    FROM unnest(v_parts) AS part
+    WHERE btrim(part) <> ''
+  );
+  v_count := COALESCE(array_length(v_parts, 1), 0);
+  IF v_count = 0 THEN
+    RETURN NULL;
+  END IF;
+
+  IF v_count = 1 THEN
+    IF v_parts[1] ~ '\d' THEN
+      RETURN NULL;
+    END IF;
+    RETURN v_parts[1];
+  END IF;
+
+  v_last := v_parts[v_count];
+  v_last_lower := lower(v_last);
+  IF v_last_lower IN (
+    'accra', 'kumasi', 'tamale', 'tema', 'cape coast', 'takoradi',
+    'sunyani', 'ho', 'koforidua', 'greater accra'
+  ) AND v_count >= 2 THEN
+    RETURN v_parts[v_count - 1];
+  END IF;
+
+  RETURN v_last;
 END;
 $function$
 
@@ -9332,6 +10074,91 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.get_cleaner_booking_location_fields(p_booking_ids uuid[])
+ RETURNS TABLE(booking_id uuid, display_location text, full_address_available boolean, navigation_available boolean, address text, location_coordinates geometry, coordinates_accuracy text)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_masked_hint constant text := 'Exact address available 1 hour before appointment.';
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN;
+  END IF;
+
+  IF p_booking_ids IS NULL OR cardinality(p_booking_ids) = 0 THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    b.id AS booking_id,
+    CASE
+      WHEN public.cleaner_booking_full_location_available(
+        b.status,
+        b.scheduled_at_utc,
+        b.scheduled_date,
+        b.scheduled_time,
+        b.timezone_name
+      ) THEN btrim(b.address)
+      ELSE COALESCE(
+        public.extract_area_label_from_address(b.address),
+        v_masked_hint
+      )
+    END AS display_location,
+    public.cleaner_booking_full_location_available(
+      b.status,
+      b.scheduled_at_utc,
+      b.scheduled_date,
+      b.scheduled_time,
+      b.timezone_name
+    ) AS full_address_available,
+    public.cleaner_booking_full_location_available(
+      b.status,
+      b.scheduled_at_utc,
+      b.scheduled_date,
+      b.scheduled_time,
+      b.timezone_name
+    ) AS navigation_available,
+    CASE
+      WHEN public.cleaner_booking_full_location_available(
+        b.status,
+        b.scheduled_at_utc,
+        b.scheduled_date,
+        b.scheduled_time,
+        b.timezone_name
+      ) THEN btrim(b.address)
+      ELSE NULL
+    END AS address,
+    CASE
+      WHEN public.cleaner_booking_full_location_available(
+        b.status,
+        b.scheduled_at_utc,
+        b.scheduled_date,
+        b.scheduled_time,
+        b.timezone_name
+      ) THEN b.location_coordinates
+      ELSE NULL
+    END AS location_coordinates,
+    CASE
+      WHEN public.cleaner_booking_full_location_available(
+        b.status,
+        b.scheduled_at_utc,
+        b.scheduled_date,
+        b.scheduled_time,
+        b.timezone_name
+      ) THEN 'exact'
+      ELSE NULL
+    END AS coordinates_accuracy
+  FROM public.bookings b
+  WHERE b.id = ANY (p_booking_ids)
+    AND public.cleaner_can_read_booking_location(b.id, v_uid);
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.get_cleaner_by_booking_slug(p_slug text)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -10144,18 +10971,6 @@ BEGIN
     RETURN;
   END IF;
 
-  -- One-off bookings: require a live cleaner hold before exposing a payable snapshot.
-  IF v_row.subscription_id IS NULL THEN
-    IF v_row.cleaner_id IS NULL AND v_row.cleaner_assigned_at IS NOT NULL THEN
-      RETURN;
-    END IF;
-
-    IF v_row.cleaner_hold_expires_at IS NOT NULL
-       AND v_row.cleaner_hold_expires_at < now() THEN
-      RETURN;
-    END IF;
-  END IF;
-
   IF v_row.subscription_id IS NOT NULL THEN
     SELECT s.status
     INTO v_subscription_status
@@ -10283,7 +11098,7 @@ $function$
 
 
 CREATE OR REPLACE FUNCTION public.get_pending_booking_for_edit(p_customer_id uuid, p_booking_id uuid)
- RETURNS TABLE(id uuid, customer_id uuid, cleaner_id uuid, service_id integer, title text, scheduled_date date, scheduled_time time without time zone, duration_hours numeric, address text, special_instructions text, status booking_status, payment_status text, subscription_id uuid, home_size text, extra_task_ids text[], duration_adjustment numeric, duration_computed numeric, duration_final numeric, timezone_name text, cleaner_assigned_at timestamp with time zone, service_duration_option_id uuid, location_latitude double precision, location_longitude double precision, booking_cover boolean, booking_cover_amount numeric, supplies_option text, supplies_allowance_minor integer, platform_fee numeric, work_rate_ghs_per_hour numeric, pricing_version text, currency text, promotion_id uuid, promotion_slug text, promotion_discount_minor integer, final_amount_minor integer, service jsonb)
+ RETURNS TABLE(id uuid, customer_id uuid, cleaner_id uuid, service_id integer, title text, scheduled_date date, scheduled_time time without time zone, duration_hours numeric, address text, special_instructions text, status booking_status, payment_status text, subscription_id uuid, home_size text, extra_task_ids text[], duration_adjustment numeric, duration_computed numeric, duration_final numeric, timezone_name text, cleaner_assigned_at timestamp with time zone, service_duration_option_id uuid, location_latitude double precision, location_longitude double precision, customer_contact_phone text, service jsonb)
  LANGUAGE sql
  STABLE
  SET search_path TO 'public'
@@ -10320,27 +11135,16 @@ AS $function$
         THEN ST_X(b.location_coordinates::geometry)
       ELSE NULL
     END AS location_longitude,
-    COALESCE(b.booking_cover, true) AS booking_cover,
-    b.booking_cover_amount,
-    COALESCE(b.supplies_option, 'customer_provided') AS supplies_option,
-    COALESCE(b.supplies_allowance_minor, 0) AS supplies_allowance_minor,
-    b.platform_fee,
-    b.work_rate_ghs_per_hour,
-    b.pricing_version,
-    b.currency,
-    b.promotion_id,
-    b.promotion_slug,
-    COALESCE(b.promotion_discount_minor, 0) AS promotion_discount_minor,
-    COALESCE(NULLIF(b.final_amount_minor, 0), NULLIF(b.total_price, 0), 0) AS final_amount_minor,
+    b.customer_contact_phone,
     to_jsonb(s.*) AS service
   FROM public.bookings b
   JOIN public.service_types s
     ON s.id = b.service_id
   WHERE b.id = p_booking_id
-    AND b.customer_id = auth.uid()
     AND b.customer_id = p_customer_id
     AND b.status IN ('pending', 'confirmed', 'scheduled')
-    AND b.subscription_id IS NULL;
+    AND b.subscription_id IS NULL
+  LIMIT 1;
 $function$
 
 
