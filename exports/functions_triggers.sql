@@ -2008,6 +2008,144 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.auto_close_stale_bookings(p_grace interval DEFAULT '1 day'::interval, p_limit integer DEFAULT 100)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_row public.bookings%ROWTYPE;
+  v_completed_count integer := 0;
+  v_review_count integer := 0;
+  v_review_logged integer := 0;
+  v_service_end timestamptz;
+  v_update_rpc regprocedure;
+  v_limit integer;
+BEGIN
+  v_update_rpc := to_regprocedure(
+    'public.update_booking_status(uuid, public.booking_status, text)'
+  );
+
+  IF v_update_rpc IS NULL THEN
+    RETURN jsonb_build_object(
+      'ok', false,
+      'error', 'missing_update_booking_status_rpc',
+      'message',
+      'auto_close_stale_bookings requires public.update_booking_status(uuid, public.booking_status, text)'
+    );
+  END IF;
+
+  v_limit := GREATEST(COALESCE(p_limit, 100), 1);
+
+  FOR v_row IN
+    SELECT *
+    FROM public.bookings b
+    WHERE b.status IN ('en_route', 'arrived', 'in_progress')
+      AND b.scheduled_at_utc IS NOT NULL
+      AND b.cleaner_id IS NOT NULL
+      AND lower(COALESCE(b.payment_status::text, '')) = 'paid'
+      AND now() >= public.booking_service_end_at(
+        b.scheduled_at_utc,
+        b.duration_hours,
+        b.duration_final
+      ) + p_grace
+    ORDER BY b.scheduled_at_utc ASC
+    LIMIT v_limit
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    PERFORM public.update_booking_status(
+      v_row.id,
+      'completed'::public.booking_status,
+      'auto_completed_stale_in_flight'
+    );
+
+    IF EXISTS (
+      SELECT 1
+      FROM public.bookings b
+      WHERE b.id = v_row.id
+        AND b.status = 'completed'
+    ) THEN
+      v_completed_count := v_completed_count + 1;
+    END IF;
+  END LOOP;
+
+  SELECT count(*)
+  INTO v_review_count
+  FROM public.bookings b
+  WHERE b.status IN ('confirmed', 'scheduled')
+    AND b.scheduled_at_utc IS NOT NULL
+    AND b.cleaner_id IS NOT NULL
+    AND lower(COALESCE(b.payment_status::text, '')) = 'paid'
+    AND now() >= public.booking_service_end_at(
+      b.scheduled_at_utc,
+      b.duration_hours,
+      b.duration_final
+    ) + p_grace;
+
+  -- Log review candidates once per booking (requires ops_events + record_ops_event).
+  IF to_regclass('public.ops_events') IS NOT NULL
+     AND to_regprocedure('public.record_ops_event(text,text,text,text,jsonb)') IS NOT NULL THEN
+    FOR v_row IN
+      SELECT *
+      FROM public.bookings b
+      WHERE b.status IN ('confirmed', 'scheduled')
+        AND b.scheduled_at_utc IS NOT NULL
+        AND b.cleaner_id IS NOT NULL
+        AND lower(COALESCE(b.payment_status::text, '')) = 'paid'
+        AND now() >= public.booking_service_end_at(
+          b.scheduled_at_utc,
+          b.duration_hours,
+          b.duration_final
+        ) + p_grace
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.ops_events o
+          WHERE o.event_type = 'stale_never_started_needs_review'
+            AND o.metadata ->> 'booking_id' = b.id::text
+        )
+      ORDER BY b.scheduled_at_utc ASC
+      LIMIT 40
+    LOOP
+      v_service_end := public.booking_service_end_at(
+        v_row.scheduled_at_utc,
+        v_row.duration_hours,
+        v_row.duration_final
+      );
+
+      PERFORM public.record_ops_event(
+        'warning',
+        'auto_close_stale_bookings',
+        'stale_never_started_needs_review',
+        'Paid assigned booking never left confirmed/scheduled; needs ops review (not auto-completed).',
+        jsonb_build_object(
+          'booking_id', v_row.id,
+          'status', v_row.status,
+          'cleaner_id', v_row.cleaner_id,
+          'customer_id', v_row.customer_id,
+          'scheduled_at_utc', v_row.scheduled_at_utc,
+          'service_end_at', v_service_end,
+          'auto_close_at', v_service_end + p_grace
+        )
+      );
+
+      v_review_logged := v_review_logged + 1;
+    END LOOP;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'auto_completed_count', v_completed_count,
+    'needs_ops_review_count', v_review_count,
+    'ops_review_events_logged', v_review_logged,
+    'grace', p_grace::text,
+    'limit', v_limit,
+    'update_booking_status_rpc', v_update_rpc::text
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.backfill_cleaner_application_approval(p_user_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -2221,6 +2359,21 @@ BEGIN
 
   RETURN true;
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.booking_service_end_at(p_scheduled_at_utc timestamp with time zone, p_duration_hours numeric, p_duration_final numeric)
+ RETURNS timestamp with time zone
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$
+  SELECT p_scheduled_at_utc
+    + (
+      GREATEST(
+        COALESCE(p_duration_hours, p_duration_final, 2),
+        0.5
+      ) || ' hours'
+    )::interval;
 $function$
 
 
@@ -11914,14 +12067,14 @@ CREATE OR REPLACE FUNCTION public.get_payout_system_logs()
  RETURNS TABLE(id bigint, status_code integer, content text, url text, created_at timestamp with time zone, delivery_status text)
  LANGUAGE sql
  SECURITY DEFINER
- SET search_path TO 'public', 'net'
+ SET search_path TO 'public', 'net', 'pg_temp'
 AS $function$
   SELECT
     q.id,
     q.status_code,
     q.content,
     NULL::text AS url,
-    NULL::timestamptz AS created_at,
+    q.created AS created_at,
     CASE
       WHEN q.timed_out THEN 'timeout'
       WHEN q.status_code >= 200 AND q.status_code < 300 THEN 'success'
@@ -11929,7 +12082,7 @@ AS $function$
       ELSE 'pending'
     END AS delivery_status
   FROM net._http_response q
-  ORDER BY q.id DESC
+  ORDER BY q.created DESC NULLS LAST, q.id DESC
   LIMIT 500;
 $function$
 

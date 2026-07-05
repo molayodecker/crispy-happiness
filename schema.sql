@@ -1656,6 +1656,149 @@ $$;
 ALTER FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "target_role_id" "text", "is_verified" boolean) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."auto_close_stale_bookings"("p_grace" interval DEFAULT '1 day'::interval, "p_limit" integer DEFAULT 100) RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_row public.bookings%ROWTYPE;
+  v_completed_count integer := 0;
+  v_review_count integer := 0;
+  v_review_logged integer := 0;
+  v_service_end timestamptz;
+  v_update_rpc regprocedure;
+  v_limit integer;
+BEGIN
+  v_update_rpc := to_regprocedure(
+    'public.update_booking_status(uuid, public.booking_status, text)'
+  );
+
+  IF v_update_rpc IS NULL THEN
+    RETURN jsonb_build_object(
+      'ok', false,
+      'error', 'missing_update_booking_status_rpc',
+      'message',
+      'auto_close_stale_bookings requires public.update_booking_status(uuid, public.booking_status, text)'
+    );
+  END IF;
+
+  v_limit := GREATEST(COALESCE(p_limit, 100), 1);
+
+  FOR v_row IN
+    SELECT *
+    FROM public.bookings b
+    WHERE b.status IN ('en_route', 'arrived', 'in_progress')
+      AND b.scheduled_at_utc IS NOT NULL
+      AND b.cleaner_id IS NOT NULL
+      AND lower(COALESCE(b.payment_status::text, '')) = 'paid'
+      AND now() >= public.booking_service_end_at(
+        b.scheduled_at_utc,
+        b.duration_hours,
+        b.duration_final
+      ) + p_grace
+    ORDER BY b.scheduled_at_utc ASC
+    LIMIT v_limit
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    PERFORM public.update_booking_status(
+      v_row.id,
+      'completed'::public.booking_status,
+      'auto_completed_stale_in_flight'
+    );
+
+    IF EXISTS (
+      SELECT 1
+      FROM public.bookings b
+      WHERE b.id = v_row.id
+        AND b.status = 'completed'
+    ) THEN
+      v_completed_count := v_completed_count + 1;
+    END IF;
+  END LOOP;
+
+  SELECT count(*)
+  INTO v_review_count
+  FROM public.bookings b
+  WHERE b.status IN ('confirmed', 'scheduled')
+    AND b.scheduled_at_utc IS NOT NULL
+    AND b.cleaner_id IS NOT NULL
+    AND lower(COALESCE(b.payment_status::text, '')) = 'paid'
+    AND now() >= public.booking_service_end_at(
+      b.scheduled_at_utc,
+      b.duration_hours,
+      b.duration_final
+    ) + p_grace;
+
+  -- Log review candidates once per booking (requires ops_events + record_ops_event).
+  IF to_regclass('public.ops_events') IS NOT NULL
+     AND to_regprocedure('public.record_ops_event(text,text,text,text,jsonb)') IS NOT NULL THEN
+    FOR v_row IN
+      SELECT *
+      FROM public.bookings b
+      WHERE b.status IN ('confirmed', 'scheduled')
+        AND b.scheduled_at_utc IS NOT NULL
+        AND b.cleaner_id IS NOT NULL
+        AND lower(COALESCE(b.payment_status::text, '')) = 'paid'
+        AND now() >= public.booking_service_end_at(
+          b.scheduled_at_utc,
+          b.duration_hours,
+          b.duration_final
+        ) + p_grace
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.ops_events o
+          WHERE o.event_type = 'stale_never_started_needs_review'
+            AND o.metadata ->> 'booking_id' = b.id::text
+        )
+      ORDER BY b.scheduled_at_utc ASC
+      LIMIT 40
+    LOOP
+      v_service_end := public.booking_service_end_at(
+        v_row.scheduled_at_utc,
+        v_row.duration_hours,
+        v_row.duration_final
+      );
+
+      PERFORM public.record_ops_event(
+        'warning',
+        'auto_close_stale_bookings',
+        'stale_never_started_needs_review',
+        'Paid assigned booking never left confirmed/scheduled; needs ops review (not auto-completed).',
+        jsonb_build_object(
+          'booking_id', v_row.id,
+          'status', v_row.status,
+          'cleaner_id', v_row.cleaner_id,
+          'customer_id', v_row.customer_id,
+          'scheduled_at_utc', v_row.scheduled_at_utc,
+          'service_end_at', v_service_end,
+          'auto_close_at', v_service_end + p_grace
+        )
+      );
+
+      v_review_logged := v_review_logged + 1;
+    END LOOP;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'auto_completed_count', v_completed_count,
+    'needs_ops_review_count', v_review_count,
+    'ops_review_events_logged', v_review_logged,
+    'grace', p_grace::text,
+    'limit', v_limit,
+    'update_booking_status_rpc', v_update_rpc::text
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."auto_close_stale_bookings"("p_grace" interval, "p_limit" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."auto_close_stale_bookings"("p_grace" interval, "p_limit" integer) IS 'Hourly cron worker: auto-complete stale in-flight paid bookings via update_booking_status (wallet credit); flag never-started for ops.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."backfill_cleaner_application_approval"("p_user_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public', 'pg_temp'
@@ -1886,6 +2029,26 @@ $$;
 
 
 ALTER FUNCTION "public"."booking_payment_split_snapshot_is_invalid"("p_payment_split_type" "text", "p_tax_paystack_share" "text", "p_vendor_paystack_share" "text", "p_amount_minor" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."booking_service_end_at"("p_scheduled_at_utc" timestamp with time zone, "p_duration_hours" numeric, "p_duration_final" numeric) RETURNS timestamp with time zone
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT p_scheduled_at_utc
+    + (
+      GREATEST(
+        COALESCE(p_duration_hours, p_duration_final, 2),
+        0.5
+      ) || ' hours'
+    )::interval;
+$$;
+
+
+ALTER FUNCTION "public"."booking_service_end_at"("p_scheduled_at_utc" timestamp with time zone, "p_duration_hours" numeric, "p_duration_final" numeric) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."booking_service_end_at"("p_scheduled_at_utc" timestamp with time zone, "p_duration_hours" numeric, "p_duration_final" numeric) IS 'Visit service window end: scheduled_at_utc + duration. Used for auto-close and ops review cutoffs.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."bookings_guard_payment_status"() RETURNS "trigger"
@@ -9247,14 +9410,14 @@ ALTER FUNCTION "public"."get_payment_split_config"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."get_payout_system_logs"() RETURNS TABLE("id" bigint, "status_code" integer, "content" "text", "url" "text", "created_at" timestamp with time zone, "delivery_status" "text")
     LANGUAGE "sql" SECURITY DEFINER
-    SET "search_path" TO 'public', 'net'
+    SET "search_path" TO 'public', 'net', 'pg_temp'
     AS $$
   SELECT
     q.id,
     q.status_code,
     q.content,
     NULL::text AS url,
-    NULL::timestamptz AS created_at,
+    q.created AS created_at,
     CASE
       WHEN q.timed_out THEN 'timeout'
       WHEN q.status_code >= 200 AND q.status_code < 300 THEN 'success'
@@ -9262,12 +9425,16 @@ CREATE OR REPLACE FUNCTION "public"."get_payout_system_logs"() RETURNS TABLE("id
       ELSE 'pending'
     END AS delivery_status
   FROM net._http_response q
-  ORDER BY q.id DESC
+  ORDER BY q.created DESC NULLS LAST, q.id DESC
   LIMIT 500;
 $$;
 
 
 ALTER FUNCTION "public"."get_payout_system_logs"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_payout_system_logs"() IS 'Admin payout HTTP log feed from pg_net net._http_response. EXECUTE limited to service_role; gate in app via requireReviewerPermission(payout_logs).';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."get_pending_booking_for_edit"("p_customer_id" "uuid", "p_booking_id" "uuid") RETURNS TABLE("id" "uuid", "customer_id" "uuid", "cleaner_id" "uuid", "service_id" integer, "title" "text", "scheduled_date" "date", "scheduled_time" time without time zone, "duration_hours" numeric, "address" "text", "special_instructions" "text", "status" "public"."booking_status", "payment_status" "text", "subscription_id" "uuid", "home_size" "text", "extra_task_ids" "text"[], "duration_adjustment" numeric, "duration_computed" numeric, "duration_final" numeric, "timezone_name" "text", "cleaner_assigned_at" timestamp with time zone, "service_duration_option_id" "uuid", "location_latitude" double precision, "location_longitude" double precision, "customer_contact_phone" "text", "service" "jsonb")
@@ -18560,6 +18727,14 @@ CREATE INDEX "idx_booking_refunds_paystack_tx_ref" ON "public"."booking_refunds"
 
 
 
+CREATE INDEX "idx_bookings_auto_close_in_flight" ON "public"."bookings" USING "btree" ("scheduled_at_utc") WHERE (("status" = ANY (ARRAY['en_route'::"public"."booking_status", 'arrived'::"public"."booking_status", 'in_progress'::"public"."booking_status"])) AND ("cleaner_id" IS NOT NULL) AND ("lower"(COALESCE("payment_status", ''::"text")) = 'paid'::"text"));
+
+
+
+CREATE INDEX "idx_bookings_auto_close_never_started" ON "public"."bookings" USING "btree" ("scheduled_at_utc") WHERE (("status" = ANY (ARRAY['confirmed'::"public"."booking_status", 'scheduled'::"public"."booking_status"])) AND ("cleaner_id" IS NOT NULL) AND ("lower"(COALESCE("payment_status", ''::"text")) = 'paid'::"text"));
+
+
+
 CREATE INDEX "idx_bookings_broadcast_assignments" ON "public"."bookings" USING "btree" ("scheduled_at_utc") WHERE (("assignment_phase" = 'broadcast'::"text") AND ("cleaner_id" IS NULL) AND ("cleaner_accepted_at" IS NULL) AND ("lower"(COALESCE("payment_status", ''::"text")) = 'paid'::"text"));
 
 
@@ -22042,6 +22217,13 @@ GRANT ALL ON FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "targ
 
 
 
+REVOKE ALL ON FUNCTION "public"."auto_close_stale_bookings"("p_grace" interval, "p_limit" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."auto_close_stale_bookings"("p_grace" interval, "p_limit" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."auto_close_stale_bookings"("p_grace" interval, "p_limit" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."auto_close_stale_bookings"("p_grace" interval, "p_limit" integer) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."backfill_cleaner_application_approval"("p_user_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."backfill_cleaner_application_approval"("p_user_id" "uuid") TO "service_role";
 
@@ -22090,6 +22272,12 @@ REVOKE ALL ON FUNCTION "public"."booking_payment_split_snapshot_is_invalid"("p_p
 GRANT ALL ON FUNCTION "public"."booking_payment_split_snapshot_is_invalid"("p_payment_split_type" "text", "p_tax_paystack_share" "text", "p_vendor_paystack_share" "text", "p_amount_minor" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."booking_payment_split_snapshot_is_invalid"("p_payment_split_type" "text", "p_tax_paystack_share" "text", "p_vendor_paystack_share" "text", "p_amount_minor" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."booking_payment_split_snapshot_is_invalid"("p_payment_split_type" "text", "p_tax_paystack_share" "text", "p_vendor_paystack_share" "text", "p_amount_minor" integer) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."booking_service_end_at"("p_scheduled_at_utc" timestamp with time zone, "p_duration_hours" numeric, "p_duration_final" numeric) TO "anon";
+GRANT ALL ON FUNCTION "public"."booking_service_end_at"("p_scheduled_at_utc" timestamp with time zone, "p_duration_hours" numeric, "p_duration_final" numeric) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."booking_service_end_at"("p_scheduled_at_utc" timestamp with time zone, "p_duration_hours" numeric, "p_duration_final" numeric) TO "service_role";
 
 
 
@@ -24815,8 +25003,7 @@ GRANT ALL ON FUNCTION "public"."get_payment_split_config"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_payout_system_logs"() TO "anon";
-GRANT ALL ON FUNCTION "public"."get_payout_system_logs"() TO "authenticated";
+REVOKE ALL ON FUNCTION "public"."get_payout_system_logs"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_payout_system_logs"() TO "service_role";
 
 
