@@ -2365,6 +2365,43 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.booking_cleaner_access_window_open(p_status booking_status, p_scheduled_at_utc timestamp with time zone, p_scheduled_date date, p_timezone_name text)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE
+AS $function$
+  SELECT CASE
+    WHEN p_status NOT IN ('confirmed', 'scheduled', 'en_route', 'arrived', 'in_progress') THEN false
+    WHEN p_scheduled_date IS NULL THEN false
+    WHEN p_scheduled_date <>
+      (now() AT TIME ZONE COALESCE(NULLIF(trim(p_timezone_name), ''), 'Africa/Accra'))::date THEN false
+    WHEN p_status IN ('confirmed', 'scheduled')
+      AND p_scheduled_at_utc IS NOT NULL
+      AND p_scheduled_at_utc <= now() THEN false
+    ELSE true
+  END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.booking_cleaner_contact_window_open(p_status booking_status, p_scheduled_at_utc timestamp with time zone, p_scheduled_date date, p_timezone_name text)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE
+AS $function$
+  SELECT CASE
+    WHEN p_status NOT IN ('confirmed', 'scheduled', 'en_route', 'arrived', 'in_progress') THEN false
+    WHEN p_status IN ('confirmed', 'scheduled')
+      AND p_scheduled_at_utc IS NOT NULL
+      AND p_scheduled_at_utc <= now() THEN false
+    WHEN p_status IN ('en_route', 'arrived', 'in_progress')
+      AND p_scheduled_date IS NOT NULL
+      AND p_scheduled_date <>
+        (now() AT TIME ZONE COALESCE(NULLIF(trim(p_timezone_name), ''), 'Africa/Accra'))::date THEN false
+    ELSE true
+  END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.booking_cover_major_from_booking(p_cover_amount numeric)
  RETURNS numeric
  LANGUAGE plpgsql
@@ -2537,10 +2574,19 @@ CREATE OR REPLACE FUNCTION public.bookings_guard_payment_status()
  RETURNS trigger
  LANGUAGE plpgsql
  SECURITY DEFINER
- SET search_path TO 'public'
+ SET search_path TO 'public', 'pg_temp'
 AS $function$
 BEGIN
   IF OLD.payment_status IS NOT DISTINCT FROM NEW.payment_status THEN
+    RETURN NEW;
+  END IF;
+
+  -- Used only by confirm_zero_amount_booking() to mark paid for promo-covered zero totals.
+  IF coalesce(nullif(current_setting('app.confirm_zero_amount', true), ''), '') = '1' THEN
+    RETURN NEW;
+  END IF;
+
+  IF auth.role() = 'service_role' THEN
     RETURN NEW;
   END IF;
 
@@ -6203,6 +6249,121 @@ BEGIN
       RAISE EXCEPTION 'Unsupported recurrence interval: %', p_recurrence_interval
         USING errcode = '22023';
   END CASE;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.confirm_zero_amount_booking(p_booking_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.bookings%ROWTYPE;
+  v_amount integer;
+  v_req jsonb;
+  v_ref text;
+  v_promo jsonb;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_booking_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  SELECT *
+  INTO v_row
+  FROM public.bookings
+  WHERE id = p_booking_id
+    AND customer_id = v_uid
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_found');
+  END IF;
+
+  IF lower(COALESCE(v_row.payment_status, '')) = 'paid' THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'already_paid', true,
+      'booking_id', p_booking_id,
+      'reference', v_row.reference
+    );
+  END IF;
+
+  IF v_row.status IS DISTINCT FROM 'pending'::public.booking_status
+     AND v_row.status IS DISTINCT FROM 'confirmed'::public.booking_status THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_payable');
+  END IF;
+
+  IF lower(COALESCE(v_row.payment_status, '')) NOT IN ('pending', 'failed') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_payable');
+  END IF;
+
+  IF v_row.subscription_id IS NULL THEN
+    IF v_row.cleaner_id IS NULL AND v_row.cleaner_assigned_at IS NOT NULL THEN
+      RETURN jsonb_build_object('success', false, 'error', 'cleaner_hold_released');
+    END IF;
+
+    IF v_row.cleaner_hold_expires_at IS NOT NULL
+       AND v_row.cleaner_hold_expires_at < now() THEN
+      RETURN jsonb_build_object('success', false, 'error', 'cleaner_hold_expired');
+    END IF;
+  END IF;
+
+  v_amount := public.booking_final_amount_minor(v_row.final_amount_minor, v_row.total_price);
+  IF v_amount <> 0 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_has_payable_amount');
+  END IF;
+
+  IF v_row.promotion_id IS NULL OR COALESCE(v_row.promotion_discount_minor, 0) <= 0 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_promo_zero_amount');
+  END IF;
+
+  v_req := public.customer_risk_booking_verification_requirement_core(v_uid, p_booking_id);
+  IF COALESCE((v_req->>'can_proceed_to_payment')::boolean, false) IS NOT TRUE THEN
+    RETURN jsonb_build_object('success', false, 'error', 'verification_required');
+  END IF;
+
+  v_ref := 'PROMO-' || replace(p_booking_id::text, '-', '');
+
+  PERFORM set_config('app.confirm_zero_amount', '1', true);
+
+  UPDATE public.bookings
+  SET
+    payment_status = 'paid',
+    payment_method = 'promotion',
+    status = 'confirmed',
+    reference = COALESCE(NULLIF(btrim(reference), ''), v_ref),
+    cleaner_hold_expires_at = NULL,
+    updated_at = now()
+  WHERE id = p_booking_id
+    AND customer_id = v_uid
+  RETURNING reference INTO v_ref;
+
+  PERFORM set_config('app.confirm_zero_amount', '', true);
+
+  v_promo := public.finalize_promotion_redemption(p_booking_id);
+  IF COALESCE(v_promo->>'success', 'false') <> 'true' THEN
+    RAISE EXCEPTION 'promotion_finalize_failed'
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  PERFORM public.broadcast_unassigned_paid_bookings();
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'booking_id', p_booking_id,
+    'reference', v_ref
+  );
+EXCEPTION
+  WHEN OTHERS THEN
+    PERFORM set_config('app.confirm_zero_amount', '', true);
+    RAISE;
 END;
 $function$
 
@@ -10321,8 +10482,9 @@ BEGIN
     FROM public.bookings b
     WHERE b.id = p_exclude_booking_id
       AND b.customer_id = p_customer_id
-      AND b.status IN ('pending', 'confirmed')
-      AND COALESCE(b.payment_status, 'pending') NOT IN ('paid', 'success')
+      AND b.subscription_id IS NULL
+      AND b.status IN ('pending', 'confirmed', 'scheduled')
+      AND lower(coalesce(b.payment_status::text, 'pending')) IN ('pending', 'paid', 'success')
     LIMIT 1;
 
     IF v_safe_exclude_booking_id IS NULL THEN
@@ -11086,17 +11248,18 @@ END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.get_booking_contact_phone(p_booking_id uuid)
+CREATE OR REPLACE FUNCTION public.get_booking_contact_phone(p_booking_id uuid, p_contact_role text DEFAULT 'customer'::text)
  RETURNS jsonb
  LANGUAGE plpgsql
  SECURITY DEFINER
- SET search_path TO 'public'
+ SET search_path TO 'public', 'pg_temp'
 AS $function$
 DECLARE
   v_uid uuid := auth.uid();
   v_row public.bookings%ROWTYPE;
   v_contact_user_id uuid;
   v_phone text;
+  v_role text := lower(coalesce(btrim(p_contact_role), 'customer'));
 BEGIN
   IF v_uid IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
@@ -11104,6 +11267,10 @@ BEGIN
 
   IF p_booking_id IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  IF v_role NOT IN ('customer', 'site') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_contact_role');
   END IF;
 
   SELECT * INTO v_row
@@ -11114,32 +11281,51 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'not_found');
   END IF;
 
-  IF v_row.status NOT IN ('confirmed', 'scheduled', 'en_route', 'arrived', 'in_progress') THEN
+  IF NOT public.booking_cleaner_contact_window_open(
+    v_row.status,
+    v_row.scheduled_at_utc,
+    v_row.scheduled_date,
+    v_row.timezone_name
+  ) THEN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
   END IF;
 
-  IF v_row.status IN ('confirmed', 'scheduled')
-    AND v_row.scheduled_at_utc IS NOT NULL
-    AND v_row.scheduled_at_utc <= now() THEN
+  IF lower(coalesce(v_row.payment_status::text, '')) NOT IN ('paid', 'success') THEN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
   END IF;
 
-  IF v_row.status IN ('en_route', 'arrived', 'in_progress')
-    AND v_row.scheduled_date IS NOT NULL
-    AND v_row.scheduled_date <>
-      (now() AT TIME ZONE COALESCE(NULLIF(trim(v_row.timezone_name), ''), 'Africa/Accra'))::date THEN
-    RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
+  IF v_role = 'site' THEN
+    IF v_uid IS DISTINCT FROM v_row.cleaner_id THEN
+      RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+    END IF;
+
+    IF COALESCE(v_row.booking_for_self, true) = true THEN
+      RETURN jsonb_build_object('success', false, 'error', 'site_contact_unavailable');
+    END IF;
+
+    v_phone := NULLIF(btrim(v_row.site_contact_phone), '');
+
+    IF v_phone IS NULL THEN
+      RETURN jsonb_build_object('success', false, 'error', 'phone_unavailable');
+    END IF;
+
+    RETURN jsonb_build_object(
+      'success', true,
+      'phone', v_phone,
+      'contact_role', 'site'
+    );
   END IF;
 
   IF v_uid = v_row.customer_id AND v_row.cleaner_id IS NOT NULL THEN
     v_contact_user_id := v_row.cleaner_id;
   ELSIF v_uid = v_row.cleaner_id AND v_row.customer_id IS NOT NULL THEN
     v_contact_user_id := v_row.customer_id;
-    IF v_row.customer_contact_phone IS NOT NULL AND trim(v_row.customer_contact_phone) <> '' THEN
+    IF v_row.customer_contact_phone IS NOT NULL AND btrim(v_row.customer_contact_phone) <> '' THEN
       RETURN jsonb_build_object(
         'success', true,
-        'phone', trim(v_row.customer_contact_phone),
-        'contact_user_id', v_contact_user_id
+        'phone', btrim(v_row.customer_contact_phone),
+        'contact_user_id', v_contact_user_id,
+        'contact_role', 'customer'
       );
     END IF;
   ELSE
@@ -11150,14 +11336,15 @@ BEGIN
   FROM public.users
   WHERE id = v_contact_user_id;
 
-  IF v_phone IS NULL OR trim(v_phone) = '' THEN
+  IF v_phone IS NULL OR btrim(v_phone) = '' THEN
     RETURN jsonb_build_object('success', false, 'error', 'phone_unavailable');
   END IF;
 
   RETURN jsonb_build_object(
     'success', true,
-    'phone', trim(v_phone),
-    'contact_user_id', v_contact_user_id
+    'phone', btrim(v_phone),
+    'contact_user_id', v_contact_user_id,
+    'contact_role', 'customer'
   );
 END;
 $function$
@@ -11353,6 +11540,103 @@ BEGIN
     JOIN public.profiles p ON p.id = cd.user_id
     WHERE cd.user_id = p_cleaner_id
       AND cd.status = 'active';
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_cleaner_booking_access_context(p_booking_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.bookings%ROWTYPE;
+  v_unlocked boolean := false;
+  v_paid boolean := false;
+  v_customer_phone text;
+  v_site_phone text;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_booking_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  SELECT * INTO v_row
+  FROM public.bookings
+  WHERE id = p_booking_id;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF v_row.cleaner_id IS DISTINCT FROM v_uid THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+  END IF;
+
+  v_paid := lower(coalesce(v_row.payment_status::text, '')) IN ('paid', 'success');
+
+  v_unlocked := v_paid
+    AND public.booking_cleaner_access_window_open(
+      v_row.status,
+      v_row.scheduled_at_utc,
+      v_row.scheduled_date,
+      v_row.timezone_name
+    );
+
+  IF NOT v_unlocked THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'unlocked', false,
+      'message', CASE
+        WHEN NOT v_paid THEN 'payment_required'
+        ELSE 'access_locked_until_job_day'
+      END
+    );
+  END IF;
+
+  SELECT NULLIF(btrim(u.phone), '') INTO v_customer_phone
+  FROM public.users u
+  WHERE u.id = v_row.customer_id;
+
+  IF NULLIF(btrim(v_row.customer_contact_phone), '') IS NOT NULL THEN
+    v_customer_phone := btrim(v_row.customer_contact_phone);
+  END IF;
+
+  v_site_phone := NULL;
+  IF COALESCE(v_row.booking_for_self, true) = false THEN
+    v_site_phone := NULLIF(btrim(v_row.site_contact_phone), '');
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'unlocked', true,
+    'booking_for_self', COALESCE(v_row.booking_for_self, true),
+    'on_site_contact_name', CASE
+      WHEN COALESCE(v_row.booking_for_self, true) = false
+        THEN NULLIF(btrim(v_row.site_contact_name), '')
+      ELSE NULL
+    END,
+    'on_site_contact_relationship', CASE
+      WHEN COALESCE(v_row.booking_for_self, true) = false
+        THEN NULLIF(btrim(v_row.site_contact_relationship), '')
+      ELSE NULL
+    END,
+    'on_site_contact_phone_available', v_site_phone IS NOT NULL,
+    'property_type', NULLIF(btrim(v_row.property_type), ''),
+    'occupant_present', v_row.occupant_present,
+    'requires_key_or_access_code', COALESCE(v_row.requires_key_or_access_code, false),
+    'access_instructions', CASE
+      WHEN COALESCE(v_row.requires_key_or_access_code, false)
+        THEN NULLIF(btrim(v_row.access_instructions), '')
+      ELSE NULL
+    END,
+    'customer_contact_available', v_customer_phone IS NOT NULL
+  );
 END;
 $function$
 
@@ -12872,33 +13156,33 @@ CREATE OR REPLACE FUNCTION public.guard_booking_payment_status_writes()
  RETURNS trigger
  LANGUAGE plpgsql
 AS $function$
-begin
-  -- Service-role calls (Paystack webhook, admin scripts) bypass entirely.
-  if auth.role() = 'service_role' then
-    return new;
-  end if;
+BEGIN
+  IF auth.role() = 'service_role' THEN
+    RETURN NEW;
+  END IF;
 
-  -- Non-service-role callers cannot transition payment_status to a privileged value.
-  if new.payment_status is distinct from old.payment_status
-     and new.payment_status in ('paid', 'refunded') then
-    raise exception
+  -- Used only by confirm_zero_amount_booking() to mark paid for promo-covered zero totals.
+  IF coalesce(nullif(current_setting('app.confirm_zero_amount', true), ''), '') = '1' THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.payment_status IS DISTINCT FROM OLD.payment_status
+     AND NEW.payment_status IN ('paid', 'refunded') THEN
+    RAISE EXCEPTION
       'payment_status transitions to % are server-only (use the Paystack webhook)',
-      new.payment_status
-      using errcode = '42501'; -- insufficient_privilege
-  end if;
+      NEW.payment_status
+      USING ERRCODE = '42501';
+  END IF;
 
-  -- Once a booking is paid, the column is locked for non-service-role callers.
-  -- This prevents a customer from "unpaying" their own booking by writing
-  -- `payment_status = 'failed'` after the webhook has confirmed the charge.
-  if old.payment_status = 'paid'
-     and new.payment_status is distinct from old.payment_status then
-    raise exception
+  IF OLD.payment_status = 'paid'
+     AND NEW.payment_status IS DISTINCT FROM OLD.payment_status THEN
+    RAISE EXCEPTION
       'cannot change payment_status of a paid booking from client'
-      using errcode = '42501';
-  end if;
+      USING ERRCODE = '42501';
+  END IF;
 
-  return new;
-end;
+  RETURN NEW;
+END;
 $function$
 
 
@@ -13056,6 +13340,7 @@ AS $function$
     WHEN 'payment_received' THEN 'new_booking'
     WHEN 'booking_confirmed' THEN 'new_booking'
     WHEN 'booking_cancelled' THEN 'booking_cancellations'
+    WHEN 'booking_rescheduled' THEN 'booking_updates'
     WHEN 'unassigned_booking_escalated' THEN 'booking_cancellations'
     WHEN 'new_message' THEN 'messages'
     WHEN 'cleaner_en_route' THEN 'cleaner_milestones'
@@ -13075,6 +13360,7 @@ AS $function$
       'cleaner_en_route',
       'cleaner_arrived',
       'booking_cancelled',
+      'booking_rescheduled',
       'payment_required',
       'direct_assignment_offer',
       'direct_assignment_reminder'
