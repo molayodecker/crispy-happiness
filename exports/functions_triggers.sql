@@ -3376,6 +3376,38 @@ CREATE OR REPLACE FUNCTION public.citextsend(citext)
 AS $function$textsend$function$
 
 
+CREATE OR REPLACE FUNCTION public.claim_booking_review_request(p_booking_id uuid)
+ RETURNS timestamp with time zone
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_claimed_at timestamptz := now();
+BEGIN
+  UPDATE public.bookings
+  SET review_request_sent_at = v_claimed_at
+  WHERE id = p_booking_id
+    AND review_request_sent_at IS NULL
+    AND payment_status = 'paid'
+    AND status = 'completed'
+    AND cleaner_id IS NOT NULL
+    AND completed_at IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.reviews r
+      WHERE r.booking_id = p_booking_id
+    );
+
+  IF FOUND THEN
+    RETURN v_claimed_at;
+  END IF;
+
+  RETURN NULL;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.claim_job(p_job_id uuid, p_cleaner_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -4201,6 +4233,32 @@ BEGIN
   GET DIAGNOSTICS v_released_count = ROW_COUNT;
 
   RETURN v_released_count;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.cleanup_orphaned_pending_subscription(p_subscription_id uuid)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+BEGIN
+  IF v_uid IS NULL OR p_subscription_id IS NULL THEN
+    RETURN false;
+  END IF;
+
+  DELETE FROM public.subscriptions s
+  WHERE s.id = p_subscription_id
+    AND s.customer_id = v_uid
+    AND lower(coalesce(s.status, '')) = 'pending'
+    AND NOT EXISTS (
+      SELECT 1 FROM public.bookings b WHERE b.subscription_id = s.id
+    );
+
+  RETURN FOUND;
 END;
 $function$
 
@@ -5815,9 +5873,10 @@ BEGIN
   END IF;
 
   IF p_customer_id IS NULL
+     OR v_caller IS NULL
+     OR v_caller <> p_customer_id
      OR (NOT COALESCE((SELECT allow_recurring FROM public.promotions WHERE slug = v_resolved_slug LIMIT 1), false)
-         AND p_is_recurring)
-     OR (v_caller IS NOT NULL AND v_caller <> p_customer_id) THEN
+         AND p_is_recurring) THEN
     RETURN QUERY
     SELECT
       v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
@@ -18673,6 +18732,22 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.set_booking_completed_at()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF NEW.status = 'completed'
+    AND (OLD.status IS DISTINCT FROM 'completed')
+  THEN
+    NEW.completed_at := COALESCE(NEW.completed_at, now());
+  END IF;
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.set_booking_timezone()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -24119,6 +24194,8 @@ CREATE TRIGGER trg_bookings_clear_payment_split_on_amount_change BEFORE UPDATE O
 CREATE TRIGGER trg_bookings_ensure_cleaner_earnings_minor BEFORE INSERT OR UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION trg_bookings_ensure_cleaner_earnings_minor();
 
 CREATE TRIGGER trg_bookings_guard_payment_status BEFORE UPDATE OF payment_status ON bookings FOR EACH ROW EXECUTE FUNCTION bookings_guard_payment_status();
+
+CREATE TRIGGER trg_bookings_set_completed_at BEFORE UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION set_booking_completed_at();
 
 CREATE TRIGGER trg_credit_cleaner_wallet_on_completion AFTER UPDATE OF status ON bookings FOR EACH ROW WHEN (new.status = 'completed'::booking_status AND old.status IS DISTINCT FROM 'completed'::booking_status) EXECUTE FUNCTION handle_job_completion();
 

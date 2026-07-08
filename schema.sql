@@ -2788,6 +2788,39 @@ $$;
 ALTER FUNCTION "public"."capture_booking_payment_split_snapshot"("p_booking_id" "uuid", "p_amount_minor" integer) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."claim_booking_review_request"("p_booking_id" "uuid") RETURNS timestamp with time zone
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_claimed_at timestamptz := now();
+BEGIN
+  UPDATE public.bookings
+  SET review_request_sent_at = v_claimed_at
+  WHERE id = p_booking_id
+    AND review_request_sent_at IS NULL
+    AND payment_status = 'paid'
+    AND status = 'completed'
+    AND cleaner_id IS NOT NULL
+    AND completed_at IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.reviews r
+      WHERE r.booking_id = p_booking_id
+    );
+
+  IF FOUND THEN
+    RETURN v_claimed_at;
+  END IF;
+
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."claim_booking_review_request"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -3656,6 +3689,33 @@ $$;
 
 
 ALTER FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscription_id" "uuid") RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+BEGIN
+  IF v_uid IS NULL OR p_subscription_id IS NULL THEN
+    RETURN false;
+  END IF;
+
+  DELETE FROM public.subscriptions s
+  WHERE s.id = p_subscription_id
+    AND s.customer_id = v_uid
+    AND lower(coalesce(s.status, '')) = 'pending'
+    AND NOT EXISTS (
+      SELECT 1 FROM public.bookings b WHERE b.subscription_id = s.id
+    );
+
+  RETURN FOUND;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscription_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid") RETURNS "jsonb"
@@ -5278,9 +5338,10 @@ BEGIN
   END IF;
 
   IF p_customer_id IS NULL
+     OR v_caller IS NULL
+     OR v_caller <> p_customer_id
      OR (NOT COALESCE((SELECT allow_recurring FROM public.promotions WHERE slug = v_resolved_slug LIMIT 1), false)
-         AND p_is_recurring)
-     OR (v_caller IS NOT NULL AND v_caller <> p_customer_id) THEN
+         AND p_is_recurring) THEN
     RETURN QUERY
     SELECT
       v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
@@ -14796,6 +14857,24 @@ COMMENT ON FUNCTION "public"."service_schedule_timestamptz"("p_schedule_date" "d
 
 
 
+CREATE OR REPLACE FUNCTION "public"."set_booking_completed_at"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NEW.status = 'completed'
+    AND (OLD.status IS DISTINCT FROM 'completed')
+  THEN
+    NEW.completed_at := COALESCE(NEW.completed_at, now());
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."set_booking_completed_at"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."set_booking_timezone"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -16960,6 +17039,8 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "dispatch_gate_reason" "text",
     "promotion_code_id" "uuid",
     "access_instructions" "text",
+    "review_request_sent_at" timestamp with time zone,
+    "completed_at" timestamp with time zone,
     CONSTRAINT "bookings_assignment_phase_check" CHECK ((("assignment_phase" IS NULL) OR ("assignment_phase" = ANY (ARRAY['exclusive'::"text", 'broadcast'::"text", 'accepted'::"text"])))),
     CONSTRAINT "bookings_cancellation_tier_check" CHECK ((("cancellation_tier" IS NULL) OR ("cancellation_tier" = ANY (ARRAY['full_refund'::"text", 'partial_refund'::"text", 'no_refund'::"text"])))),
     CONSTRAINT "bookings_cancelled_by_role_check" CHECK ((("cancelled_by_role" IS NULL) OR ("cancelled_by_role" = ANY (ARRAY['customer'::"text", 'cleaner'::"text", 'admin'::"text", 'platform'::"text"])))),
@@ -17096,6 +17177,14 @@ COMMENT ON COLUMN "public"."bookings"."dispatch_gate_reason" IS 'Human/debug rea
 
 
 COMMENT ON COLUMN "public"."bookings"."access_instructions" IS 'Gate code, lockbox, or concierge notes when requires_key_or_access_code is true. Not stored in special_instructions.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."review_request_sent_at" IS 'When the customer-facing review_request notification was sent after job completion.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."completed_at" IS 'When the booking first transitioned to completed status.';
 
 
 
@@ -19647,6 +19736,10 @@ CREATE INDEX "bookings_promotion_code_id_idx" ON "public"."bookings" USING "btre
 
 
 
+CREATE INDEX "bookings_review_request_pending_idx" ON "public"."bookings" USING "btree" ("completed_at") WHERE (("review_request_sent_at" IS NULL) AND ("payment_status" = 'paid'::"text") AND ("status" = 'completed'::"public"."booking_status") AND ("cleaner_id" IS NOT NULL) AND ("completed_at" IS NOT NULL));
+
+
+
 CREATE UNIQUE INDEX "cleaner_application_drafts_user_id_key" ON "public"."cleaner_application_drafts" USING "btree" ("user_id");
 
 
@@ -20532,6 +20625,10 @@ CREATE OR REPLACE TRIGGER "trg_bookings_ensure_cleaner_earnings_minor" BEFORE IN
 
 
 CREATE OR REPLACE TRIGGER "trg_bookings_guard_payment_status" BEFORE UPDATE OF "payment_status" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."bookings_guard_payment_status"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_bookings_set_completed_at" BEFORE UPDATE OF "status" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."set_booking_completed_at"();
 
 
 
@@ -23671,6 +23768,13 @@ GRANT ALL ON FUNCTION "public"."citext_smaller"("public"."citext", "public"."cit
 
 
 
+REVOKE ALL ON FUNCTION "public"."claim_booking_review_request"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."claim_booking_review_request"("p_booking_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."claim_booking_review_request"("p_booking_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."claim_booking_review_request"("p_booking_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") TO "service_role";
@@ -23842,6 +23946,12 @@ GRANT ALL ON FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"(
 
 
 
+REVOKE ALL ON FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscription_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscription_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscription_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid") TO "service_role";
@@ -23890,7 +24000,7 @@ GRANT ALL ON FUNCTION "public"."compute_booking_pricing_with_promotion"("p_servi
 
 
 
-GRANT ALL ON FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid", "p_channel" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_customer_id" "uuid", "p_promotion_slug" "text", "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_booking_id" "uuid", "p_service_duration_option_id" "uuid", "p_promotion_code" "text") TO "anon";
+REVOKE ALL ON FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid", "p_channel" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_customer_id" "uuid", "p_promotion_slug" "text", "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_booking_id" "uuid", "p_service_duration_option_id" "uuid", "p_promotion_code" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid", "p_channel" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_customer_id" "uuid", "p_promotion_slug" "text", "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_booking_id" "uuid", "p_service_duration_option_id" "uuid", "p_promotion_code" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid", "p_channel" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_customer_id" "uuid", "p_promotion_slug" "text", "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_booking_id" "uuid", "p_service_duration_option_id" "uuid", "p_promotion_code" "text") TO "service_role";
 
@@ -27629,6 +27739,12 @@ GRANT ALL ON FUNCTION "public"."search_available_cleaners_old"("p_lat" double pr
 GRANT ALL ON FUNCTION "public"."service_schedule_timestamptz"("p_schedule_date" "date", "p_schedule_time" time without time zone, "p_timezone" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."service_schedule_timestamptz"("p_schedule_date" "date", "p_schedule_time" time without time zone, "p_timezone" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."service_schedule_timestamptz"("p_schedule_date" "date", "p_schedule_time" time without time zone, "p_timezone" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."set_booking_completed_at"() TO "anon";
+GRANT ALL ON FUNCTION "public"."set_booking_completed_at"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_booking_completed_at"() TO "service_role";
 
 
 
