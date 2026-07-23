@@ -28205,6 +28205,54 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.properties_guard_auto_booking_enabled()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.auto_booking_enabled IS TRUE
+       AND coalesce(current_setting('instaclean.allow_auto_booking_toggle', true), '')
+           IS DISTINCT FROM 'on' THEN
+      NEW.auto_booking_enabled := false;
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF NEW.auto_booking_enabled IS DISTINCT FROM OLD.auto_booking_enabled
+     AND coalesce(current_setting('instaclean.allow_auto_booking_toggle', true), '')
+         IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'auto_booking_enabled must be changed via set_property_auto_booking_enabled'
+      USING ERRCODE = '42501';
+  END IF;
+
+  RETURN NEW;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.property_preferred_cleaners_require_approved()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.cleaner_data cd
+    WHERE cd.user_id = NEW.cleaner_id
+      AND cd.status = 'active'::public.cleaner_status
+  ) THEN
+    RAISE EXCEPTION 'cleaner_not_eligible'
+      USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.psk_transaction(p_booking_id uuid, p_user_id uuid, p_reference text, p_paystack_id bigint, p_amount numeric, p_fee_amount numeric, p_total_captured numeric, p_currency text, p_metadata jsonb)
  RETURNS psk_transaction
  LANGUAGE plpgsql
@@ -31180,6 +31228,73 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.save_property_information(p_property_id uuid, p_trash_notes text DEFAULT NULL::text, p_supplies_notes text DEFAULT NULL::text, p_other_notes text DEFAULT NULL::text, p_access_notes text DEFAULT NULL::text, p_wifi_network text DEFAULT NULL::text, p_wifi_password text DEFAULT NULL::text, p_parking_notes text DEFAULT NULL::text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_property_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'property_required');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.properties
+    WHERE id = p_property_id
+      AND customer_id = v_uid
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'property_not_found');
+  END IF;
+
+  UPDATE public.properties
+  SET
+    trash_notes = nullif(btrim(COALESCE(p_trash_notes, '')), ''),
+    supplies_notes = nullif(btrim(COALESCE(p_supplies_notes, '')), ''),
+    other_notes = nullif(btrim(COALESCE(p_other_notes, '')), ''),
+    updated_at = now()
+  WHERE id = p_property_id
+    AND customer_id = v_uid;
+
+  INSERT INTO public.property_private_instructions (
+    property_id,
+    owner_id,
+    access_notes,
+    wifi_network,
+    wifi_password,
+    parking_notes,
+    updated_at
+  )
+  VALUES (
+    p_property_id,
+    v_uid,
+    nullif(btrim(COALESCE(p_access_notes, '')), ''),
+    nullif(btrim(COALESCE(p_wifi_network, '')), ''),
+    nullif(btrim(COALESCE(p_wifi_password, '')), ''),
+    nullif(btrim(COALESCE(p_parking_notes, '')), ''),
+    now()
+  )
+  ON CONFLICT (property_id)
+  DO UPDATE SET
+    owner_id = EXCLUDED.owner_id,
+    access_notes = EXCLUDED.access_notes,
+    wifi_network = EXCLUDED.wifi_network,
+    wifi_password = EXCLUDED.wifi_password,
+    parking_notes = EXCLUDED.parking_notes,
+    updated_at = now();
+
+  RETURN jsonb_build_object('success', true);
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.schema_owner_is(name, name)
  RETURNS text
  LANGUAGE sql
@@ -31894,6 +32009,88 @@ AS $function$
 BEGIN
   NEW.updated_at := now();
   RETURN NEW;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.set_property_auto_booking_enabled(p_property_id uuid, p_enabled boolean)
+ RETURNS json
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_property public.properties%ROWTYPE;
+  v_has_active_feed boolean := false;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN json_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_property_id IS NULL THEN
+    RETURN json_build_object('success', false, 'error', 'property_required');
+  END IF;
+
+  SELECT *
+  INTO v_property
+  FROM public.properties
+  WHERE id = p_property_id
+    AND customer_id = v_uid
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN json_build_object('success', false, 'error', 'property_not_found');
+  END IF;
+
+  IF p_enabled IS TRUE THEN
+    IF v_property.turnover_defaults_confirmed IS NOT TRUE THEN
+      RETURN json_build_object('success', false, 'error', 'defaults_unconfirmed');
+    END IF;
+
+    SELECT EXISTS (
+      SELECT 1
+      FROM public.property_calendar_feeds f
+      WHERE f.property_id = p_property_id
+        AND f.owner_id = v_uid
+        AND f.sync_enabled IS TRUE
+    )
+    INTO v_has_active_feed;
+
+    IF v_has_active_feed IS NOT TRUE THEN
+      RETURN json_build_object('success', false, 'error', 'calendar_required');
+    END IF;
+  END IF;
+
+  PERFORM set_config('instaclean.allow_auto_booking_toggle', 'on', true);
+
+  UPDATE public.properties
+  SET
+    auto_booking_enabled = coalesce(p_enabled, false),
+    auto_booking_starts_on = CASE
+      WHEN coalesce(p_enabled, false) THEN
+        coalesce(
+          auto_booking_starts_on,
+          (
+            timezone(
+              coalesce(nullif(v_property.timezone, ''), 'Africa/Accra'),
+              now()
+            )
+          )::date
+        )
+      ELSE NULL
+    END,
+    updated_at = now()
+  WHERE id = p_property_id
+    AND customer_id = v_uid
+  RETURNING * INTO v_property;
+
+  RETURN json_build_object(
+    'success', true,
+    'property_id', v_property.id,
+    'auto_booking_enabled', v_property.auto_booking_enabled,
+    'auto_booking_starts_on', v_property.auto_booking_starts_on
+  );
 END;
 $function$
 
@@ -38720,6 +38917,10 @@ CREATE TRIGGER trg_profiles_fullname BEFORE INSERT OR UPDATE OF firstname, middl
 CREATE TRIGGER promotion_config_audit_no_delete BEFORE DELETE ON promotion_config_audit FOR EACH ROW EXECUTE FUNCTION prevent_promotion_config_audit_mutation();
 
 CREATE TRIGGER promotion_config_audit_no_update BEFORE UPDATE ON promotion_config_audit FOR EACH ROW EXECUTE FUNCTION prevent_promotion_config_audit_mutation();
+
+CREATE TRIGGER properties_guard_auto_booking_enabled BEFORE INSERT OR UPDATE OF auto_booking_enabled ON properties FOR EACH ROW EXECUTE FUNCTION properties_guard_auto_booking_enabled();
+
+CREATE TRIGGER property_preferred_cleaners_require_approved BEFORE INSERT OR UPDATE OF cleaner_id ON property_preferred_cleaners FOR EACH ROW EXECUTE FUNCTION property_preferred_cleaners_require_approved();
 
 
 -- === EVENT TRIGGERS (summary; DDL in schema.sql) ===
