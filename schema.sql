@@ -1771,6 +1771,75 @@ COMMENT ON FUNCTION "public"."approve_cleaner_application"("p_application_id" "u
 
 
 
+CREATE OR REPLACE FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") RETURNS "void"
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_status public.cleaner_status;
+  v_verified boolean;
+  v_hourly_rate numeric;
+  v_specialties text[];
+  v_missing text;
+BEGIN
+  IF p_cleaner_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  IF p_cleaner_id = p_customer_id THEN
+    RAISE EXCEPTION 'Cannot book yourself as the cleaner' USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT cd.status, cd.verified, cd.hourly_rate, cd.specialties
+  INTO v_status, v_verified, v_hourly_rate, v_specialties
+  FROM public.cleaner_data cd
+  WHERE cd.user_id = p_cleaner_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Selected cleaner was not found' USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_status IS DISTINCT FROM 'active' THEN
+    RAISE EXCEPTION 'Selected cleaner is not available for booking' USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_verified IS DISTINCT FROM true THEN
+    RAISE EXCEPTION 'Selected cleaner is not verified' USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_hourly_rate IS NULL OR v_hourly_rate <= 0 THEN
+    RAISE EXCEPTION 'Selected cleaner does not have a valid hourly rate'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT req.slug
+  INTO v_missing
+  FROM jsonb_array_elements_text(COALESCE(p_required_specialty_slugs, '[]'::jsonb)) AS req(slug)
+  WHERE NULLIF(btrim(req.slug), '') IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM unnest(COALESCE(v_specialties, ARRAY[]::text[])) AS s(slug)
+      WHERE lower(btrim(s.slug)) = lower(btrim(req.slug))
+    )
+  LIMIT 1;
+
+  IF v_missing IS NOT NULL THEN
+    RAISE EXCEPTION
+      'Selected cleaner does not offer all required Quick Tasks specialties (missing: %)',
+      v_missing
+      USING ERRCODE = 'check_violation';
+  END IF;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") IS 'Server-side Quick Tasks cleaner eligibility: active, verified, rate, and every required specialty.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."assign_cleaner_after_payment"("p_booking_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -2060,6 +2129,7 @@ DECLARE
   v_duration_hours numeric;
   v_notes text;
   v_claimed integer;
+  v_include_cover boolean := COALESCE(p_include_booking_cover, false);
 BEGIN
   IF v_uid IS NULL THEN
     RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
@@ -2084,7 +2154,7 @@ BEGIN
     v_booking.scheduled_date,
     COALESCE(v_booking.timezone_name, 'Africa/Accra'),
     COALESCE(p_equipment_provider, 'customer'),
-    COALESCE(p_include_booking_cover, false),
+    v_include_cover,
     NULL,
     true
   );
@@ -2142,6 +2212,8 @@ BEGIN
     weekend_surcharge_minor = COALESCE((v_pricing->>'weekend_surcharge_minor')::integer, 0),
     platform_fee = COALESCE((v_pricing->>'platform_fee_major')::numeric, 0),
     total_price = COALESCE((v_pricing->>'final_amount_minor')::integer, 0),
+    booking_cover = v_include_cover,
+    booking_cover_amount = COALESCE((v_pricing->>'booking_cover_major')::numeric, 0),
     pricing_version = COALESCE(v_pricing->>'pricing_version', pricing_version),
     currency = COALESCE(v_pricing->>'currency', currency)
   WHERE id = p_booking_id;
@@ -2159,7 +2231,7 @@ $$;
 ALTER FUNCTION "public"."attach_booking_micro_tasks"("p_booking_id" "uuid", "p_selected_tasks" "jsonb", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_scope_acknowledged" boolean) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."attach_booking_micro_tasks"("p_booking_id" "uuid", "p_selected_tasks" "jsonb", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_scope_acknowledged" boolean) IS 'Recomputes Quick Tasks pricing and attaches line items to a pending booking. Requires scope acknowledgement.';
+COMMENT ON FUNCTION "public"."attach_booking_micro_tasks"("p_booking_id" "uuid", "p_selected_tasks" "jsonb", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_scope_acknowledged" boolean) IS 'Replaces Quick Tasks line items on a pending booking and syncs pricing, including booking_cover fields.';
 
 
 
@@ -4263,41 +4335,18 @@ ALTER FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscription_
 
 CREATE OR REPLACE FUNCTION "public"."cleanup_orphaned_quick_task_uploads"("p_older_than" interval DEFAULT '24:00:00'::interval, "p_limit" integer DEFAULT 200) RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public', 'storage'
+    SET "search_path" TO 'public'
     AS $$
 DECLARE
-  v_paths text[];
-  v_deleted_rows integer := 0;
-  v_deleted_objects integer := 0;
+  v_listed jsonb;
 BEGIN
-  SELECT coalesce(array_agg(storage_path), ARRAY[]::text[])
-  INTO v_paths
-  FROM (
-    SELECT storage_path
-    FROM public.quick_task_uploads
-    WHERE claimed_at IS NULL
-      AND created_at < now() - p_older_than
-    ORDER BY created_at
-    LIMIT greatest(1, least(COALESCE(p_limit, 200), 1000))
-  ) t;
-
-  IF coalesce(array_length(v_paths, 1), 0) = 0 THEN
-    RETURN jsonb_build_object('deleted_rows', 0, 'deleted_objects', 0);
-  END IF;
-
-  DELETE FROM public.quick_task_uploads
-  WHERE storage_path = ANY (v_paths)
-    AND claimed_at IS NULL;
-  GET DIAGNOSTICS v_deleted_rows = ROW_COUNT;
-
-  DELETE FROM storage.objects
-  WHERE bucket_id = 'quick-task-photos'
-    AND name = ANY (v_paths);
-  GET DIAGNOSTICS v_deleted_objects = ROW_COUNT;
-
+  v_listed := public.list_orphaned_quick_task_uploads(p_older_than, p_limit);
   RETURN jsonb_build_object(
-    'deleted_rows', v_deleted_rows,
-    'deleted_objects', v_deleted_objects
+    'paths', COALESCE(v_listed->'paths', '[]'::jsonb),
+    'path_count', COALESCE((v_listed->>'path_count')::integer, 0),
+    'deleted_rows', 0,
+    'deleted_objects', 0,
+    'storage_delete_required', true
   );
 END;
 $$;
@@ -4306,7 +4355,7 @@ $$;
 ALTER FUNCTION "public"."cleanup_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."cleanup_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) IS 'Deletes unclaimed Quick Tasks photo registry rows and storage objects older than the given interval. Invoke daily via cron/service_role.';
+COMMENT ON FUNCTION "public"."cleanup_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) IS 'Lists orphan Quick Tasks upload paths for the cleanup Edge Function. Does not delete Storage bytes directly.';
 
 
 
@@ -6500,6 +6549,10 @@ BEGIN
   END LOOP;
 
   IF p_for_checkout THEN
+    IF auth.uid() IS NULL THEN
+      RAISE EXCEPTION 'Sign in required for Quick Tasks checkout pricing'
+        USING ERRCODE = '42501';
+    END IF;
     SELECT bs.value_numeric INTO v_checkout_enabled
     FROM public.booking_settings bs WHERE bs.key = 'quick_tasks_checkout_enabled';
     IF COALESCE(v_checkout_enabled, 0) = 0 THEN
@@ -6628,6 +6681,10 @@ $$;
 
 
 ALTER FUNCTION "public"."compute_micro_task_booking_pricing"("p_selected_tasks" "jsonb", "p_scheduled_date" "date", "p_service_timezone" "text", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_client_claimed_final_minor" integer, "p_for_checkout" boolean) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."compute_micro_task_booking_pricing"("p_selected_tasks" "jsonb", "p_scheduled_date" "date", "p_service_timezone" "text", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_client_claimed_final_minor" integer, "p_for_checkout" boolean) IS 'Authoritative Quick Tasks pricing. Estimates allowed for anon; checkout mode requires auth.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."compute_next_recurrence_date"("p_current_date" "date", "p_recurrence_interval" "text", "p_recurrence_anchor_date" "date" DEFAULT NULL::"date") RETURNS "date"
@@ -6986,6 +7043,13 @@ BEGIN
     true
   );
 
+  -- Independent of client filters: chosen cleaner must cover every required specialty.
+  PERFORM public.assert_quick_tasks_cleaner_eligible(
+    v_cleaner_id,
+    v_uid,
+    v_pricing->'required_specialty_slugs'
+  );
+
   v_duration_hours := COALESCE((v_pricing->>'duration_hours')::numeric, 0.5);
   IF v_duration_hours < 0.5 THEN
     v_duration_hours := 0.5;
@@ -7093,7 +7157,6 @@ BEGIN
   )
   RETURNING id INTO v_booking_id;
 
-  -- Attach lines + claim photos (checkout already enforced above).
   v_attach := public.attach_booking_micro_tasks(
     v_booking_id,
     p_selected_tasks,
@@ -7133,7 +7196,7 @@ $$;
 ALTER FUNCTION "public"."create_quick_tasks_booking"("p_booking" "jsonb", "p_selected_tasks" "jsonb", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_scope_acknowledged" boolean) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."create_quick_tasks_booking"("p_booking" "jsonb", "p_selected_tasks" "jsonb", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_scope_acknowledged" boolean) IS 'Atomically creates a Quick Tasks booking, priced line items, and claims uploaded photos.';
+COMMENT ON FUNCTION "public"."create_quick_tasks_booking"("p_booking" "jsonb", "p_selected_tasks" "jsonb", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_scope_acknowledged" boolean) IS 'Atomically creates a Quick Tasks booking, priced line items, and claims uploaded photos. Validates cleaner eligibility server-side.';
 
 
 
@@ -7606,9 +7669,9 @@ $$;
 ALTER FUNCTION "public"."delete_booking_job_photo"("p_booking_id" "uuid", "p_storage_path" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_quick_task_upload"("p_storage_path" "text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."delete_quick_task_upload"("p_storage_path" "text") RETURNS "text"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public', 'storage'
+    SET "search_path" TO 'public'
     AS $$
 DECLARE
   v_uid uuid := auth.uid();
@@ -7618,7 +7681,7 @@ BEGIN
     RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
   END IF;
   IF v_path IS NULL THEN
-    RETURN;
+    RETURN NULL;
   END IF;
 
   DELETE FROM public.quick_task_uploads
@@ -7626,22 +7689,29 @@ BEGIN
     AND uploaded_by = v_uid
     AND claimed_at IS NULL;
 
-  IF NOT FOUND AND EXISTS (
+  IF FOUND THEN
+    -- Caller must remove bytes via Storage API using the returned path.
+    RETURN v_path;
+  END IF;
+
+  IF EXISTS (
     SELECT 1 FROM public.quick_task_uploads
     WHERE storage_path = v_path AND uploaded_by = v_uid AND claimed_at IS NOT NULL
   ) THEN
     RAISE EXCEPTION 'Cannot delete a claimed Quick Tasks photo' USING ERRCODE = 'check_violation';
   END IF;
 
-  DELETE FROM storage.objects
-  WHERE bucket_id = 'quick-task-photos'
-    AND name = v_path
-    AND COALESCE((storage.foldername(name))[1], '') = v_uid::text;
+  -- Not owned / not found: no-op.
+  RETURN NULL;
 END;
 $$;
 
 
 ALTER FUNCTION "public"."delete_quick_task_upload"("p_storage_path" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."delete_quick_task_upload"("p_storage_path" "text") IS 'Deletes an unclaimed quick_task_uploads row for the caller and returns the path for Storage API removal. Does not DELETE storage.objects directly.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."diagnose_cleaner_booking_unavailability"("p_cleaner_id" "uuid", "p_booking_date" "date", "p_start_time" time without time zone, "p_duration_hours" numeric, "p_latitude" double precision, "p_longitude" double precision, "p_max_distance_meters" integer, "p_requested_category" "public"."service_category", "p_requested_specialty_slugs" "text"[], "p_exclude_booking_id" "uuid", "p_customer_id" "uuid") RETURNS "text"
@@ -8244,6 +8314,35 @@ $$;
 
 
 ALTER FUNCTION "public"."fetch_cleaner_earnings"("p_user_id" "uuid", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_deleted_rows integer := 0;
+BEGIN
+  IF p_paths IS NULL OR coalesce(array_length(p_paths, 1), 0) = 0 THEN
+    RETURN jsonb_build_object('deleted_rows', 0);
+  END IF;
+
+  -- Only remove still-unclaimed rows. Claimed booking media must never be finalized.
+  DELETE FROM public.quick_task_uploads
+  WHERE storage_path = ANY (p_paths)
+    AND claimed_at IS NULL;
+  GET DIAGNOSTICS v_deleted_rows = ROW_COUNT;
+
+  RETURN jsonb_build_object('deleted_rows', v_deleted_rows);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) IS 'Deletes unclaimed quick_task_uploads rows after Storage API removal succeeds. Never deletes claimed booking photos.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."finalize_promotion_redemption"("p_booking_id" "uuid") RETURNS "jsonb"
@@ -12472,6 +12571,39 @@ $$;
 
 
 ALTER FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval DEFAULT '24:00:00'::interval, "p_limit" integer DEFAULT 200) RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_paths text[];
+BEGIN
+  SELECT coalesce(array_agg(storage_path), ARRAY[]::text[])
+  INTO v_paths
+  FROM (
+    SELECT storage_path
+    FROM public.quick_task_uploads
+    WHERE claimed_at IS NULL
+      AND created_at < now() - p_older_than
+    ORDER BY created_at
+    LIMIT greatest(1, least(COALESCE(p_limit, 200), 1000))
+  ) t;
+
+  RETURN jsonb_build_object(
+    'paths', to_jsonb(COALESCE(v_paths, ARRAY[]::text[])),
+    'path_count', coalesce(array_length(v_paths, 1), 0)
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) IS 'Returns unclaimed Quick Tasks upload paths eligible for Storage API deletion. Does not delete objects.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."list_turnover_opportunities_for_customer"("p_limit" integer DEFAULT 20) RETURNS TABLE("id" "uuid", "property_id" "uuid", "property_name" "text", "property_timezone" "text", "departing_event_id" "uuid", "arriving_event_id" "uuid", "checkout_at" timestamp with time zone, "next_checkin_at" timestamp with time zone, "suggested_start_at" timestamp with time zone, "suggested_duration_hours" numeric, "status" "text", "booking_id" "uuid", "source" "text", "window_hours" numeric)
@@ -25607,7 +25739,7 @@ CREATE POLICY "micro_task_options_admin_write" ON "public"."micro_task_options" 
 
 
 
-CREATE POLICY "micro_task_options_select_active_or_admin" ON "public"."micro_task_options" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+CREATE POLICY "micro_task_options_select_active_or_admin" ON "public"."micro_task_options" FOR SELECT TO "authenticated", "anon" USING ((EXISTS ( SELECT 1
    FROM "public"."micro_tasks" "mt"
   WHERE (("mt"."id" = "micro_task_options"."micro_task_id") AND (("mt"."is_active" = true) OR "public"."is_admin"("auth"."uid"()))))));
 
@@ -25620,7 +25752,7 @@ CREATE POLICY "micro_tasks_admin_write" ON "public"."micro_tasks" TO "authentica
 
 
 
-CREATE POLICY "micro_tasks_select_active_or_admin" ON "public"."micro_tasks" FOR SELECT TO "authenticated" USING ((("is_active" = true) OR "public"."is_admin"("auth"."uid"())));
+CREATE POLICY "micro_tasks_select_active_or_admin" ON "public"."micro_tasks" FOR SELECT TO "authenticated", "anon" USING ((("is_active" = true) OR "public"."is_admin"("auth"."uid"())));
 
 
 
@@ -28668,6 +28800,13 @@ GRANT ALL ON FUNCTION "public"."approve_cleaner_application"("p_application_id" 
 
 
 
+REVOKE ALL ON FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."assign_cleaner_after_payment"("p_booking_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."assign_cleaner_after_payment"("p_booking_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."assign_cleaner_after_payment"("p_booking_id" "uuid") TO "authenticated";
@@ -29985,6 +30124,7 @@ GRANT ALL ON FUNCTION "public"."compute_ghana_phone_variants"("raw_phone" "text"
 REVOKE ALL ON FUNCTION "public"."compute_micro_task_booking_pricing"("p_selected_tasks" "jsonb", "p_scheduled_date" "date", "p_service_timezone" "text", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_client_claimed_final_minor" integer, "p_for_checkout" boolean) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."compute_micro_task_booking_pricing"("p_selected_tasks" "jsonb", "p_scheduled_date" "date", "p_service_timezone" "text", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_client_claimed_final_minor" integer, "p_for_checkout" boolean) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."compute_micro_task_booking_pricing"("p_selected_tasks" "jsonb", "p_scheduled_date" "date", "p_service_timezone" "text", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_client_claimed_final_minor" integer, "p_for_checkout" boolean) TO "service_role";
+GRANT ALL ON FUNCTION "public"."compute_micro_task_booking_pricing"("p_selected_tasks" "jsonb", "p_scheduled_date" "date", "p_service_timezone" "text", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_client_claimed_final_minor" integer, "p_for_checkout" boolean) TO "anon";
 
 
 
@@ -30626,6 +30766,13 @@ GRANT ALL ON FUNCTION "public"."fdw_privs_are"("name", "name", "name"[], "text")
 REVOKE ALL ON FUNCTION "public"."fetch_cleaner_earnings"("p_user_id" "uuid", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."fetch_cleaner_earnings"("p_user_id" "uuid", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."fetch_cleaner_earnings"("p_user_id" "uuid", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) TO "service_role";
 
 
 
@@ -36549,6 +36696,13 @@ REVOKE ALL ON FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" 
 GRANT ALL ON FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) TO "service_role";
 
 
 

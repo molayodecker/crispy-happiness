@@ -5925,6 +5925,7 @@ DECLARE
   v_duration_hours numeric;
   v_notes text;
   v_claimed integer;
+  v_include_cover boolean := COALESCE(p_include_booking_cover, false);
 BEGIN
   IF v_uid IS NULL THEN
     RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
@@ -5949,7 +5950,7 @@ BEGIN
     v_booking.scheduled_date,
     COALESCE(v_booking.timezone_name, 'Africa/Accra'),
     COALESCE(p_equipment_provider, 'customer'),
-    COALESCE(p_include_booking_cover, false),
+    v_include_cover,
     NULL,
     true
   );
@@ -6007,6 +6008,8 @@ BEGIN
     weekend_surcharge_minor = COALESCE((v_pricing->>'weekend_surcharge_minor')::integer, 0),
     platform_fee = COALESCE((v_pricing->>'platform_fee_major')::numeric, 0),
     total_price = COALESCE((v_pricing->>'final_amount_minor')::integer, 0),
+    booking_cover = v_include_cover,
+    booking_cover_amount = COALESCE((v_pricing->>'booking_cover_major')::numeric, 0),
     pricing_version = COALESCE(v_pricing->>'pricing_version', pricing_version),
     currency = COALESCE(v_pricing->>'currency', currency)
   WHERE id = p_booking_id;
@@ -11768,6 +11771,10 @@ BEGIN
   END LOOP;
 
   IF p_for_checkout THEN
+    IF auth.uid() IS NULL THEN
+      RAISE EXCEPTION 'Sign in required for Quick Tasks checkout pricing'
+        USING ERRCODE = '42501';
+    END IF;
     SELECT bs.value_numeric INTO v_checkout_enabled
     FROM public.booking_settings bs WHERE bs.key = 'quick_tasks_checkout_enabled';
     IF COALESCE(v_checkout_enabled, 0) = 0 THEN
@@ -12932,10 +12939,10 @@ $function$
 
 
 CREATE OR REPLACE FUNCTION public.delete_quick_task_upload(p_storage_path text)
- RETURNS void
+ RETURNS text
  LANGUAGE plpgsql
  SECURITY DEFINER
- SET search_path TO 'public', 'storage'
+ SET search_path TO 'public'
 AS $function$
 DECLARE
   v_uid uuid := auth.uid();
@@ -12945,7 +12952,7 @@ BEGIN
     RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
   END IF;
   IF v_path IS NULL THEN
-    RETURN;
+    RETURN NULL;
   END IF;
 
   DELETE FROM public.quick_task_uploads
@@ -12953,17 +12960,20 @@ BEGIN
     AND uploaded_by = v_uid
     AND claimed_at IS NULL;
 
-  IF NOT FOUND AND EXISTS (
+  IF FOUND THEN
+    -- Caller must remove bytes via Storage API using the returned path.
+    RETURN v_path;
+  END IF;
+
+  IF EXISTS (
     SELECT 1 FROM public.quick_task_uploads
     WHERE storage_path = v_path AND uploaded_by = v_uid AND claimed_at IS NOT NULL
   ) THEN
     RAISE EXCEPTION 'Cannot delete a claimed Quick Tasks photo' USING ERRCODE = 'check_violation';
   END IF;
 
-  DELETE FROM storage.objects
-  WHERE bucket_id = 'quick-task-photos'
-    AND name = v_path
-    AND COALESCE((storage.foldername(name))[1], '') = v_uid::text;
+  -- Not owned / not found: no-op.
+  RETURN NULL;
 END;
 $function$
 
