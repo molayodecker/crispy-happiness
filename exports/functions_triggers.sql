@@ -11771,15 +11771,15 @@ BEGIN
   END LOOP;
 
   IF p_for_checkout THEN
-    IF auth.uid() IS NULL THEN
-      RAISE EXCEPTION 'Sign in required for Quick Tasks checkout pricing'
-        USING ERRCODE = '42501';
-    END IF;
     SELECT bs.value_numeric INTO v_checkout_enabled
     FROM public.booking_settings bs WHERE bs.key = 'quick_tasks_checkout_enabled';
     IF COALESCE(v_checkout_enabled, 0) = 0 THEN
       RAISE EXCEPTION 'Quick Tasks checkout is disabled until pricing review is complete'
         USING ERRCODE = 'check_violation';
+    END IF;
+    IF auth.uid() IS NULL THEN
+      RAISE EXCEPTION 'Sign in required for Quick Tasks checkout pricing'
+        USING ERRCODE = '42501';
     END IF;
     IF v_has_placeholder THEN
       RAISE EXCEPTION 'Quick Tasks placeholder prices cannot be used for checkout'
