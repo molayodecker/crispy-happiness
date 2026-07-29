@@ -7640,6 +7640,59 @@ CREATE OR REPLACE FUNCTION public.citextsend(citext)
 AS $function$textsend$function$
 
 
+CREATE OR REPLACE FUNCTION public.claim_booking_reminder(p_booking_id uuid, p_kind text, p_claim_ttl_minutes integer DEFAULT 45)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_ttl integer := greatest(1, COALESCE(p_claim_ttl_minutes, 45));
+  v_id uuid;
+BEGIN
+  IF p_booking_id IS NULL THEN
+    RAISE EXCEPTION 'booking id required' USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF p_kind = 'customer' THEN
+    UPDATE public.bookings b
+    SET
+      customer_reminder_claimed_at = now(),
+      customer_reminder_last_error = NULL,
+      updated_at = now()
+    WHERE b.id = p_booking_id
+      AND b.customer_reminder_sent_at IS NULL
+      AND (
+        b.customer_reminder_claimed_at IS NULL
+        OR b.customer_reminder_claimed_at
+          < now() - make_interval(mins => v_ttl)
+      )
+    RETURNING b.id INTO v_id;
+  ELSIF p_kind = 'cleaner' THEN
+    UPDATE public.bookings b
+    SET
+      cleaner_reminder_claimed_at = now(),
+      cleaner_reminder_last_error = NULL,
+      updated_at = now()
+    WHERE b.id = p_booking_id
+      AND b.cleaner_id IS NOT NULL
+      AND b.cleaner_reminder_sent_at IS NULL
+      AND (
+        b.cleaner_reminder_claimed_at IS NULL
+        OR b.cleaner_reminder_claimed_at
+          < now() - make_interval(mins => v_ttl)
+      )
+    RETURNING b.id INTO v_id;
+  ELSE
+    RAISE EXCEPTION 'invalid reminder kind (expected customer|cleaner)'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  RETURN v_id IS NOT NULL;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.claim_booking_review_request(p_booking_id uuid)
  RETURNS timestamp with time zone
  LANGUAGE plpgsql
@@ -10022,6 +10075,118 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.compute_admin_monthly_schedule_split(p_amount_minor integer, p_weekdays integer[] DEFAULT NULL::integer[], p_period_start date DEFAULT NULL::date, p_period_end date DEFAULT NULL::date)
+ RETURNS TABLE(monthly_amount_minor integer, full_monthly_amount_minor integer, platform_fee_bps integer, platform_fee_minor integer, cleaner_earnings_minor integer, currency text, period_visit_count integer, full_month_visit_count integer, is_prorated boolean)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  c_default_platform_fee_bps constant integer := 1500;
+  v_settings_platform_raw numeric;
+  v_platform_bps integer;
+  v_platform_fee_minor integer;
+  v_cleaner_earnings_minor integer;
+  v_full_amount integer;
+  v_charged integer;
+  v_period_visits integer;
+  v_full_month_visits integer;
+  v_month_start date;
+  v_month_end date;
+  v_prorate boolean := false;
+BEGIN
+  v_full_amount := greatest(0, COALESCE(p_amount_minor, 0));
+  IF v_full_amount <= 0 THEN
+    RAISE EXCEPTION 'monthly amount must be positive'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_charged := v_full_amount;
+  v_period_visits := NULL;
+  v_full_month_visits := NULL;
+
+  IF p_weekdays IS NOT NULL
+     OR p_period_start IS NOT NULL
+     OR p_period_end IS NOT NULL THEN
+    IF p_weekdays IS NULL OR p_period_start IS NULL OR p_period_end IS NULL THEN
+      RAISE EXCEPTION 'weekdays, period_start, and period_end are required together for proration'
+        USING ERRCODE = 'check_violation';
+    END IF;
+    IF p_period_start > p_period_end THEN
+      RAISE EXCEPTION 'period start must be on or before period end'
+        USING ERRCODE = 'check_violation';
+    END IF;
+    IF date_trunc('month', p_period_start::timestamp)
+       <> date_trunc('month', p_period_end::timestamp) THEN
+      RAISE EXCEPTION 'proration period must remain within one calendar month'
+        USING ERRCODE = 'check_violation';
+    END IF;
+
+    v_month_start := date_trunc('month', p_period_start::timestamp)::date;
+    v_month_end := (date_trunc('month', p_period_start::timestamp) + interval '1 month - 1 day')::date;
+
+    v_period_visits := public.count_admin_schedule_weekday_occurrences(
+      p_weekdays, p_period_start, p_period_end
+    );
+    v_full_month_visits := public.count_admin_schedule_weekday_occurrences(
+      p_weekdays, v_month_start, v_month_end
+    );
+
+    IF v_period_visits < 1 THEN
+      RAISE EXCEPTION 'no matching weekdays in the selected period'
+        USING ERRCODE = 'check_violation';
+    END IF;
+    IF v_full_month_visits < 1 THEN
+      RAISE EXCEPTION 'no matching weekdays in the reference month'
+        USING ERRCODE = 'check_violation';
+    END IF;
+
+    v_charged := round(
+      v_full_amount::numeric * v_period_visits / v_full_month_visits
+    )::integer;
+    IF v_charged < 1 THEN
+      v_charged := 1;
+    END IF;
+    -- Visit ratio, not rounded money (tiny amounts can round to full charge).
+    v_prorate := v_period_visits IS DISTINCT FROM v_full_month_visits;
+  END IF;
+
+  SELECT bs.value_numeric
+  INTO v_settings_platform_raw
+  FROM public.booking_settings bs
+  WHERE bs.key = 'platform_fee_percentage';
+
+  IF v_settings_platform_raw IS NULL OR v_settings_platform_raw < 0 THEN
+    v_platform_bps := c_default_platform_fee_bps;
+  ELSIF v_settings_platform_raw = 0 THEN
+    v_platform_bps := 0;
+  ELSIF v_settings_platform_raw <= 100 THEN
+    v_platform_bps := round(v_settings_platform_raw * 100)::integer;
+  ELSE
+    v_platform_bps := round(v_settings_platform_raw)::integer;
+  END IF;
+  v_platform_bps := greatest(0, least(10000, COALESCE(v_platform_bps, c_default_platform_fee_bps)));
+
+  v_platform_fee_minor := round(v_charged * v_platform_bps / 10000.0)::integer;
+  IF v_platform_fee_minor > v_charged THEN
+    v_platform_fee_minor := v_charged;
+  END IF;
+  v_cleaner_earnings_minor := v_charged - v_platform_fee_minor;
+
+  monthly_amount_minor := v_charged;
+  full_monthly_amount_minor := v_full_amount;
+  platform_fee_bps := v_platform_bps;
+  platform_fee_minor := v_platform_fee_minor;
+  cleaner_earnings_minor := v_cleaner_earnings_minor;
+  currency := 'GHS';
+  period_visit_count := v_period_visits;
+  full_month_visit_count := v_full_month_visits;
+  is_prorated := v_prorate;
+  RETURN NEXT;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.compute_booking_pricing(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true, p_cleaner_id uuid DEFAULT NULL::uuid)
  RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, minimum_duration_hours numeric, cleaner_earnings_minor integer)
  LANGUAGE plpgsql
@@ -11732,6 +11897,29 @@ BEGIN
       RAISE EXCEPTION 'Quantity out of range for %', v_task.slug USING ERRCODE = 'check_violation';
     END IF;
 
+    -- Flat packages (e.g. 20-shirt ironing bundle): do not multiply by item_count.
+    FOR v_opt IN
+      SELECT *
+      FROM public.micro_task_options o
+      WHERE o.micro_task_id = v_task.id
+        AND o.input_type = 'single_select'
+    LOOP
+      v_choice_value := COALESCE(v_selected_options ->> v_opt.option_key, '');
+      IF v_choice_value = '' THEN
+        CONTINUE;
+      END IF;
+      SELECT c
+      INTO v_choice
+      FROM jsonb_array_elements(COALESCE(v_opt.configuration->'choices', '[]'::jsonb)) AS c
+      WHERE c->>'value' = v_choice_value
+        AND COALESCE((c->>'flat_package')::boolean, false)
+      LIMIT 1;
+      IF v_choice IS NOT NULL THEN
+        v_quantity := 1;
+        EXIT;
+      END IF;
+    END LOOP;
+
     IF v_task.pricing_type IN ('per_item', 'per_load', 'per_room', 'per_hour') THEN
       IF v_quantity <> trunc(v_quantity) THEN
         RAISE EXCEPTION 'Quantity for % must be a whole number', v_task.slug
@@ -12095,6 +12283,45 @@ CREATE OR REPLACE FUNCTION public.contains_2d(geometry, box2df)
  LANGUAGE sql
  IMMUTABLE PARALLEL SAFE STRICT COST 1
 AS $function$SELECT $2 OPERATOR(public.@) $1;$function$
+
+
+CREATE OR REPLACE FUNCTION public.count_admin_schedule_weekday_occurrences(p_weekdays integer[], p_start date, p_end date)
+ RETURNS integer
+ LANGUAGE plpgsql
+ IMMUTABLE STRICT
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_count integer := 0;
+  v_day date;
+  v_wanted integer[];
+BEGIN
+  IF p_start > p_end THEN
+    RAISE EXCEPTION 'period start must be on or before period end'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT coalesce(array_agg(DISTINCT d ORDER BY d), ARRAY[]::integer[])
+  INTO v_wanted
+  FROM unnest(p_weekdays) AS d
+  WHERE d BETWEEN 1 AND 7;
+
+  IF coalesce(cardinality(v_wanted), 0) = 0 THEN
+    RAISE EXCEPTION 'select at least one weekday (ISO 1=Mon … 7=Sun)'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_day := p_start;
+  WHILE v_day <= p_end LOOP
+    IF extract(isodow FROM v_day)::integer = ANY (v_wanted) THEN
+      v_count := v_count + 1;
+    END IF;
+    v_day := v_day + 1;
+  END LOOP;
+
+  RETURN v_count;
+END;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.count_unread_messages_for_user(p_user_id uuid)
@@ -18563,7 +18790,7 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
   END IF;
 
-  IF lower(coalesce(v_row.payment_status::text, '')) NOT IN ('paid', 'success') THEN
+  IF lower(coalesce(v_row.payment_status::text, '')) NOT IN ('paid', 'success', 'post_paid') THEN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
   END IF;
 
@@ -18942,7 +19169,8 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
   END IF;
 
-  v_paid := lower(coalesce(v_row.payment_status::text, '')) IN ('paid', 'success');
+  -- post_paid = bill-later but operationally authorized (admin monthly schedules).
+  v_paid := lower(coalesce(v_row.payment_status::text, '')) IN ('paid', 'success', 'post_paid');
 
   v_unlocked := v_paid
     AND public.booking_cleaner_access_window_open(
@@ -20573,8 +20801,11 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  -- Used only by confirm_zero_amount_booking() to mark paid for promo-covered zero totals.
   IF coalesce(nullif(current_setting('app.confirm_zero_amount', true), ''), '') = '1' THEN
+    RETURN NEW;
+  END IF;
+
+  IF coalesce(nullif(current_setting('app.settle_admin_monthly_schedule', true), ''), '') = '1' THEN
     RETURN NEW;
   END IF;
 
@@ -31047,15 +31278,16 @@ BEGIN
     cleaner_id = NULL,
     cleaner_hold_expires_at = NULL,
     status = CASE
-      WHEN status IN ('confirmed', 'pending') AND COALESCE(payment_status, 'pending') <> 'paid'
+      WHEN status IN ('confirmed', 'pending')
+           AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
         THEN 'pending'::public.booking_status
       ELSE status
     END,
     updated_at = now(),
     last_updated = now()
   WHERE cleaner_id IS NOT NULL
-    AND COALESCE(payment_status, 'pending') <> 'paid'
-    AND status IN ('confirmed', 'pending') 
+    AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
+    AND status IN ('confirmed', 'pending')
     AND (
       payment_status = 'failed'
       OR (
@@ -31089,14 +31321,15 @@ BEGIN
     cleaner_id = NULL,
     cleaner_hold_expires_at = NULL,
     status = CASE
-      WHEN status = 'confirmed' AND COALESCE(payment_status, 'pending') <> 'paid'
+      WHEN status = 'confirmed'
+           AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
         THEN 'pending'::public.booking_status
       ELSE status
     END,
     updated_at = now(),
     last_updated = now()
   WHERE cleaner_id IS NOT NULL
-    AND COALESCE(payment_status, 'pending') <> 'paid'
+    AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
     AND (
       payment_status = 'failed'
       OR (
@@ -33060,14 +33293,14 @@ CREATE OR REPLACE FUNCTION public.set_cleaner_assigned_at_for_hold()
  LANGUAGE plpgsql
 AS $function$
 BEGIN
-  -- Paid bookings: only clear legacy expiry column; do not reset hold/assignment timestamps.
-  IF COALESCE(NEW.payment_status, 'pending') = 'paid' THEN
+  -- Paid / post-paid: sticky assignment, not a temporary unpaid hold.
+  IF lower(COALESCE(NEW.payment_status, 'pending')) IN ('paid', 'post_paid') THEN
     NEW.cleaner_hold_expires_at := NULL;
     RETURN NEW;
   END IF;
 
   IF NEW.cleaner_id IS NOT NULL
-     AND COALESCE(NEW.payment_status, 'pending') <> 'paid'
+     AND lower(COALESCE(NEW.payment_status, 'pending')) NOT IN ('paid', 'post_paid')
      AND (
        TG_OP = 'INSERT'
        OR OLD.cleaner_id IS NULL
@@ -33380,6 +33613,160 @@ begin
   new.updated_at = now();
   return new;
 end $function$
+
+
+CREATE OR REPLACE FUNCTION public.settle_admin_monthly_schedule_payment(p_group_id uuid, p_paystack_reference text, p_amount_minor integer)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_group public.admin_booking_schedule_groups%ROWTYPE;
+  v_booking_ids uuid[];
+  v_count integer;
+  v_share integer;
+  v_remainder integer;
+  v_idx integer := 0;
+  v_booking_id uuid;
+  v_earning integer;
+  v_fee_share integer;
+  v_fee_remainder integer;
+  v_price_share integer;
+  v_price_remainder integer;
+  v_price_minor integer;
+  v_fee_minor integer;
+  v_ref text;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RAISE EXCEPTION 'group id required' USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_ref := trim(COALESCE(p_paystack_reference, ''));
+  IF length(v_ref) = 0 THEN
+    RAISE EXCEPTION 'payment reference required' USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT *
+  INTO v_group
+  FROM public.admin_booking_schedule_groups g
+  WHERE g.id = p_group_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule group not found' USING ERRCODE = 'no_data_found';
+  END IF;
+
+  -- Always validate amount before any success path (including idempotent replay).
+  IF p_amount_minor IS NULL OR p_amount_minor <> v_group.monthly_amount_minor THEN
+    RAISE EXCEPTION 'paid amount does not match monthly_amount_minor'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_group.status = 'paid' THEN
+    IF v_group.paystack_reference IS NOT NULL
+       AND v_group.paystack_reference = v_ref THEN
+      RETURN jsonb_build_object(
+        'ok', true,
+        'idempotent', true,
+        'group_id', v_group.id,
+        'status', v_group.status,
+        'monthly_amount_minor', v_group.monthly_amount_minor,
+        'platform_fee_minor', v_group.platform_fee_minor,
+        'cleaner_earnings_minor', v_group.cleaner_earnings_minor
+      );
+    END IF;
+    RAISE EXCEPTION 'schedule group already settled'
+      USING ERRCODE = 'unique_violation';
+  END IF;
+
+  IF v_group.status <> 'open' THEN
+    RAISE EXCEPTION 'schedule group is not open for payment'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- Local-only bypass for payment_status guard (needed when JWT role is absent, e.g. psql).
+  PERFORM set_config('app.settle_admin_monthly_schedule', '1', true);
+
+  -- Fail closed if any non-cancelled visit already has terminal payment state.
+  IF EXISTS (
+    SELECT 1
+    FROM public.bookings b
+    WHERE b.schedule_group_id = v_group.id
+      AND b.status IS DISTINCT FROM 'cancelled'::public.booking_status
+      AND b.payment_status IN ('paid', 'refunded', 'partially_refunded')
+  ) THEN
+    RAISE EXCEPTION
+      'schedule group contains an already paid or refunded booking'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- Lock child rows in scheduled order so concurrent cancel/update cannot race allocation.
+  SELECT array_agg(q.id ORDER BY q.scheduled_date, q.id)
+  INTO v_booking_ids
+  FROM (
+    SELECT b.id, b.scheduled_date
+    FROM public.bookings b
+    WHERE b.schedule_group_id = v_group.id
+      AND b.status IS DISTINCT FROM 'cancelled'::public.booking_status
+    FOR UPDATE
+  ) q;
+
+  v_count := coalesce(cardinality(v_booking_ids), 0);
+  IF v_count < 1 THEN
+    RAISE EXCEPTION 'schedule group has no bookings to settle'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_share := v_group.cleaner_earnings_minor / v_count;
+  v_remainder := v_group.cleaner_earnings_minor - (v_share * v_count);
+  v_fee_share := v_group.platform_fee_minor / v_count;
+  v_fee_remainder := v_group.platform_fee_minor - (v_fee_share * v_count);
+  v_price_share := v_group.monthly_amount_minor / v_count;
+  v_price_remainder := v_group.monthly_amount_minor - (v_price_share * v_count);
+
+  FOREACH v_booking_id IN ARRAY v_booking_ids LOOP
+    v_idx := v_idx + 1;
+    v_earning := v_share + CASE WHEN v_idx = v_count THEN v_remainder ELSE 0 END;
+    v_fee_minor := v_fee_share + CASE WHEN v_idx = v_count THEN v_fee_remainder ELSE 0 END;
+    -- total_price / final_amount_minor / core_amount_minor: minor (pesewas)
+    -- platform_fee: major GHS (existing bookings convention)
+    v_price_minor := v_price_share
+      + CASE WHEN v_idx = v_count THEN v_price_remainder ELSE 0 END;
+
+    UPDATE public.bookings b
+    SET
+      payment_status = 'paid',
+      cleaner_earnings_minor = v_earning,
+      platform_fee = (v_fee_minor::numeric / 100.0),
+      total_price = v_price_minor,
+      final_amount_minor = v_price_minor,
+      core_amount_minor = v_price_minor,
+      updated_at = now()
+    WHERE b.id = v_booking_id;
+  END LOOP;
+
+  UPDATE public.admin_booking_schedule_groups g
+  SET
+    status = 'paid',
+    paystack_reference = v_ref,
+    settled_at = now(),
+    updated_at = now()
+  WHERE g.id = v_group.id;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'idempotent', false,
+    'group_id', v_group.id,
+    'status', 'paid',
+    'booking_count', v_count,
+    'monthly_amount_minor', v_group.monthly_amount_minor,
+    'platform_fee_minor', v_group.platform_fee_minor,
+    'cleaner_earnings_minor', v_group.cleaner_earnings_minor,
+    'paystack_reference', v_ref
+  );
+END;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.skip(integer)
