@@ -5170,6 +5170,82 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.allocate_booking_customer_invoice_seq(p_booking_id uuid)
+ RETURNS integer
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_seq integer;
+BEGIN
+  IF p_booking_id IS NULL THEN
+    RAISE EXCEPTION 'booking_id required' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT b.customer_invoice_seq
+  INTO v_seq
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'booking not found: %', p_booking_id USING ERRCODE = 'P0002';
+  END IF;
+
+  IF v_seq IS NOT NULL THEN
+    RETURN v_seq;
+  END IF;
+
+  v_seq := nextval('public.customer_invoice_seq')::integer;
+
+  UPDATE public.bookings
+  SET customer_invoice_seq = v_seq
+  WHERE id = p_booking_id;
+
+  RETURN v_seq;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.allocate_schedule_group_customer_invoice_seq(p_group_id uuid)
+ RETURNS integer
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_seq integer;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RAISE EXCEPTION 'group_id required' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT g.customer_invoice_seq
+  INTO v_seq
+  FROM public.admin_booking_schedule_groups g
+  WHERE g.id = p_group_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule group not found: %', p_group_id USING ERRCODE = 'P0002';
+  END IF;
+
+  IF v_seq IS NOT NULL THEN
+    RETURN v_seq;
+  END IF;
+
+  v_seq := nextval('public.customer_invoice_seq')::integer;
+
+  UPDATE public.admin_booking_schedule_groups
+  SET customer_invoice_seq = v_seq
+  WHERE id = p_group_id;
+
+  RETURN v_seq;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.any_column_privs_are(name, name, name, name[])
  RETURNS text
  LANGUAGE sql
@@ -7785,6 +7861,62 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.claim_orphaned_quick_task_uploads_for_cleanup(p_older_than interval DEFAULT '24:00:00'::interval, p_limit integer DEFAULT 200)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_claim_id uuid := gen_random_uuid();
+  v_paths text[];
+  v_lim integer := greatest(1, least(COALESCE(p_limit, 200), 1000));
+  v_poison_count integer := 0;
+BEGIN
+  UPDATE public.quick_task_uploads
+  SET cleanup_claim_id = NULL, cleanup_claimed_at = NULL
+  WHERE claimed_at IS NULL
+    AND cleanup_claim_id IS NOT NULL
+    AND cleanup_claimed_at < now() - interval '30 minutes';
+
+  WITH picked AS (
+    SELECT u.id
+    FROM public.quick_task_uploads u
+    WHERE u.claimed_at IS NULL
+      AND u.cleanup_claim_id IS NULL
+      AND u.created_at < now() - p_older_than
+    ORDER BY u.created_at
+    LIMIT v_lim
+    FOR UPDATE SKIP LOCKED
+  ),
+  updated AS (
+    UPDATE public.quick_task_uploads u
+    SET
+      cleanup_claim_id = v_claim_id,
+      cleanup_claimed_at = now(),
+      cleanup_attempts = u.cleanup_attempts + 1
+    FROM picked p
+    WHERE u.id = p.id
+      AND u.claimed_at IS NULL
+      AND u.cleanup_claim_id IS NULL
+    RETURNING u.storage_path, u.cleanup_attempts
+  )
+  SELECT
+    coalesce(array_agg(storage_path), ARRAY[]::text[]),
+    count(*) FILTER (WHERE cleanup_attempts >= 5)::integer
+  INTO v_paths, v_poison_count
+  FROM updated;
+
+  RETURN jsonb_build_object(
+    'claim_id', v_claim_id,
+    'paths', to_jsonb(COALESCE(v_paths, ARRAY[]::text[])),
+    'path_count', coalesce(array_length(v_paths, 1), 0),
+    'high_attempt_row_count', COALESCE(v_poison_count, 0)
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.claim_quick_task_uploads_for_booking(p_booking_id uuid, p_selected_tasks jsonb)
  RETURNS integer
  LANGUAGE plpgsql
@@ -9642,10 +9774,10 @@ BEGIN
       USING ERRCODE = 'no_data_found';
   END IF;
 
-  IF NOT (
-    public.is_admin(v_uid)
-    OR v_booking.cleaner_id = v_uid
-    OR v_booking.direct_assigned_cleaner_id = v_uid
+  IF NOT public.is_authorized_quick_tasks_worker(
+    v_booking.cleaner_id,
+    v_booking.direct_assigned_cleaner_id,
+    v_uid
   ) THEN
     RAISE EXCEPTION 'Not allowed to complete this Quick Task'
       USING ERRCODE = '42501';
@@ -9695,6 +9827,13 @@ BEGIN
     completed_at = now(),
     updated_at = now()
   WHERE id = v_line.id;
+
+  IF v_booking.status = 'arrived' THEN
+    UPDATE public.bookings
+    SET status = 'in_progress', updated_at = now(), last_updated = now()
+    WHERE id = v_booking.id;
+    v_booking.status := 'in_progress';
+  END IF;
 
   SELECT count(*)::integer
   INTO v_remaining
@@ -9748,10 +9887,17 @@ BEGIN
   SELECT * INTO v_row
   FROM public.bookings
   WHERE id = p_booking_id
-    AND cleaner_id = v_uid
   FOR UPDATE;
 
   IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF NOT public.is_authorized_quick_tasks_worker(
+    v_row.cleaner_id,
+    v_row.direct_assigned_cleaner_id,
+    v_uid
+  ) THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_found');
   END IF;
 
@@ -9773,13 +9919,15 @@ BEGIN
     );
   END IF;
 
-  v_missing := public._booking_job_photo_missing_required(p_booking_id);
-  IF array_length(v_missing, 1) IS NOT NULL THEN
-    RETURN jsonb_build_object(
-      'success', false,
-      'error', 'JOB_PHOTOS_INCOMPLETE',
-      'missing_types', to_jsonb(v_missing)
-    );
+  IF COALESCE(v_row.is_quick_tasks, false) IS NOT TRUE THEN
+    v_missing := public._booking_job_photo_missing_required(p_booking_id);
+    IF array_length(v_missing, 1) IS NOT NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'JOB_PHOTOS_INCOMPLETE',
+        'missing_types', to_jsonb(v_missing)
+      );
+    END IF;
   END IF;
 
   IF p_customer_rating IS NOT NULL THEN
@@ -14538,7 +14686,7 @@ END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.finalize_orphaned_quick_task_uploads(p_paths text[])
+CREATE OR REPLACE FUNCTION public.finalize_orphaned_quick_task_uploads(p_paths text[], p_claim_id uuid DEFAULT NULL::uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
  SECURITY DEFINER
@@ -14551,13 +14699,21 @@ BEGIN
     RETURN jsonb_build_object('deleted_rows', 0);
   END IF;
 
-  -- Only remove still-unclaimed rows. Claimed booking media must never be finalized.
-  DELETE FROM public.quick_task_uploads
-  WHERE storage_path = ANY (p_paths)
-    AND claimed_at IS NULL;
+  IF p_claim_id IS NULL THEN
+    DELETE FROM public.quick_task_uploads
+    WHERE storage_path = ANY (p_paths)
+      AND claimed_at IS NULL
+      AND cleanup_claim_id IS NULL;
+  ELSE
+    DELETE FROM public.quick_task_uploads
+    WHERE storage_path = ANY (p_paths)
+      AND claimed_at IS NULL
+      AND cleanup_claim_id = p_claim_id;
+  END IF;
+
   GET DIAGNOSTICS v_deleted_rows = ROW_COUNT;
 
-  RETURN jsonb_build_object('deleted_rows', v_deleted_rows);
+  RETURN jsonb_build_object('deleted_rows', v_deleted_rows, 'claim_id', p_claim_id);
 END;
 $function$
 
@@ -23914,6 +24070,25 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.is_authorized_quick_tasks_worker(p_cleaner_id uuid, p_direct_assigned_cleaner_id uuid, p_worker_id uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT
+    p_worker_id IS NOT NULL
+    AND (
+      public.is_admin(p_worker_id)
+      OR p_cleaner_id = p_worker_id
+      OR (
+        p_cleaner_id IS NULL
+        AND p_direct_assigned_cleaner_id = p_worker_id
+      )
+    );
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.is_clustered(name)
  RETURNS text
  LANGUAGE plpgsql
@@ -26012,7 +26187,7 @@ $function$
 CREATE OR REPLACE FUNCTION public.list_orphaned_quick_task_uploads(p_older_than interval DEFAULT '24:00:00'::interval, p_limit integer DEFAULT 200)
  RETURNS jsonb
  LANGUAGE plpgsql
- SECURITY DEFINER
+ STABLE SECURITY DEFINER
  SET search_path TO 'public'
 AS $function$
 DECLARE
@@ -26024,6 +26199,7 @@ BEGIN
     SELECT storage_path
     FROM public.quick_task_uploads
     WHERE claimed_at IS NULL
+      AND cleanup_claim_id IS NULL
       AND created_at < now() - p_older_than
     ORDER BY created_at
     LIMIT greatest(1, least(COALESCE(p_limit, 200), 1000))
@@ -31344,6 +31520,31 @@ BEGIN
     'ok', true,
     'released_count', released_count
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.release_orphaned_quick_task_upload_claim(p_claim_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_released integer := 0;
+BEGIN
+  IF p_claim_id IS NULL THEN
+    RETURN jsonb_build_object('released_rows', 0);
+  END IF;
+
+  UPDATE public.quick_task_uploads
+  SET cleanup_claim_id = NULL, cleanup_claimed_at = NULL
+  WHERE cleanup_claim_id = p_claim_id
+    AND claimed_at IS NULL;
+
+  GET DIAGNOSTICS v_released = ROW_COUNT;
+
+  RETURN jsonb_build_object('released_rows', v_released, 'claim_id', p_claim_id);
 END;
 $function$
 
@@ -37164,10 +37365,10 @@ BEGIN
   WHERE id = v_line.booking_id
   FOR UPDATE;
 
-  IF NOT (
-    public.is_admin(v_uid)
-    OR v_booking.cleaner_id = v_uid
-    OR v_booking.direct_assigned_cleaner_id = v_uid
+  IF NOT public.is_authorized_quick_tasks_worker(
+    v_booking.cleaner_id,
+    v_booking.direct_assigned_cleaner_id,
+    v_uid
   ) THEN
     RAISE EXCEPTION 'Not allowed'
       USING ERRCODE = '42501';

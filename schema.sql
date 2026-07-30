@@ -1427,6 +1427,84 @@ $$;
 ALTER FUNCTION "public"."airbnb_turnover_window_hours"("p_checkout" timestamp with time zone, "p_checkin" timestamp with time zone) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."allocate_booking_customer_invoice_seq"("p_booking_id" "uuid") RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_seq integer;
+BEGIN
+  IF p_booking_id IS NULL THEN
+    RAISE EXCEPTION 'booking_id required' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT b.customer_invoice_seq
+  INTO v_seq
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'booking not found: %', p_booking_id USING ERRCODE = 'P0002';
+  END IF;
+
+  IF v_seq IS NOT NULL THEN
+    RETURN v_seq;
+  END IF;
+
+  v_seq := nextval('public.customer_invoice_seq')::integer;
+
+  UPDATE public.bookings
+  SET customer_invoice_seq = v_seq
+  WHERE id = p_booking_id;
+
+  RETURN v_seq;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."allocate_booking_customer_invoice_seq"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."allocate_schedule_group_customer_invoice_seq"("p_group_id" "uuid") RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_seq integer;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RAISE EXCEPTION 'group_id required' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT g.customer_invoice_seq
+  INTO v_seq
+  FROM public.admin_booking_schedule_groups g
+  WHERE g.id = p_group_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule group not found: %', p_group_id USING ERRCODE = 'P0002';
+  END IF;
+
+  IF v_seq IS NOT NULL THEN
+    RETURN v_seq;
+  END IF;
+
+  v_seq := nextval('public.customer_invoice_seq')::integer;
+
+  UPDATE public.admin_booking_schedule_groups
+  SET customer_invoice_seq = v_seq
+  WHERE id = p_group_id;
+
+  RETURN v_seq;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."allocate_schedule_group_customer_invoice_seq"("p_group_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."apply_referral_code"("p_code" "text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -3367,6 +3445,67 @@ $$;
 ALTER FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."claim_orphaned_quick_task_uploads_for_cleanup"("p_older_than" interval DEFAULT '24:00:00'::interval, "p_limit" integer DEFAULT 200) RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_claim_id uuid := gen_random_uuid();
+  v_paths text[];
+  v_lim integer := greatest(1, least(COALESCE(p_limit, 200), 1000));
+  v_poison_count integer := 0;
+BEGIN
+  UPDATE public.quick_task_uploads
+  SET cleanup_claim_id = NULL, cleanup_claimed_at = NULL
+  WHERE claimed_at IS NULL
+    AND cleanup_claim_id IS NOT NULL
+    AND cleanup_claimed_at < now() - interval '30 minutes';
+
+  WITH picked AS (
+    SELECT u.id
+    FROM public.quick_task_uploads u
+    WHERE u.claimed_at IS NULL
+      AND u.cleanup_claim_id IS NULL
+      AND u.created_at < now() - p_older_than
+    ORDER BY u.created_at
+    LIMIT v_lim
+    FOR UPDATE SKIP LOCKED
+  ),
+  updated AS (
+    UPDATE public.quick_task_uploads u
+    SET
+      cleanup_claim_id = v_claim_id,
+      cleanup_claimed_at = now(),
+      cleanup_attempts = u.cleanup_attempts + 1
+    FROM picked p
+    WHERE u.id = p.id
+      AND u.claimed_at IS NULL
+      AND u.cleanup_claim_id IS NULL
+    RETURNING u.storage_path, u.cleanup_attempts
+  )
+  SELECT
+    coalesce(array_agg(storage_path), ARRAY[]::text[]),
+    count(*) FILTER (WHERE cleanup_attempts >= 5)::integer
+  INTO v_paths, v_poison_count
+  FROM updated;
+
+  RETURN jsonb_build_object(
+    'claim_id', v_claim_id,
+    'paths', to_jsonb(COALESCE(v_paths, ARRAY[]::text[])),
+    'path_count', coalesce(array_length(v_paths, 1), 0),
+    'high_attempt_row_count', COALESCE(v_poison_count, 0)
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."claim_orphaned_quick_task_uploads_for_cleanup"("p_older_than" interval, "p_limit" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."claim_orphaned_quick_task_uploads_for_cleanup"("p_older_than" interval, "p_limit" integer) IS 'Marks eligible orphan registry rows for cleanup; does not delete rows until Storage succeeds.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."claim_quick_task_uploads_for_booking"("p_booking_id" "uuid", "p_selected_tasks" "jsonb") RETURNS integer
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -4452,10 +4591,10 @@ BEGIN
       USING ERRCODE = 'no_data_found';
   END IF;
 
-  IF NOT (
-    public.is_admin(v_uid)
-    OR v_booking.cleaner_id = v_uid
-    OR v_booking.direct_assigned_cleaner_id = v_uid
+  IF NOT public.is_authorized_quick_tasks_worker(
+    v_booking.cleaner_id,
+    v_booking.direct_assigned_cleaner_id,
+    v_uid
   ) THEN
     RAISE EXCEPTION 'Not allowed to complete this Quick Task'
       USING ERRCODE = '42501';
@@ -4505,6 +4644,13 @@ BEGIN
     completed_at = now(),
     updated_at = now()
   WHERE id = v_line.id;
+
+  IF v_booking.status = 'arrived' THEN
+    UPDATE public.bookings
+    SET status = 'in_progress', updated_at = now(), last_updated = now()
+    WHERE id = v_booking.id;
+    v_booking.status := 'in_progress';
+  END IF;
 
   SELECT count(*)::integer
   INTO v_remaining
@@ -4563,10 +4709,17 @@ BEGIN
   SELECT * INTO v_row
   FROM public.bookings
   WHERE id = p_booking_id
-    AND cleaner_id = v_uid
   FOR UPDATE;
 
   IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF NOT public.is_authorized_quick_tasks_worker(
+    v_row.cleaner_id,
+    v_row.direct_assigned_cleaner_id,
+    v_uid
+  ) THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_found');
   END IF;
 
@@ -4588,13 +4741,15 @@ BEGIN
     );
   END IF;
 
-  v_missing := public._booking_job_photo_missing_required(p_booking_id);
-  IF array_length(v_missing, 1) IS NOT NULL THEN
-    RETURN jsonb_build_object(
-      'success', false,
-      'error', 'JOB_PHOTOS_INCOMPLETE',
-      'missing_types', to_jsonb(v_missing)
-    );
+  IF COALESCE(v_row.is_quick_tasks, false) IS NOT TRUE THEN
+    v_missing := public._booking_job_photo_missing_required(p_booking_id);
+    IF array_length(v_missing, 1) IS NOT NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'JOB_PHOTOS_INCOMPLETE',
+        'missing_types', to_jsonb(v_missing)
+      );
+    END IF;
   END IF;
 
   IF p_customer_rating IS NOT NULL THEN
@@ -8554,7 +8709,7 @@ $$;
 ALTER FUNCTION "public"."fetch_cleaner_earnings"("p_user_id" "uuid", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[], "p_claim_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -8565,21 +8720,29 @@ BEGIN
     RETURN jsonb_build_object('deleted_rows', 0);
   END IF;
 
-  -- Only remove still-unclaimed rows. Claimed booking media must never be finalized.
-  DELETE FROM public.quick_task_uploads
-  WHERE storage_path = ANY (p_paths)
-    AND claimed_at IS NULL;
+  IF p_claim_id IS NULL THEN
+    DELETE FROM public.quick_task_uploads
+    WHERE storage_path = ANY (p_paths)
+      AND claimed_at IS NULL
+      AND cleanup_claim_id IS NULL;
+  ELSE
+    DELETE FROM public.quick_task_uploads
+    WHERE storage_path = ANY (p_paths)
+      AND claimed_at IS NULL
+      AND cleanup_claim_id = p_claim_id;
+  END IF;
+
   GET DIAGNOSTICS v_deleted_rows = ROW_COUNT;
 
-  RETURN jsonb_build_object('deleted_rows', v_deleted_rows);
+  RETURN jsonb_build_object('deleted_rows', v_deleted_rows, 'claim_id', p_claim_id);
 END;
 $$;
 
 
-ALTER FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) OWNER TO "postgres";
+ALTER FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[], "p_claim_id" "uuid") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) IS 'Deletes unclaimed quick_task_uploads rows after Storage API removal succeeds. Never deletes claimed booking photos.';
+COMMENT ON FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[], "p_claim_id" "uuid") IS 'Deletes registry rows after Storage API removal; optional claim_id enforces cleanup batch.';
 
 
 
@@ -12401,6 +12564,30 @@ $$;
 ALTER FUNCTION "public"."is_admin"("user_uuid" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."is_authorized_quick_tasks_worker"("p_cleaner_id" "uuid", "p_direct_assigned_cleaner_id" "uuid", "p_worker_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    p_worker_id IS NOT NULL
+    AND (
+      public.is_admin(p_worker_id)
+      OR p_cleaner_id = p_worker_id
+      OR (
+        p_cleaner_id IS NULL
+        AND p_direct_assigned_cleaner_id = p_worker_id
+      )
+    );
+$$;
+
+
+ALTER FUNCTION "public"."is_authorized_quick_tasks_worker"("p_cleaner_id" "uuid", "p_direct_assigned_cleaner_id" "uuid", "p_worker_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."is_authorized_quick_tasks_worker"("p_cleaner_id" "uuid", "p_direct_assigned_cleaner_id" "uuid", "p_worker_id" "uuid") IS 'Quick Tasks job worker: assigned cleaner_id, or direct_assigned only when cleaner_id is unset.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."is_co_cleaner_background_check_eligible"("p_user_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -12816,7 +13003,7 @@ ALTER FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid") 
 
 
 CREATE OR REPLACE FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval DEFAULT '24:00:00'::interval, "p_limit" integer DEFAULT 200) RETURNS "jsonb"
-    LANGUAGE "plpgsql" SECURITY DEFINER
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
 DECLARE
@@ -12828,6 +13015,7 @@ BEGIN
     SELECT storage_path
     FROM public.quick_task_uploads
     WHERE claimed_at IS NULL
+      AND cleanup_claim_id IS NULL
       AND created_at < now() - p_older_than
     ORDER BY created_at
     LIMIT greatest(1, least(COALESCE(p_limit, 200), 1000))
@@ -12844,7 +13032,7 @@ $$;
 ALTER FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) IS 'Returns unclaimed Quick Tasks upload paths eligible for Storage API deletion. Does not delete objects.';
+COMMENT ON FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) IS 'Read-only orphan path listing for dry runs; stale claim recovery runs in claim_orphaned only.';
 
 
 
@@ -15965,6 +16153,36 @@ $$;
 ALTER FUNCTION "public"."release_cleaner_hold_15min"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."release_orphaned_quick_task_upload_claim"("p_claim_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_released integer := 0;
+BEGIN
+  IF p_claim_id IS NULL THEN
+    RETURN jsonb_build_object('released_rows', 0);
+  END IF;
+
+  UPDATE public.quick_task_uploads
+  SET cleanup_claim_id = NULL, cleanup_claimed_at = NULL
+  WHERE cleanup_claim_id = p_claim_id
+    AND claimed_at IS NULL;
+
+  GET DIAGNOSTICS v_released = ROW_COUNT;
+
+  RETURN jsonb_build_object('released_rows', v_released, 'claim_id', p_claim_id);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."release_orphaned_quick_task_upload_claim"("p_claim_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."release_orphaned_quick_task_upload_claim"("p_claim_id" "uuid") IS 'Releases cleanup claim so rows are discoverable again after Storage failure.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."release_own_welcome_promotion_reservation"("p_booking_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -17599,10 +17817,10 @@ BEGIN
   WHERE id = v_line.booking_id
   FOR UPDATE;
 
-  IF NOT (
-    public.is_admin(v_uid)
-    OR v_booking.cleaner_id = v_uid
-    OR v_booking.direct_assigned_cleaner_id = v_uid
+  IF NOT public.is_authorized_quick_tasks_worker(
+    v_booking.cleaner_id,
+    v_booking.direct_assigned_cleaner_id,
+    v_uid
   ) THEN
     RAISE EXCEPTION 'Not allowed'
       USING ERRCODE = '42501';
@@ -19876,6 +20094,7 @@ CREATE TABLE IF NOT EXISTS "public"."admin_booking_schedule_groups" (
     "full_month_visit_count" integer,
     "create_notify_customer_claimed_at" timestamp with time zone,
     "create_notify_worker_claimed_at" timestamp with time zone,
+    "customer_invoice_seq" integer,
     CONSTRAINT "admin_booking_schedule_groups_check" CHECK (("period_start" <= "period_end")),
     CONSTRAINT "admin_booking_schedule_groups_check1" CHECK ((("platform_fee_minor" + "cleaner_earnings_minor") = "monthly_amount_minor")),
     CONSTRAINT "admin_booking_schedule_groups_cleaner_earnings_minor_check" CHECK (("cleaner_earnings_minor" >= 0)),
@@ -19891,7 +20110,8 @@ CREATE TABLE IF NOT EXISTS "public"."admin_booking_schedule_groups" (
     CONSTRAINT "admin_booking_schedule_groups_status_check" CHECK (("status" = ANY (ARRAY['open'::"text", 'paid'::"text", 'cancelled'::"text"]))),
     CONSTRAINT "admin_booking_schedule_groups_visit_counts_ordered" CHECK ((("period_visit_count" IS NULL) OR ("full_month_visit_count" IS NULL) OR ("period_visit_count" <= "full_month_visit_count"))),
     CONSTRAINT "admin_booking_schedule_groups_weekdays_iso" CHECK (("weekdays" <@ ARRAY[1, 2, 3, 4, 5, 6, 7])),
-    CONSTRAINT "admin_booking_schedule_groups_weekdays_nonempty" CHECK (("cardinality"("weekdays") > 0))
+    CONSTRAINT "admin_booking_schedule_groups_weekdays_nonempty" CHECK (("cardinality"("weekdays") > 0)),
+    CONSTRAINT "admin_groups_customer_invoice_seq_positive" CHECK ((("customer_invoice_seq" IS NULL) OR ("customer_invoice_seq" > 0)))
 );
 
 
@@ -19935,6 +20155,10 @@ COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."create_notify_custom
 
 
 COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."create_notify_worker_claimed_at" IS 'In-flight claim for worker create-notify. Cleared on send failure; stale claims may be reclaimed.';
+
+
+
+COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."customer_invoice_seq" IS 'Sticky incremental invoice sequence for monthly schedule receipts (display: PSK_INSTACLN_#### with min-width 4 zero-pad). Global uniqueness depends on allocation RPCs only — do not write this column directly.';
 
 
 
@@ -20359,12 +20583,14 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "cleaner_reminder_claimed_at" timestamp with time zone,
     "customer_reminder_last_error" "text",
     "cleaner_reminder_last_error" "text",
+    "customer_invoice_seq" integer,
     CONSTRAINT "bookings_assignment_phase_check" CHECK ((("assignment_phase" IS NULL) OR ("assignment_phase" = ANY (ARRAY['exclusive'::"text", 'broadcast'::"text", 'accepted'::"text"])))),
     CONSTRAINT "bookings_cancellation_tier_check" CHECK ((("cancellation_tier" IS NULL) OR ("cancellation_tier" = ANY (ARRAY['full_refund'::"text", 'partial_refund'::"text", 'no_refund'::"text"])))),
     CONSTRAINT "bookings_cancelled_by_role_check" CHECK ((("cancelled_by_role" IS NULL) OR ("cancelled_by_role" = ANY (ARRAY['customer'::"text", 'cleaner'::"text", 'admin'::"text", 'platform'::"text"])))),
     CONSTRAINT "bookings_core_amount_nonnegative_check" CHECK ((("core_amount_minor" IS NULL) OR ("core_amount_minor" >= 0))),
     CONSTRAINT "bookings_customer_cannot_be_cleaner" CHECK ((("cleaner_id" IS NULL) OR ("customer_id" IS NULL) OR ("cleaner_id" <> "customer_id"))),
     CONSTRAINT "bookings_customer_cannot_be_direct_assigned_cleaner" CHECK ((("direct_assigned_cleaner_id" IS NULL) OR ("customer_id" IS NULL) OR ("direct_assigned_cleaner_id" <> "customer_id"))),
+    CONSTRAINT "bookings_customer_invoice_seq_positive" CHECK ((("customer_invoice_seq" IS NULL) OR ("customer_invoice_seq" > 0))),
     CONSTRAINT "bookings_duration_hours_valid" CHECK ((("duration_hours" > (0)::numeric) AND ("duration_hours" <= (24)::numeric))),
     CONSTRAINT "bookings_final_amount_nonnegative_check" CHECK ((("final_amount_minor" IS NULL) OR ("final_amount_minor" >= 0))),
     CONSTRAINT "bookings_payment_split_type_check" CHECK ((("payment_split_type" IS NULL) OR ("payment_split_type" = ANY (ARRAY['split_code'::"text", 'percentage'::"text", 'flat'::"text"])))),
@@ -20595,6 +20821,10 @@ COMMENT ON COLUMN "public"."bookings"."customer_reminder_claimed_at" IS 'In-flig
 
 
 COMMENT ON COLUMN "public"."bookings"."cleaner_reminder_claimed_at" IS 'In-flight claim for cleaner day-before reminder. Same semantics as customer_reminder_claimed_at.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."customer_invoice_seq" IS 'Sticky incremental invoice sequence for customer receipts (display: PSK_INSTACLN_#### with min-width 4 zero-pad). Global uniqueness across bookings + schedule groups depends on allocate_booking_customer_invoice_seq / allocate_schedule_group_customer_invoice_seq only — do not write this column directly.';
 
 
 
@@ -21061,6 +21291,22 @@ CREATE OR REPLACE VIEW "public"."customer_bookings_view" AS
 
 
 ALTER VIEW "public"."customer_bookings_view" OWNER TO "postgres";
+
+
+CREATE SEQUENCE IF NOT EXISTS "public"."customer_invoice_seq"
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE "public"."customer_invoice_seq" OWNER TO "postgres";
+
+
+COMMENT ON SEQUENCE "public"."customer_invoice_seq" IS 'Shared customer invoice counter for bookings and admin_booking_schedule_groups. No maxvalue; display format is minimum-width padStart(4), so values past 9999 become PSK_INSTACLN_10000 etc.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."customer_risk_admin_actions" (
@@ -22195,6 +22441,9 @@ CREATE TABLE IF NOT EXISTS "public"."quick_task_uploads" (
     "booking_id" "uuid",
     "claimed_at" timestamp with time zone,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "cleanup_claimed_at" timestamp with time zone,
+    "cleanup_claim_id" "uuid",
+    "cleanup_attempts" integer DEFAULT 0 NOT NULL,
     CONSTRAINT "quick_task_uploads_claim_consistency" CHECK (((("claimed_at" IS NULL) AND ("booking_id" IS NULL)) OR (("claimed_at" IS NOT NULL) AND ("booking_id" IS NOT NULL)))),
     CONSTRAINT "quick_task_uploads_path_shape" CHECK (("storage_path" ~ '^[0-9a-f-]{36}/[A-Za-z0-9_.-]+\.(jpg|jpeg|png|webp)$'::"text"))
 );
@@ -22204,6 +22453,14 @@ ALTER TABLE "public"."quick_task_uploads" OWNER TO "postgres";
 
 
 COMMENT ON TABLE "public"."quick_task_uploads" IS 'Pre-booking Quick Tasks photo uploads. Claimed when attached to a booking; unclaimed rows are eligible for cleanup.';
+
+
+
+COMMENT ON COLUMN "public"."quick_task_uploads"."cleanup_claimed_at" IS 'When cleanup claimed this row; claims older than 30 minutes become eligible again.';
+
+
+
+COMMENT ON COLUMN "public"."quick_task_uploads"."cleanup_claim_id" IS 'Batch id while janitor holds rows between Storage deletion and registry finalize.';
 
 
 
@@ -23560,6 +23817,10 @@ CREATE INDEX "admin_cash_payouts_cleaner_created_idx" ON "public"."admin_cash_pa
 
 
 
+CREATE UNIQUE INDEX "admin_schedule_groups_customer_invoice_seq_uidx" ON "public"."admin_booking_schedule_groups" USING "btree" ("customer_invoice_seq") WHERE ("customer_invoice_seq" IS NOT NULL);
+
+
+
 CREATE INDEX "auth_identity_lookup_email_normalized_idx" ON "public"."auth_identity_lookup" USING "btree" ("email_normalized");
 
 
@@ -23609,6 +23870,10 @@ CREATE INDEX "bookings_cleaner_reminder_pending_idx" ON "public"."bookings" USIN
 
 
 CREATE UNIQUE INDEX "bookings_customer_idempotency_key_uidx" ON "public"."bookings" USING "btree" ("customer_id", "idempotency_key") WHERE ("idempotency_key" IS NOT NULL);
+
+
+
+CREATE UNIQUE INDEX "bookings_customer_invoice_seq_uidx" ON "public"."bookings" USING "btree" ("customer_invoice_seq") WHERE ("customer_invoice_seq" IS NOT NULL);
 
 
 
@@ -24533,6 +24798,10 @@ CREATE INDEX "property_preferred_cleaners_property_id_idx" ON "public"."property
 
 
 CREATE INDEX "quick_task_uploads_booking_idx" ON "public"."quick_task_uploads" USING "btree" ("booking_id") WHERE ("booking_id" IS NOT NULL);
+
+
+
+CREATE INDEX "quick_task_uploads_orphan_cleanup_eligible_idx" ON "public"."quick_task_uploads" USING "btree" ("created_at") WHERE (("claimed_at" IS NULL) AND ("cleanup_claim_id" IS NULL));
 
 
 
@@ -29326,6 +29595,16 @@ GRANT ALL ON FUNCTION "public"."alike"("anyelement", "text", "text") TO "service
 
 
 
+REVOKE ALL ON FUNCTION "public"."allocate_booking_customer_invoice_seq"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."allocate_booking_customer_invoice_seq"("p_booking_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."allocate_schedule_group_customer_invoice_seq"("p_group_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."allocate_schedule_group_customer_invoice_seq"("p_group_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."any_column_privs_are"("name", "name", "name"[]) TO "postgres";
 GRANT ALL ON FUNCTION "public"."any_column_privs_are"("name", "name", "name"[]) TO "anon";
 GRANT ALL ON FUNCTION "public"."any_column_privs_are"("name", "name", "name"[]) TO "authenticated";
@@ -29890,6 +30169,11 @@ GRANT ALL ON FUNCTION "public"."claim_booking_review_request"("p_booking_id" "uu
 GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."claim_orphaned_quick_task_uploads_for_cleanup"("p_older_than" interval, "p_limit" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."claim_orphaned_quick_task_uploads_for_cleanup"("p_older_than" interval, "p_limit" integer) TO "service_role";
 
 
 
@@ -31363,10 +31647,8 @@ GRANT ALL ON FUNCTION "public"."fetch_cleaner_earnings"("p_user_id" "uuid", "p_s
 
 
 
-REVOKE ALL ON FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) TO "anon";
-GRANT ALL ON FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[]) TO "service_role";
+REVOKE ALL ON FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[], "p_claim_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."finalize_orphaned_quick_task_uploads"("p_paths" "text"[], "p_claim_id" "uuid") TO "service_role";
 
 
 
@@ -36038,6 +36320,11 @@ GRANT ALL ON FUNCTION "public"."is_ancestor_of"("name", "name", "name", "name", 
 
 
 
+REVOKE ALL ON FUNCTION "public"."is_authorized_quick_tasks_worker"("p_cleaner_id" "uuid", "p_direct_assigned_cleaner_id" "uuid", "p_worker_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_authorized_quick_tasks_worker"("p_cleaner_id" "uuid", "p_direct_assigned_cleaner_id" "uuid", "p_worker_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."is_clustered"("name") TO "postgres";
 GRANT ALL ON FUNCTION "public"."is_clustered"("name") TO "anon";
 GRANT ALL ON FUNCTION "public"."is_clustered"("name") TO "authenticated";
@@ -37294,8 +37581,6 @@ GRANT ALL ON FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "
 
 
 REVOKE ALL ON FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) TO "anon";
-GRANT ALL ON FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval, "p_limit" integer) TO "service_role";
 
 
@@ -38653,6 +38938,11 @@ GRANT ALL ON FUNCTION "public"."release_cleaner_after_15min_hold"() TO "service_
 GRANT ALL ON FUNCTION "public"."release_cleaner_hold_15min"() TO "anon";
 GRANT ALL ON FUNCTION "public"."release_cleaner_hold_15min"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."release_cleaner_hold_15min"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."release_orphaned_quick_task_upload_claim"("p_claim_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."release_orphaned_quick_task_upload_claim"("p_claim_id" "uuid") TO "service_role";
 
 
 
@@ -43679,6 +43969,12 @@ GRANT ALL ON TABLE "public"."conversation_list" TO "service_role";
 GRANT ALL ON TABLE "public"."customer_bookings_view" TO "anon";
 GRANT ALL ON TABLE "public"."customer_bookings_view" TO "authenticated";
 GRANT ALL ON TABLE "public"."customer_bookings_view" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."customer_invoice_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."customer_invoice_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."customer_invoice_seq" TO "service_role";
 
 
 
