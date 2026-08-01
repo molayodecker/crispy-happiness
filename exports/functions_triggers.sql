@@ -4906,6 +4906,262 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.admin_reset_exclusive_accept_hold(p_booking_id uuid, p_cleaner_id uuid DEFAULT NULL::uuid, p_admin_user_id uuid DEFAULT NULL::uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_row public.bookings%ROWTYPE;
+  v_cleaner_id uuid;
+  v_hold_minutes integer;
+  v_hold_until timestamptz;
+  v_previous_phase text;
+  v_is_cleaner boolean := false;
+  v_cleaner_status public.cleaner_status;
+  v_cleaner_verified boolean;
+  v_persisted_cleaner_id uuid;
+  v_persisted_phase text;
+  v_persisted_hold_until timestamptz;
+  v_new_status public.booking_status;
+  v_scheduled_start timestamptz;
+BEGIN
+  IF p_booking_id IS NULL THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'invalid_booking_id',
+      'message', 'booking_id is required'
+    );
+  END IF;
+
+  SELECT * INTO v_row
+  FROM public.bookings
+  WHERE id = p_booking_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'booking_not_found',
+      'message', 'Booking not found'
+    );
+  END IF;
+
+  v_previous_phase := v_row.assignment_phase;
+
+  IF lower(COALESCE(v_row.payment_status, '')) <> 'paid' THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'unpaid',
+      'message', 'Booking must be paid before resetting an exclusive hold'
+    );
+  END IF;
+
+  IF v_row.cleaner_accepted_at IS NOT NULL OR v_row.assignment_phase = 'accepted' THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'already_accepted',
+      'message', 'A cleaner has already accepted this booking'
+    );
+  END IF;
+
+  IF v_row.status IS NOT NULL
+     AND lower(v_row.status::text) IN ('cancelled', 'completed') THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'terminal_status',
+      'message', format('Cannot reset hold while booking status is %s', v_row.status)
+    );
+  END IF;
+
+  -- Prefer broadcast / exclusive (including expired exclusive). NULL phase is
+  -- allowed when a direct pick still exists so ops can recover stuck rows.
+  IF v_row.assignment_phase IS NOT NULL
+     AND v_row.assignment_phase NOT IN ('broadcast', 'exclusive') THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'invalid_phase',
+      'message', format('Cannot reset hold from assignment_phase=%s', v_row.assignment_phase)
+    );
+  END IF;
+
+  IF v_row.assignment_phase = 'exclusive'
+     AND v_row.assignment_hold_until IS NOT NULL
+     AND v_row.assignment_hold_until > now() THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'hold_still_active',
+      'message', 'The current exclusive hold has not expired'
+    );
+  END IF;
+
+  v_scheduled_start := COALESCE(
+    v_row.scheduled_at_utc,
+    CASE
+      WHEN v_row.scheduled_date IS NOT NULL AND v_row.scheduled_time IS NOT NULL THEN
+        (
+          (v_row.scheduled_date + v_row.scheduled_time)
+          AT TIME ZONE COALESCE(NULLIF(btrim(v_row.timezone_name), ''), 'UTC')
+        )
+      ELSE NULL
+    END
+  );
+
+  IF v_scheduled_start IS NOT NULL AND v_scheduled_start <= now() THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'booking_in_past',
+      'message', 'Cannot reopen an exclusive hold for a booking whose scheduled start has already passed'
+    );
+  END IF;
+
+  -- Same eligibility helper enforced by trg_init_direct_assignment_on_paid.
+  IF v_row.customer_id IS NOT NULL
+     AND public.customer_trust_can_dispatch_cleaner(v_row.customer_id, p_booking_id) IS NOT TRUE THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'customer_not_dispatchable',
+      'message', 'This customer is not currently eligible for cleaner dispatch'
+    );
+  END IF;
+
+  v_cleaner_id := COALESCE(p_cleaner_id, v_row.direct_assigned_cleaner_id);
+
+  IF v_cleaner_id IS NULL THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'missing_cleaner',
+      'message', 'cleaner_id is required when direct_assigned_cleaner_id is empty'
+    );
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM public.users u WHERE u.id = v_cleaner_id) THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'invalid_cleaner',
+      'message', 'Cleaner user was not found'
+    );
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.user_roles ur
+    WHERE ur.user_id = v_cleaner_id
+      AND ur.role_id = 'cleaner'
+  ) INTO v_is_cleaner;
+
+  IF NOT v_is_cleaner THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'invalid_cleaner',
+      'message', 'Selected user is not an active cleaner'
+    );
+  END IF;
+
+  SELECT cd.status, cd.verified
+  INTO v_cleaner_status, v_cleaner_verified
+  FROM public.cleaner_data cd
+  WHERE cd.user_id = v_cleaner_id;
+
+  IF NOT FOUND
+     OR v_cleaner_status IS DISTINCT FROM 'active'
+     OR v_cleaner_verified IS DISTINCT FROM true THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'invalid_cleaner',
+      'message', 'Selected user is not an active verified cleaner'
+    );
+  END IF;
+
+  v_hold_minutes := public.direct_assignment_hold_minutes(
+    v_row.scheduled_date,
+    v_row.timezone_name
+  );
+  v_hold_until := now() + (v_hold_minutes || ' minutes')::interval;
+
+  UPDATE public.bookings
+  SET
+    cleaner_id = v_cleaner_id,
+    direct_assigned_cleaner_id = v_cleaner_id,
+    assignment_phase = 'exclusive',
+    assignment_hold_until = v_hold_until,
+    assignment_reminder_sent_at = NULL,
+    cleaner_accepted_at = NULL,
+    status = CASE
+      WHEN status = 'pending' THEN 'confirmed'
+      ELSE status
+    END,
+    updated_at = now(),
+    last_updated = now()
+  WHERE id = p_booking_id
+  RETURNING
+    cleaner_id,
+    assignment_phase,
+    assignment_hold_until,
+    status
+  INTO
+    v_persisted_cleaner_id,
+    v_persisted_phase,
+    v_persisted_hold_until,
+    v_new_status;
+
+  IF NOT FOUND
+     OR v_persisted_cleaner_id IS DISTINCT FROM v_cleaner_id
+     OR v_persisted_phase IS DISTINCT FROM 'exclusive'
+     OR v_persisted_hold_until IS DISTINCT FROM v_hold_until THEN
+    RAISE EXCEPTION
+      'Exclusive assignment reset was altered or rejected by a booking trigger';
+  END IF;
+
+  INSERT INTO public.notifications (user_id, type, title, message, data)
+  VALUES (
+    v_cleaner_id,
+    'direct_assignment_offer',
+    'You were selected for a job',
+    format(
+      'You''ve been selected for a job. Accept within %s minutes before it is offered to other cleaners.',
+      v_hold_minutes
+    ),
+    jsonb_build_object(
+      'booking_id', p_booking_id,
+      'bookingId', p_booking_id,
+      'assignment_phase', 'exclusive',
+      'hold_minutes', v_hold_minutes,
+      'source', 'admin_reset_exclusive_hold',
+      'admin_user_id', p_admin_user_id,
+      'previous_phase', v_previous_phase
+    )
+  );
+
+  INSERT INTO public.booking_timeline (booking_id, stage, changed_at, notes)
+  VALUES (
+    p_booking_id,
+    COALESCE(v_new_status, 'confirmed'::public.booking_status),
+    now(),
+    format(
+      'Admin reset exclusive accept hold (admin=%s, cleaner=%s, previous_phase=%s, hold_minutes=%s)',
+      COALESCE(p_admin_user_id::text, 'unknown'),
+      v_cleaner_id::text,
+      COALESCE(v_previous_phase, 'null'),
+      v_hold_minutes::text
+    )
+  );
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'booking_id', p_booking_id,
+    'cleaner_id', v_cleaner_id,
+    'assignment_hold_until', v_hold_until,
+    'hold_minutes', v_hold_minutes,
+    'previous_phase', v_previous_phase,
+    'admin_user_id', p_admin_user_id,
+    'status', v_new_status::text
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.admin_soft_delete_user(p_user_id uuid, p_reason text DEFAULT 'Deleted by admin'::text)
  RETURNS void
  LANGUAGE plpgsql
@@ -26559,7 +26815,7 @@ $function$
 CREATE OR REPLACE FUNCTION public.lookup_sign_in_account(lookup_identifier text)
  RETURNS TABLE(email text, has_account boolean, matched_by text, phone_e164 text, providers text[], supports_email_password boolean, supports_phone_otp boolean, user_id uuid)
  LANGUAGE sql
- STABLE SECURITY DEFINER
+ SECURITY DEFINER
  SET search_path TO 'public', 'auth'
 AS $function$
   WITH input AS (
@@ -38862,6 +39118,14 @@ DECLARE
   v_hold_minutes integer;
 BEGIN
   IF lower(COALESCE(NEW.payment_status, '')) <> 'paid' THEN
+    RETURN NEW;
+  END IF;
+
+  -- Admin exclusive-hold reset must keep cleaner_id; skip dispatch-gate strip.
+  IF coalesce(
+       nullif(current_setting('app.admin_reset_exclusive_hold', true), ''),
+       ''
+     ) = '1' THEN
     RETURN NEW;
   END IF;
 
