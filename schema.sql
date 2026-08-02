@@ -1232,12 +1232,16 @@ BEGIN
     );
   END IF;
 
-  IF v_row.status IS NOT NULL
-     AND lower(v_row.status::text) IN ('cancelled', 'completed') THEN
+  -- Match cleaner_is_eligible_for_exclusive_assignment status gate.
+  IF v_row.status IS NULL
+     OR v_row.status NOT IN ('pending', 'confirmed', 'scheduled') THEN
     RETURN jsonb_build_object(
       'success', false,
-      'error', 'terminal_status',
-      'message', format('Cannot reset hold while booking status is %s', v_row.status)
+      'error', 'non_assignable_status',
+      'message', format(
+        'Cannot reset hold while booking status is %s',
+        COALESCE(v_row.status::text, 'null')
+      )
     );
   END IF;
 
@@ -1268,7 +1272,7 @@ BEGIN
       WHEN v_row.scheduled_date IS NOT NULL AND v_row.scheduled_time IS NOT NULL THEN
         (
           (v_row.scheduled_date + v_row.scheduled_time)
-          AT TIME ZONE COALESCE(NULLIF(btrim(v_row.timezone_name), ''), 'UTC')
+          AT TIME ZONE COALESCE(NULLIF(btrim(v_row.timezone_name), ''), 'Africa/Accra')
         )
       ELSE NULL
     END
@@ -1354,6 +1358,11 @@ BEGIN
     assignment_hold_until = v_hold_until,
     assignment_reminder_sent_at = NULL,
     cleaner_accepted_at = NULL,
+    dispatch_gate_cleared_at = CASE
+      WHEN dispatch_gated_at IS NOT NULL AND dispatch_gate_cleared_at IS NULL
+      THEN now()
+      ELSE dispatch_gate_cleared_at
+    END,
     status = CASE
       WHEN status = 'pending' THEN 'confirmed'
       ELSE status
