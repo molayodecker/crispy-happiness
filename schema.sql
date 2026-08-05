@@ -154,7 +154,8 @@ CREATE TYPE "public"."notification_type" AS ENUM (
     'direct_assignment_reminder',
     'cleaner_assignment_broadcast',
     'cleaner_accepted_assignment',
-    'booking_rescheduled'
+    'booking_rescheduled',
+    'review_request'
 );
 
 
@@ -814,15 +815,21 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'self_booking_not_allowed');
   END IF;
 
-  IF lower(coalesce(v_row.payment_status, '')) <> 'paid' THEN
+  IF NOT public.booking_payment_allows_contact(v_row.payment_status::text) THEN
     RETURN jsonb_build_object('success', false, 'error', 'payment_not_paid');
   END IF;
 
-  IF v_row.cleaner_accepted_at IS NOT NULL OR v_row.assignment_phase = 'accepted' THEN
+  IF v_row.cleaner_accepted_at IS NOT NULL
+     AND v_row.assignment_phase = 'accepted' THEN
     IF v_row.cleaner_id = v_uid THEN
       RETURN jsonb_build_object('success', true, 'already_accepted', true);
     END IF;
     RETURN jsonb_build_object('success', false, 'error', 'already_taken');
+  END IF;
+
+  IF v_row.cleaner_accepted_at IS NOT NULL
+     OR v_row.assignment_phase = 'accepted' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_assignment_state');
   END IF;
 
   IF v_row.assignment_phase = 'exclusive' THEN
@@ -836,6 +843,8 @@ BEGIN
   IF NOT v_eligible THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_eligible');
   END IF;
+
+  PERFORM set_config('app.booking_assignment_write', '1', true);
 
   UPDATE public.bookings
   SET
@@ -2818,6 +2827,91 @@ COMMENT ON FUNCTION "public"."backfill_cleaner_application_approval"("p_user_id"
 
 
 
+CREATE OR REPLACE FUNCTION "public"."booking_allows_conversation_create"("p_booking_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+  SELECT public.booking_allows_participant_contact(
+    p_booking_id,
+    p_customer_id,
+    p_cleaner_id
+  );
+$$;
+
+
+ALTER FUNCTION "public"."booking_allows_conversation_create"("p_booking_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."booking_allows_conversation_create"("p_booking_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") IS 'Alias of booking_allows_participant_contact for booked conversation inserts.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."booking_allows_participant_contact"("p_booking_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") RETURNS boolean
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.bookings%ROWTYPE;
+BEGIN
+  -- Requires an end-user JWT claim. service_role bypasses RLS and should not
+  -- call this helper directly without SET request.jwt.claim.sub.
+  IF v_uid IS NULL THEN
+    RETURN false;
+  END IF;
+
+  IF p_booking_id IS NULL OR p_customer_id IS NULL OR p_cleaner_id IS NULL THEN
+    RETURN false;
+  END IF;
+
+  IF v_uid IS DISTINCT FROM p_customer_id
+     AND v_uid IS DISTINCT FROM p_cleaner_id THEN
+    RETURN false;
+  END IF;
+
+  SELECT * INTO v_row
+  FROM public.bookings
+  WHERE id = p_booking_id;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  IF v_row.customer_id IS DISTINCT FROM p_customer_id
+     OR v_row.cleaner_id IS DISTINCT FROM p_cleaner_id THEN
+    RETURN false;
+  END IF;
+
+  IF NOT public.booking_cleaner_contact_window_open(
+    v_row.status,
+    v_row.scheduled_at_utc,
+    v_row.scheduled_date,
+    v_row.timezone_name
+  ) THEN
+    RETURN false;
+  END IF;
+
+  IF NOT public.booking_payment_allows_contact(v_row.payment_status::text) THEN
+    RETURN false;
+  END IF;
+
+  IF v_row.cleaner_accepted_at IS NULL
+     OR lower(coalesce(v_row.assignment_phase, '')) <> 'accepted' THEN
+    RETURN false;
+  END IF;
+
+  RETURN true;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."booking_allows_participant_contact"("p_booking_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."booking_allows_participant_contact"("p_booking_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") IS 'True when booking participants may create a conversation or send a message: caller is a participant, IDs match, contact window is open, payment allows contact, and cleaner has accepted.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."booking_broadcast_grace_ends_at"("p_scheduled_at_utc" timestamp with time zone, "p_duration_hours" numeric, "p_duration_final" numeric) RETURNS timestamp with time zone
     LANGUAGE "sql" IMMUTABLE
     AS $$
@@ -2984,6 +3078,21 @@ ALTER FUNCTION "public"."booking_masked_location_label"("p_address" "text", "p_l
 
 
 COMMENT ON FUNCTION "public"."booking_masked_location_label"("p_address" "text", "p_lat" double precision, "p_lng" double precision) IS 'Pre-accept offer area label. Uses geo_reverse_cache when available, else extract_area_label_from_address.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."booking_payment_allows_contact"("p_payment_status" "text") RETURNS boolean
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT lower(coalesce(btrim(p_payment_status), ''))
+    IN ('paid', 'success', 'post_paid');
+$$;
+
+
+ALTER FUNCTION "public"."booking_payment_allows_contact"("p_payment_status" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."booking_payment_allows_contact"("p_payment_status" "text") IS 'Shared payment gate for phone + messaging contact. Allows paid, success, and post_paid.';
 
 
 
@@ -3570,12 +3679,32 @@ CREATE OR REPLACE FUNCTION "public"."claim_booking_reminder"("p_booking_id" "uui
 DECLARE
   v_ttl integer := greatest(1, COALESCE(p_claim_ttl_minutes, 45));
   v_id uuid;
+  v_kind text := lower(trim(COALESCE(p_kind, '')));
 BEGIN
   IF p_booking_id IS NULL THEN
     RAISE EXCEPTION 'booking id required' USING ERRCODE = 'check_violation';
   END IF;
 
-  IF p_kind = 'customer' THEN
+  -- Normalize aliases
+  IF v_kind = 'customer_24h' THEN
+    v_kind := 'customer';
+  END IF;
+
+  IF v_kind = 'customer_48h' THEN
+    UPDATE public.bookings b
+    SET
+      customer_reminder_48h_claimed_at = now(),
+      customer_reminder_last_error = NULL,
+      updated_at = now()
+    WHERE b.id = p_booking_id
+      AND b.customer_reminder_48h_sent_at IS NULL
+      AND (
+        b.customer_reminder_48h_claimed_at IS NULL
+        OR b.customer_reminder_48h_claimed_at
+          < now() - make_interval(mins => v_ttl)
+      )
+    RETURNING b.id INTO v_id;
+  ELSIF v_kind = 'customer' THEN
     UPDATE public.bookings b
     SET
       customer_reminder_claimed_at = now(),
@@ -3589,7 +3718,21 @@ BEGIN
           < now() - make_interval(mins => v_ttl)
       )
     RETURNING b.id INTO v_id;
-  ELSIF p_kind = 'cleaner' THEN
+  ELSIF v_kind = 'customer_morning' THEN
+    UPDATE public.bookings b
+    SET
+      customer_reminder_morning_claimed_at = now(),
+      customer_reminder_last_error = NULL,
+      updated_at = now()
+    WHERE b.id = p_booking_id
+      AND b.customer_reminder_morning_sent_at IS NULL
+      AND (
+        b.customer_reminder_morning_claimed_at IS NULL
+        OR b.customer_reminder_morning_claimed_at
+          < now() - make_interval(mins => v_ttl)
+      )
+    RETURNING b.id INTO v_id;
+  ELSIF v_kind = 'cleaner' THEN
     UPDATE public.bookings b
     SET
       cleaner_reminder_claimed_at = now(),
@@ -3605,7 +3748,7 @@ BEGIN
       )
     RETURNING b.id INTO v_id;
   ELSE
-    RAISE EXCEPTION 'invalid reminder kind (expected customer|cleaner)'
+    RAISE EXCEPTION 'invalid reminder kind (expected customer_48h|customer|customer_morning|cleaner)'
       USING ERRCODE = 'check_violation';
   END IF;
 
@@ -3617,7 +3760,7 @@ $$;
 ALTER FUNCTION "public"."claim_booking_reminder"("p_booking_id" "uuid", "p_kind" "text", "p_claim_ttl_minutes" integer) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."claim_booking_reminder"("p_booking_id" "uuid", "p_kind" "text", "p_claim_ttl_minutes" integer) IS 'Atomically claim a booking reminder slot before send. Returns false if already sent or claimed within TTL. service_role only.';
+COMMENT ON FUNCTION "public"."claim_booking_reminder"("p_booking_id" "uuid", "p_kind" "text", "p_claim_ttl_minutes" integer) IS 'Atomically claim a booking reminder stage before send (customer_48h|customer|customer_morning|cleaner). service_role only.';
 
 
 
@@ -4240,7 +4383,7 @@ BEGIN
      OR v_row.cleaner_id IS NOT NULL
      OR v_row.cleaner_accepted_at IS NOT NULL
      OR v_row.assignment_escalated_at IS NOT NULL
-     OR lower(coalesce(v_row.payment_status, '')) <> 'paid'
+     OR NOT public.booking_payment_allows_contact(v_row.payment_status::text)
      OR v_row.status NOT IN ('pending', 'confirmed', 'scheduled')
      OR v_row.location_coordinates IS NULL
      OR v_row.scheduled_date IS NULL
@@ -4251,6 +4394,8 @@ BEGIN
      ) <= now() THEN
     RETURN false;
   END IF;
+
+  PERFORM set_config('app.system_cleaner_discovery', '1', true);
 
   v_lat := ST_Y(v_row.location_coordinates::geometry);
   v_lng := ST_X(v_row.location_coordinates::geometry);
@@ -4303,7 +4448,7 @@ BEGIN
 
   RETURN v_row.assignment_phase = 'exclusive'
     AND v_row.cleaner_accepted_at IS NULL
-    AND lower(coalesce(v_row.payment_status, '')) = 'paid'
+    AND public.booking_payment_allows_contact(v_row.payment_status::text)
     AND v_row.status IN ('pending', 'confirmed', 'scheduled')
     AND (
       v_row.direct_assigned_cleaner_id = p_cleaner_id
@@ -7490,6 +7635,43 @@ $$;
 ALTER FUNCTION "public"."confirm_zero_amount_booking"("p_booking_id" "uuid") OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."conversations" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "customer_id" "uuid" NOT NULL,
+    "cleaner_id" "uuid" NOT NULL,
+    "booking_id" "uuid",
+    "last_message_at" timestamp with time zone DEFAULT "now"(),
+    "metadata" "jsonb" DEFAULT '{}'::"jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."conversations" OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."conversation_row_public_json"("p_row" "public"."conversations") RETURNS "jsonb"
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT jsonb_build_object(
+    'id', p_row.id,
+    'customer_id', p_row.customer_id,
+    'cleaner_id', p_row.cleaner_id,
+    'booking_id', p_row.booking_id,
+    'last_message_at', p_row.last_message_at,
+    'created_at', p_row.created_at,
+    'updated_at', p_row.updated_at
+  );
+$$;
+
+
+ALTER FUNCTION "public"."conversation_row_public_json"("p_row" "public"."conversations") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."conversation_row_public_json"("p_row" "public"."conversations") IS 'Allowlisted conversation columns for mobile RPC responses.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."count_admin_schedule_weekday_occurrences"("p_weekdays" integer[], "p_start" "date", "p_end" "date") RETURNS integer
     LANGUAGE "plpgsql" IMMUTABLE STRICT
     SET "search_path" TO 'public'
@@ -10524,6 +10706,18 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'not_found');
   END IF;
 
+  -- Authorize before leaking schedule/payment/accept state.
+  IF v_role = 'site' THEN
+    IF v_uid IS DISTINCT FROM v_row.cleaner_id THEN
+      RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+    END IF;
+  ELSE
+    IF v_uid IS DISTINCT FROM v_row.customer_id
+       AND v_uid IS DISTINCT FROM v_row.cleaner_id THEN
+      RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+    END IF;
+  END IF;
+
   IF NOT public.booking_cleaner_contact_window_open(
     v_row.status,
     v_row.scheduled_at_utc,
@@ -10533,15 +10727,16 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
   END IF;
 
-  IF lower(coalesce(v_row.payment_status::text, '')) NOT IN ('paid', 'success', 'post_paid') THEN
+  IF NOT public.booking_payment_allows_contact(v_row.payment_status::text) THEN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
   END IF;
 
-  IF v_role = 'site' THEN
-    IF v_uid IS DISTINCT FROM v_row.cleaner_id THEN
-      RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
-    END IF;
+  IF v_row.cleaner_accepted_at IS NULL
+     OR lower(coalesce(v_row.assignment_phase, '')) <> 'accepted' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'assignment_pending');
+  END IF;
 
+  IF v_role = 'site' THEN
     IF COALESCE(v_row.booking_for_self, true) = true THEN
       RETURN jsonb_build_object('success', false, 'error', 'site_contact_unavailable');
     END IF;
@@ -10594,6 +10789,10 @@ $$;
 
 
 ALTER FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid", "p_contact_role" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid", "p_contact_role" "text") IS 'Returns counterpart or site-contact phone for paid/post_paid active bookings only after the cleaner has accepted the assignment (cleaner_accepted_at set and assignment_phase=accepted).';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."get_booking_payment_snapshot"("p_booking_id" "uuid") RETURNS TABLE("booking_id" "uuid", "final_amount_minor" integer, "currency" "text", "payment_status" "text", "status" "public"."booking_status", "booking_cover" boolean, "booking_cover_amount" numeric, "platform_fee" numeric, "work_rate_ghs_per_hour" numeric, "pricing_version" "text", "promotion_id" "uuid", "promotion_slug" "text", "promotion_discount_minor" integer, "subscription_recurring_amount_minor" integer, "cleaner_earnings_minor" integer)
@@ -10765,7 +10964,8 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'not_found');
   END IF;
 
-  IF v_row.cleaner_accepted_at IS NOT NULL OR v_row.assignment_phase = 'accepted' THEN
+  IF v_row.cleaner_accepted_at IS NOT NULL
+     AND v_row.assignment_phase = 'accepted' THEN
     IF v_row.cleaner_id = v_uid THEN
       RETURN jsonb_build_object(
         'success', true,
@@ -10774,6 +10974,11 @@ BEGIN
       );
     END IF;
     RETURN jsonb_build_object('success', false, 'error', 'already_taken');
+  END IF;
+
+  IF v_row.cleaner_accepted_at IS NOT NULL
+     OR v_row.assignment_phase = 'accepted' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_assignment_state');
   END IF;
 
   IF v_row.assignment_phase = 'exclusive' THEN
@@ -11908,6 +12113,122 @@ LIMIT 200;$$;
 ALTER FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" double precision, "p_longitude" double precision, "p_radius_meters" integer, "p_scheduled_date" "date", "p_start_time" time without time zone, "p_duration_hours" integer) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.bookings%ROWTYPE;
+  v_conv public.conversations%ROWTYPE;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_booking_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  -- Lock booking so reassignment cannot flip mid decision/insert.
+  SELECT *
+  INTO v_row
+  FROM public.bookings
+  WHERE id = p_booking_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  -- Authorize before classifying business-rule denials.
+  IF v_uid IS DISTINCT FROM v_row.customer_id
+     AND v_uid IS DISTINCT FROM v_row.cleaner_id THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+  END IF;
+
+  IF v_row.cleaner_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'no_cleaner');
+  END IF;
+
+  IF NOT public.booking_cleaner_contact_window_open(
+    v_row.status,
+    v_row.scheduled_at_utc,
+    v_row.scheduled_date,
+    v_row.timezone_name
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
+  END IF;
+
+  IF NOT public.booking_payment_allows_contact(v_row.payment_status::text) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'payment_incomplete');
+  END IF;
+
+  IF v_row.cleaner_accepted_at IS NULL
+     OR lower(coalesce(v_row.assignment_phase, '')) <> 'accepted' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'assignment_pending');
+  END IF;
+
+  -- Defense in depth: shared helper must agree (IDs + window + payment + accept).
+  IF NOT public.booking_allows_participant_contact(
+    v_row.id,
+    v_row.customer_id,
+    v_row.cleaner_id
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
+  END IF;
+
+  SELECT *
+  INTO v_conv
+  FROM public.conversations
+  WHERE booking_id = v_row.id
+    AND customer_id = v_row.customer_id
+    AND cleaner_id = v_row.cleaner_id
+  ORDER BY created_at ASC
+  LIMIT 1;
+
+  IF FOUND THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'conversation', public.conversation_row_public_json(v_conv)
+    );
+  END IF;
+
+  BEGIN
+    INSERT INTO public.conversations (customer_id, cleaner_id, booking_id)
+    VALUES (v_row.customer_id, v_row.cleaner_id, v_row.id)
+    RETURNING * INTO v_conv;
+  EXCEPTION
+    WHEN unique_violation THEN
+      SELECT *
+      INTO v_conv
+      FROM public.conversations
+      WHERE booking_id = v_row.id
+        AND customer_id = v_row.customer_id
+        AND cleaner_id = v_row.cleaner_id
+      ORDER BY created_at ASC
+      LIMIT 1;
+
+      IF NOT FOUND THEN
+        RETURN jsonb_build_object('success', false, 'error', 'unavailable');
+      END IF;
+  END;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'conversation', public.conversation_row_public_json(v_conv)
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uuid") IS 'Atomically validates active booking contact and returns or creates the booked conversation for the current cleaner assignment.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."get_own_cleaner_location"() RETURNS "jsonb"
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public', 'pg_temp'
@@ -12497,6 +12818,52 @@ $$;
 ALTER FUNCTION "public"."get_welcome_offer_eligibility"("p_customer_id" "uuid", "p_promotion_slug" "text", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."guard_booking_assignment_column_writes"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  IF auth.role() = 'service_role' THEN
+    RETURN NEW;
+  END IF;
+
+  IF coalesce(nullif(current_setting('app.booking_assignment_write', true), ''), '') = '1' THEN
+    RETURN NEW;
+  END IF;
+
+  -- pg_cron / psql / migrations typically have no JWT role.
+  IF auth.role() IS DISTINCT FROM 'authenticated'
+     AND auth.role() IS DISTINCT FROM 'anon' THEN
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.cleaner_accepted_at IS NOT NULL OR NEW.assignment_phase = 'accepted' THEN
+      RAISE EXCEPTION
+        'cleaner assignment acceptance columns are server-only (use accept_booking_assignment)'
+        USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF NEW.cleaner_accepted_at IS DISTINCT FROM OLD.cleaner_accepted_at
+     OR NEW.assignment_phase IS DISTINCT FROM OLD.assignment_phase THEN
+    RAISE EXCEPTION
+      'cleaner assignment acceptance columns are server-only (use accept_booking_assignment)'
+      USING ERRCODE = '42501';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."guard_booking_assignment_column_writes"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."guard_booking_assignment_column_writes"() IS 'Blocks authenticated/anon clients from writing cleaner_accepted_at or assignment_phase; service_role, app.booking_assignment_write=1, and non-client sessions may write.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."guard_booking_payment_status_writes"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -12693,6 +13060,7 @@ CREATE OR REPLACE FUNCTION "public"."inbox_notification_android_channel"("p_type
     WHEN 'booking_confirmed' THEN 'new_booking'
     WHEN 'booking_cancelled' THEN 'booking_cancellations'
     WHEN 'booking_rescheduled' THEN 'booking_updates'
+    WHEN 'review_request' THEN 'booking_updates'
     WHEN 'unassigned_booking_escalated' THEN 'booking_cancellations'
     WHEN 'new_message' THEN 'messages'
     WHEN 'cleaner_en_route' THEN 'cleaner_milestones'
@@ -12703,6 +13071,10 @@ $$;
 
 
 ALTER FUNCTION "public"."inbox_notification_android_channel"("p_type" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."inbox_notification_android_channel"("p_type" "text") IS 'Expo Android channel for inbox-triggered pushes; review_request uses booking_updates.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."inbox_notification_interruption_level"("p_type" "text") RETURNS "text"
@@ -13171,6 +13543,8 @@ BEGIN
     RETURN;
   END IF;
 
+  PERFORM set_config('app.system_cleaner_discovery', '1', true);
+
   RETURN QUERY
   SELECT b.id
   FROM public.bookings b
@@ -13178,7 +13552,7 @@ BEGIN
     AND b.cleaner_id IS NULL
     AND b.cleaner_accepted_at IS NULL
     AND b.assignment_escalated_at IS NULL
-    AND lower(COALESCE(b.payment_status, '')) = 'paid'
+    AND public.booking_payment_allows_contact(b.payment_status::text)
     AND b.status IN ('pending', 'confirmed', 'scheduled')
     AND b.location_coordinates IS NOT NULL
     AND b.scheduled_date IS NOT NULL
@@ -14286,7 +14660,8 @@ BEGIN
     'new_message',
     'payment_received',
     'cleaner_en_route',
-    'cleaner_arrived'
+    'cleaner_arrived',
+    'review_request'
   ) THEN
     RETURN NEW;
   END IF;
@@ -14309,6 +14684,10 @@ $$;
 
 
 ALTER FUNCTION "public"."notify_inbox_notification_push"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."notify_inbox_notification_push"() IS 'AFTER INSERT on notifications: queue Expo push unless the type is handled by a dedicated sender (includes review_request).';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."notify_new_message_trigger"() RETURNS "trigger"
@@ -20853,6 +21232,10 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "customer_reminder_last_error" "text",
     "cleaner_reminder_last_error" "text",
     "customer_invoice_seq" integer,
+    "customer_reminder_48h_sent_at" timestamp with time zone,
+    "customer_reminder_48h_claimed_at" timestamp with time zone,
+    "customer_reminder_morning_sent_at" timestamp with time zone,
+    "customer_reminder_morning_claimed_at" timestamp with time zone,
     CONSTRAINT "bookings_assignment_phase_check" CHECK ((("assignment_phase" IS NULL) OR ("assignment_phase" = ANY (ARRAY['exclusive'::"text", 'broadcast'::"text", 'accepted'::"text"])))),
     CONSTRAINT "bookings_cancellation_tier_check" CHECK ((("cancellation_tier" IS NULL) OR ("cancellation_tier" = ANY (ARRAY['full_refund'::"text", 'partial_refund'::"text", 'no_refund'::"text"])))),
     CONSTRAINT "bookings_cancelled_by_role_check" CHECK ((("cancelled_by_role" IS NULL) OR ("cancelled_by_role" = ANY (ARRAY['customer'::"text", 'cleaner'::"text", 'admin'::"text", 'platform'::"text"])))),
@@ -20953,7 +21336,7 @@ COMMENT ON COLUMN "public"."bookings"."vendor_paystack_share" IS 'Ready-to-send 
 
 
 
-COMMENT ON COLUMN "public"."bookings"."customer_reminder_sent_at" IS 'Set only after at least one customer reminder channel succeeds.';
+COMMENT ON COLUMN "public"."bookings"."customer_reminder_sent_at" IS 'Set after customer ~24h-before reminder delivers on at least one channel.';
 
 
 
@@ -21094,6 +21477,22 @@ COMMENT ON COLUMN "public"."bookings"."cleaner_reminder_claimed_at" IS 'In-fligh
 
 
 COMMENT ON COLUMN "public"."bookings"."customer_invoice_seq" IS 'Sticky incremental invoice sequence for customer receipts (display: PSK_INSTACLN_#### with min-width 4 zero-pad). Global uniqueness across bookings + schedule groups depends on allocate_booking_customer_invoice_seq / allocate_schedule_group_customer_invoice_seq only — do not write this column directly.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."customer_reminder_48h_sent_at" IS 'Set after customer ~48h-before reminder delivers on at least one channel.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."customer_reminder_48h_claimed_at" IS 'In-flight claim for customer 48h reminder; TTL allows retry.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."customer_reminder_morning_sent_at" IS 'Set after customer morning-of (~08:00 Africa/Accra) reminder delivers.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."customer_reminder_morning_claimed_at" IS 'In-flight claim for customer morning-of reminder; TTL allows retry.';
 
 
 
@@ -21476,21 +21875,6 @@ CREATE TABLE IF NOT EXISTS "public"."co_cleaner_relationships" (
 
 
 ALTER TABLE "public"."co_cleaner_relationships" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."conversations" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "customer_id" "uuid" NOT NULL,
-    "cleaner_id" "uuid" NOT NULL,
-    "booking_id" "uuid",
-    "last_message_at" timestamp with time zone DEFAULT "now"(),
-    "metadata" "jsonb" DEFAULT '{}'::"jsonb",
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
-);
-
-
-ALTER TABLE "public"."conversations" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."messages" (
@@ -25254,6 +25638,10 @@ CREATE OR REPLACE TRIGGER "trg_set_cleaner_assigned_at_for_hold" BEFORE INSERT O
 
 
 
+CREATE OR REPLACE TRIGGER "trg_zz_guard_booking_assignment_column_writes" BEFORE INSERT OR UPDATE ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."guard_booking_assignment_column_writes"();
+
+
+
 CREATE OR REPLACE TRIGGER "trigger_calculate_booking_period" BEFORE INSERT OR UPDATE OF "scheduled_date", "scheduled_time", "duration_hours", "timezone" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."calculate_booking_period"();
 
 
@@ -26158,7 +26546,7 @@ CREATE POLICY "Everyone can view testimonials" ON "public"."testimonials" FOR SE
 
 
 
-CREATE POLICY "Insert_Own_Conversations" ON "public"."conversations" FOR INSERT WITH CHECK ((("auth"."uid"() = "customer_id") OR ("auth"."uid"() = "cleaner_id")));
+CREATE POLICY "Insert_Own_Conversations" ON "public"."conversations" FOR INSERT TO "authenticated" WITH CHECK (((("auth"."uid"() = "customer_id") OR ("auth"."uid"() = "cleaner_id")) AND ("booking_id" IS NOT NULL) AND "public"."booking_allows_participant_contact"("booking_id", "customer_id", "cleaner_id")));
 
 
 
@@ -26178,9 +26566,9 @@ CREATE POLICY "Public read pricing_rules" ON "public"."pricing_rules" FOR SELECT
 
 
 
-CREATE POLICY "Send_Messages_In_Joined_Convos" ON "public"."messages" FOR INSERT WITH CHECK ((("sender_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
-   FROM "public"."conversations"
-  WHERE (("conversations"."id" = "messages"."conversation_id") AND (("conversations"."customer_id" = "auth"."uid"()) OR ("conversations"."cleaner_id" = "auth"."uid"())))))));
+CREATE POLICY "Send_Messages_In_Joined_Convos" ON "public"."messages" FOR INSERT TO "authenticated" WITH CHECK ((("sender_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."conversations" "c"
+  WHERE (("c"."id" = "messages"."conversation_id") AND (("c"."customer_id" = "auth"."uid"()) OR ("c"."cleaner_id" = "auth"."uid"())) AND ("c"."booking_id" IS NOT NULL) AND "public"."booking_allows_participant_contact"("c"."booking_id", "c"."customer_id", "c"."cleaner_id"))))));
 
 
 
@@ -30066,6 +30454,18 @@ GRANT ALL ON FUNCTION "public"."bag_ne"("text", "text", "text") TO "service_role
 
 
 
+REVOKE ALL ON FUNCTION "public"."booking_allows_conversation_create"("p_booking_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."booking_allows_conversation_create"("p_booking_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."booking_allows_conversation_create"("p_booking_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."booking_allows_participant_contact"("p_booking_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."booking_allows_participant_contact"("p_booking_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."booking_allows_participant_contact"("p_booking_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."booking_broadcast_grace_ends_at"("p_scheduled_at_utc" timestamp with time zone, "p_duration_hours" numeric, "p_duration_final" numeric) TO "anon";
 GRANT ALL ON FUNCTION "public"."booking_broadcast_grace_ends_at"("p_scheduled_at_utc" timestamp with time zone, "p_duration_hours" numeric, "p_duration_final" numeric) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."booking_broadcast_grace_ends_at"("p_scheduled_at_utc" timestamp with time zone, "p_duration_hours" numeric, "p_duration_final" numeric) TO "service_role";
@@ -30116,6 +30516,12 @@ REVOKE ALL ON FUNCTION "public"."booking_masked_location_label"("p_address" "tex
 GRANT ALL ON FUNCTION "public"."booking_masked_location_label"("p_address" "text", "p_lat" double precision, "p_lng" double precision) TO "anon";
 GRANT ALL ON FUNCTION "public"."booking_masked_location_label"("p_address" "text", "p_lat" double precision, "p_lng" double precision) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."booking_masked_location_label"("p_address" "text", "p_lat" double precision, "p_lng" double precision) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."booking_payment_allows_contact"("p_payment_status" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."booking_payment_allows_contact"("p_payment_status" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."booking_payment_allows_contact"("p_payment_status" "text") TO "service_role";
 
 
 
@@ -31305,6 +31711,18 @@ GRANT ALL ON FUNCTION "public"."contains_2d"("public"."geometry", "public"."box2
 GRANT ALL ON FUNCTION "public"."contains_2d"("public"."geometry", "public"."box2df") TO "anon";
 GRANT ALL ON FUNCTION "public"."contains_2d"("public"."geometry", "public"."box2df") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."contains_2d"("public"."geometry", "public"."box2df") TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."conversations" TO "anon";
+GRANT ALL ON TABLE "public"."conversations" TO "authenticated";
+GRANT ALL ON TABLE "public"."conversations" TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."conversation_row_public_json"("p_row" "public"."conversations") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."conversation_row_public_json"("p_row" "public"."conversations") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."conversation_row_public_json"("p_row" "public"."conversations") TO "service_role";
 
 
 
@@ -34389,6 +34807,12 @@ GRANT ALL ON FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" doub
 
 
 
+REVOKE ALL ON FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."get_own_cleaner_location"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_own_cleaner_location"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_own_cleaner_location"() TO "service_role";
@@ -34515,6 +34939,12 @@ GRANT ALL ON FUNCTION "public"."gserialized_gist_sel_nd"("internal", "oid", "int
 GRANT ALL ON FUNCTION "public"."gserialized_gist_sel_nd"("internal", "oid", "internal", integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."gserialized_gist_sel_nd"("internal", "oid", "internal", integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."gserialized_gist_sel_nd"("internal", "oid", "internal", integer) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."guard_booking_assignment_column_writes"() TO "anon";
+GRANT ALL ON FUNCTION "public"."guard_booking_assignment_column_writes"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."guard_booking_assignment_column_writes"() TO "service_role";
 
 
 
@@ -44219,12 +44649,6 @@ GRANT ALL ON TABLE "public"."co_cleaner_invitations" TO "service_role";
 GRANT ALL ON TABLE "public"."co_cleaner_relationships" TO "anon";
 GRANT ALL ON TABLE "public"."co_cleaner_relationships" TO "authenticated";
 GRANT ALL ON TABLE "public"."co_cleaner_relationships" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."conversations" TO "anon";
-GRANT ALL ON TABLE "public"."conversations" TO "authenticated";
-GRANT ALL ON TABLE "public"."conversations" TO "service_role";
 
 
 
