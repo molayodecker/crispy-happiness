@@ -7665,6 +7665,68 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.cascade_cancel_pending_subscription_after_booking_cancel()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_payment text;
+BEGIN
+  IF TG_OP <> 'UPDATE' THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.status IS DISTINCT FROM 'cancelled'::public.booking_status THEN
+    RETURN NEW;
+  END IF;
+
+  IF OLD.status IS NOT DISTINCT FROM 'cancelled'::public.booking_status THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.subscription_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  -- Only cascade for unpaid / never-paid checkouts. Use an allowlist so
+  -- paid-like states (paid, post_paid, refunded, …) preserve the subscription.
+  v_payment := lower(trim(coalesce(NEW.payment_status::text, '')));
+  IF v_payment NOT IN ('', 'pending', 'failed') THEN
+    RETURN NEW;
+  END IF;
+
+  -- Serialize concurrent cancels for the same subscription so two transactions
+  -- cannot each see the other booking as still live and both skip the cancel.
+  PERFORM 1
+  FROM public.subscriptions s
+  WHERE s.id = NEW.subscription_id
+    AND s.customer_id = NEW.customer_id
+    AND lower(coalesce(s.status, '')) = 'pending'
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN NEW;
+  END IF;
+
+  UPDATE public.subscriptions s
+  SET
+    status = 'cancelled',
+    updated_at = now()
+  WHERE s.id = NEW.subscription_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.bookings b
+      WHERE b.subscription_id = s.id
+        AND b.status IS DISTINCT FROM 'cancelled'::public.booking_status
+    );
+
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.cash_dist(money, money)
  RETURNS money
  LANGUAGE c
@@ -38678,6 +38740,492 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.sync_recurring_unpaid_checkout_snapshots(p_booking_id uuid, p_customer_id uuid, p_draft jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_booking public.bookings%ROWTYPE;
+  v_sub public.subscriptions%ROWTYPE;
+  v_payment text;
+  v_updated public.bookings%ROWTYPE;
+  v_pricing record;
+  v_promo_pricing record;
+  v_use_promo boolean := false;
+
+  v_cleaner_id uuid;
+  v_service_id integer;
+  v_title text;
+  v_scheduled_date date;
+  v_scheduled_time time;
+  v_duration_hours_raw numeric;
+  v_address text;
+  v_special_instructions text;
+  v_location_wkt text;
+  v_timezone_name text;
+  v_home_size text;
+  v_extra_task_ids text[];
+  v_include_booking_cover boolean;
+  v_supplies_option text;
+  v_service_duration_option_id uuid;
+  v_direct_assigned_cleaner_id uuid;
+  v_customer_contact_phone text;
+  v_tax_amount numeric;
+  v_duration_adjustment numeric;
+  v_booking_for_self boolean;
+  v_site_contact_name text;
+  v_site_contact_phone text;
+  v_site_contact_relationship text;
+  v_property_type text;
+  v_occupant_present boolean;
+  v_requires_key_or_access_code boolean;
+  v_access_instructions text;
+  v_turnover_guest_checkout_at timestamptz;
+  v_turnover_next_checkin_at timestamptz;
+  v_turnover_linen_handling text;
+  v_turnover_restocking_notes text;
+  v_turnover_source text;
+  v_turnover_opportunity_id uuid;
+  v_property_id uuid;
+  v_promotion_slug text;
+  v_promotion_code text;
+  v_promotion_channel text;
+  v_promotion_lat double precision;
+  v_promotion_lng double precision;
+  v_promotion_code_id uuid;
+
+  v_recurring_amount integer;
+  v_first_charge integer;
+  v_discount_bps integer;
+  v_promotion_id uuid;
+  v_promotion_slug_out text;
+  v_promotion_discount_minor integer;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_booking_id IS NULL OR p_customer_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_ids');
+  END IF;
+
+  IF v_uid IS DISTINCT FROM p_customer_id THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+  END IF;
+
+  IF p_draft IS NULL OR jsonb_typeof(p_draft) <> 'object' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_draft');
+  END IF;
+
+  -- Reject any client attempt to supply derived financial fields.
+  IF p_draft ? 'final_amount_minor'
+     OR p_draft ? 'total_price'
+     OR p_draft ? 'core_amount_minor'
+     OR p_draft ? 'platform_fee'
+     OR p_draft ? 'booking_cover_amount'
+     OR p_draft ? 'cleaner_earnings_minor'
+     OR p_draft ? 'same_day_surcharge_minor'
+     OR p_draft ? 'weekend_surcharge_minor'
+     OR p_draft ? 'recurring_discount_minor'
+     OR p_draft ? 'supplies_allowance_minor'
+     OR p_draft ? 'work_rate_ghs_per_hour'
+     OR p_draft ? 'amount'
+     OR p_draft ? 'recurring_amount_minor'
+     OR p_draft ? 'first_charge_amount_minor'
+     OR p_draft ? 'discount_rate_bps'
+     OR p_draft ? 'pricing_version'
+     OR p_draft ? 'currency'
+     OR p_draft ? 'promotion_discount_minor'
+     OR p_draft ? 'promotion_id'
+     OR p_draft ? 'status'
+     OR p_draft ? 'payment_status' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'financial_fields_not_allowed');
+  END IF;
+
+  SELECT *
+  INTO v_booking
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+    AND b.customer_id = p_customer_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_found');
+  END IF;
+
+  IF v_booking.status IS DISTINCT FROM 'pending'::public.booking_status
+     AND v_booking.status IS DISTINCT FROM 'confirmed'::public.booking_status THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_editable');
+  END IF;
+
+  v_payment := lower(trim(coalesce(v_booking.payment_status::text, '')));
+  IF v_payment NOT IN ('', 'pending', 'failed') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_editable');
+  END IF;
+
+  IF v_booking.subscription_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_subscription_linked');
+  END IF;
+
+  SELECT *
+  INTO v_sub
+  FROM public.subscriptions s
+  WHERE s.id = v_booking.subscription_id
+    AND s.customer_id = p_customer_id
+    AND lower(coalesce(s.status, '')) = 'pending'
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'subscription_not_pending');
+  END IF;
+
+  v_cleaner_id := NULLIF(p_draft->>'cleaner_id', '')::uuid;
+  v_service_id := COALESCE((p_draft->>'service_id')::integer, v_booking.service_id);
+  v_title := COALESCE(NULLIF(p_draft->>'title', ''), v_booking.title);
+  v_scheduled_date := COALESCE((p_draft->>'scheduled_date')::date, v_booking.scheduled_date);
+  v_scheduled_time := COALESCE((p_draft->>'scheduled_time')::time, v_booking.scheduled_time);
+  v_duration_hours_raw := COALESCE(
+    (p_draft->>'duration_hours_raw')::numeric,
+    (p_draft->>'duration_hours')::numeric,
+    v_booking.duration_hours
+  );
+  v_address := COALESCE(NULLIF(p_draft->>'address', ''), v_booking.address);
+  v_special_instructions := CASE
+    WHEN p_draft ? 'special_instructions' THEN p_draft->>'special_instructions'
+    ELSE v_booking.special_instructions
+  END;
+  v_location_wkt := CASE
+    WHEN p_draft ? 'location_coordinates' THEN NULLIF(p_draft->>'location_coordinates', '')
+    ELSE NULL
+  END;
+  v_timezone_name := COALESCE(
+    NULLIF(p_draft->>'timezone_name', ''),
+    v_booking.timezone_name,
+    'Africa/Accra'
+  );
+  v_home_size := CASE
+    WHEN p_draft ? 'home_size' THEN p_draft->>'home_size'
+    ELSE v_booking.home_size
+  END;
+  IF p_draft ? 'extra_task_ids' THEN
+    v_extra_task_ids := ARRAY(
+      SELECT jsonb_array_elements_text(COALESCE(p_draft->'extra_task_ids', '[]'::jsonb))
+    );
+  ELSE
+    v_extra_task_ids := COALESCE(v_booking.extra_task_ids, ARRAY[]::text[]);
+  END IF;
+  v_include_booking_cover := COALESCE((p_draft->>'include_booking_cover')::boolean, true);
+  v_supplies_option := COALESCE(
+    NULLIF(p_draft->>'supplies_option', ''),
+    v_booking.supplies_option,
+    'customer_provided'
+  );
+  v_service_duration_option_id := CASE
+    WHEN p_draft ? 'service_duration_option_id'
+      THEN NULLIF(p_draft->>'service_duration_option_id', '')::uuid
+    ELSE v_booking.service_duration_option_id
+  END;
+  v_direct_assigned_cleaner_id := CASE
+    WHEN p_draft ? 'direct_assigned_cleaner_id'
+      THEN NULLIF(p_draft->>'direct_assigned_cleaner_id', '')::uuid
+    ELSE NULL
+  END;
+  v_customer_contact_phone := CASE
+    WHEN p_draft ? 'customer_contact_phone' THEN p_draft->>'customer_contact_phone'
+    ELSE v_booking.customer_contact_phone
+  END;
+  v_tax_amount := COALESCE((p_draft->>'tax_amount')::numeric, COALESCE(v_booking.tax_amount, 0));
+  v_duration_adjustment := COALESCE(
+    (p_draft->>'duration_adjustment')::numeric,
+    COALESCE(v_booking.duration_adjustment, 0)
+  );
+  v_booking_for_self := COALESCE((p_draft->>'booking_for_self')::boolean, true);
+  v_site_contact_name := CASE
+    WHEN p_draft ? 'site_contact_name' THEN p_draft->>'site_contact_name'
+    ELSE v_booking.site_contact_name
+  END;
+  v_site_contact_phone := CASE
+    WHEN p_draft ? 'site_contact_phone' THEN p_draft->>'site_contact_phone'
+    ELSE v_booking.site_contact_phone
+  END;
+  v_site_contact_relationship := CASE
+    WHEN p_draft ? 'site_contact_relationship' THEN p_draft->>'site_contact_relationship'
+    ELSE v_booking.site_contact_relationship
+  END;
+  v_property_type := CASE
+    WHEN p_draft ? 'property_type' THEN p_draft->>'property_type'
+    ELSE v_booking.property_type
+  END;
+  v_occupant_present := CASE
+    WHEN p_draft ? 'occupant_present' THEN (p_draft->>'occupant_present')::boolean
+    ELSE v_booking.occupant_present
+  END;
+  v_requires_key_or_access_code := COALESCE(
+    (p_draft->>'requires_key_or_access_code')::boolean,
+    false
+  );
+  v_access_instructions := CASE
+    WHEN v_requires_key_or_access_code THEN NULLIF(p_draft->>'access_instructions', '')
+    ELSE NULL
+  END;
+  v_turnover_guest_checkout_at := CASE
+    WHEN p_draft ? 'turnover_guest_checkout_at'
+      AND nullif(p_draft->>'turnover_guest_checkout_at', '') IS NOT NULL
+      THEN (p_draft->>'turnover_guest_checkout_at')::timestamptz
+    WHEN p_draft ? 'turnover_guest_checkout_at' THEN NULL
+    ELSE v_booking.turnover_guest_checkout_at
+  END;
+  v_turnover_next_checkin_at := CASE
+    WHEN p_draft ? 'turnover_next_checkin_at'
+      AND nullif(p_draft->>'turnover_next_checkin_at', '') IS NOT NULL
+      THEN (p_draft->>'turnover_next_checkin_at')::timestamptz
+    WHEN p_draft ? 'turnover_next_checkin_at' THEN NULL
+    ELSE v_booking.turnover_next_checkin_at
+  END;
+  v_turnover_linen_handling := CASE
+    WHEN p_draft ? 'turnover_linen_handling' THEN p_draft->>'turnover_linen_handling'
+    ELSE v_booking.turnover_linen_handling
+  END;
+  v_turnover_restocking_notes := CASE
+    WHEN p_draft ? 'turnover_restocking_notes' THEN p_draft->>'turnover_restocking_notes'
+    ELSE v_booking.turnover_restocking_notes
+  END;
+  v_turnover_source := CASE
+    WHEN p_draft ? 'turnover_source' THEN p_draft->>'turnover_source'
+    ELSE v_booking.turnover_source
+  END;
+  v_turnover_opportunity_id := CASE
+    WHEN p_draft ? 'turnover_opportunity_id'
+      THEN NULLIF(p_draft->>'turnover_opportunity_id', '')::uuid
+    ELSE v_booking.turnover_opportunity_id
+  END;
+  v_property_id := CASE
+    WHEN p_draft ? 'property_id' THEN NULLIF(p_draft->>'property_id', '')::uuid
+    ELSE v_booking.property_id
+  END;
+
+  v_promotion_slug := NULLIF(btrim(COALESCE(p_draft->>'promotion_slug', '')), '');
+  v_promotion_code := NULLIF(btrim(COALESCE(p_draft->>'promotion_code', '')), '');
+  v_promotion_channel := NULLIF(btrim(COALESCE(p_draft->>'promotion_channel', '')), '');
+  v_promotion_lat := CASE
+    WHEN p_draft ? 'promotion_lat' THEN (p_draft->>'promotion_lat')::double precision
+    ELSE NULL
+  END;
+  v_promotion_lng := CASE
+    WHEN p_draft ? 'promotion_lng' THEN (p_draft->>'promotion_lng')::double precision
+    ELSE NULL
+  END;
+  v_promotion_code_id := NULLIF(p_draft->>'promotion_code_id', '')::uuid;
+
+  IF v_service_id IS NULL
+     OR v_scheduled_date IS NULL
+     OR v_scheduled_time IS NULL
+     OR v_duration_hours_raw IS NULL
+     OR v_duration_hours_raw <= 0
+     OR v_address IS NULL
+     OR btrim(v_address) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_draft_fields');
+  END IF;
+
+  v_use_promo :=
+    v_promotion_channel IS NOT NULL
+    AND (
+      v_promotion_slug IS NOT NULL
+      OR v_promotion_code IS NOT NULL
+    );
+
+  IF v_use_promo THEN
+    SELECT *
+    INTO v_promo_pricing
+    FROM public.compute_booking_pricing_with_promotion(
+      v_service_id,
+      v_duration_hours_raw,
+      v_scheduled_date,
+      v_timezone_name,
+      v_cleaner_id,
+      v_promotion_channel,
+      v_sub.recurrence_interval,
+      true,
+      v_include_booking_cover,
+      v_supplies_option,
+      p_customer_id,
+      v_promotion_slug,
+      v_promotion_lat,
+      v_promotion_lng,
+      v_extra_task_ids,
+      p_booking_id,
+      v_service_duration_option_id,
+      v_promotion_code
+    )
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+      RETURN jsonb_build_object('success', false, 'error', 'pricing_failed');
+    END IF;
+
+    v_pricing := v_promo_pricing;
+    v_promotion_id := v_promo_pricing.promotion_id;
+    v_promotion_slug_out := v_promo_pricing.promotion_slug;
+    v_promotion_discount_minor := COALESCE(v_promo_pricing.promotion_discount_minor, 0);
+  ELSE
+    SELECT *
+    INTO v_pricing
+    FROM public.compute_booking_pricing(
+      v_service_id,
+      v_duration_hours_raw,
+      v_scheduled_date,
+      v_timezone_name,
+      v_sub.recurrence_interval,
+      true,
+      v_include_booking_cover,
+      v_supplies_option,
+      v_cleaner_id,
+      v_extra_task_ids,
+      v_service_duration_option_id
+    )
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+      RETURN jsonb_build_object('success', false, 'error', 'pricing_failed');
+    END IF;
+
+    v_promotion_id := NULL;
+    v_promotion_slug_out := NULL;
+    v_promotion_discount_minor := 0;
+  END IF;
+
+  v_recurring_amount := COALESCE(v_pricing.recurring_amount_minor, v_pricing.final_amount_minor);
+  v_first_charge := COALESCE(v_pricing.first_charge_amount_minor, v_pricing.final_amount_minor);
+  v_discount_bps := COALESCE(v_pricing.discount_rate_bps, 0);
+
+  UPDATE public.subscriptions s
+  SET
+    cleaner_id = v_cleaner_id,
+    service_id = v_service_id,
+    address = v_address,
+    location_coordinates = CASE
+      WHEN p_draft ? 'location_coordinates' AND v_location_wkt IS NOT NULL
+        THEN v_location_wkt::public.geometry
+      WHEN p_draft ? 'location_coordinates' THEN NULL
+      ELSE s.location_coordinates
+    END,
+    duration_hours = ROUND(v_pricing.duration_hours)::integer,
+    recurrence_interval = v_sub.recurrence_interval,
+    amount = v_recurring_amount,
+    recurring_amount_minor = v_recurring_amount,
+    first_charge_amount_minor = v_first_charge,
+    discount_type = v_sub.recurrence_interval,
+    discount_rate_bps = v_discount_bps,
+    pricing_version = v_pricing.pricing_version,
+    currency = v_pricing.currency,
+    next_occurrence_date = v_scheduled_date,
+    recurrence_anchor_date = v_scheduled_date,
+    scheduled_time = v_scheduled_time,
+    home_size = v_home_size,
+    extra_task_ids = v_extra_task_ids,
+    special_instructions = v_special_instructions,
+    updated_at = now()
+  WHERE s.id = v_sub.id
+    AND lower(coalesce(s.status, '')) = 'pending';
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'subscription_update_failed');
+  END IF;
+
+  UPDATE public.bookings b
+  SET
+    cleaner_id = v_cleaner_id,
+    direct_assigned_cleaner_id = v_direct_assigned_cleaner_id,
+    customer_contact_phone = v_customer_contact_phone,
+    service_id = v_service_id,
+    title = v_title,
+    scheduled_date = v_scheduled_date,
+    scheduled_time = v_scheduled_time,
+    duration_hours = v_pricing.duration_hours,
+    address = v_address,
+    special_instructions = v_special_instructions,
+    total_price = v_pricing.final_amount_minor,
+    final_amount_minor = v_pricing.final_amount_minor,
+    core_amount_minor = v_pricing.core_amount_minor,
+    same_day_surcharge_minor = v_pricing.same_day_surcharge_minor,
+    weekend_surcharge_minor = v_pricing.weekend_surcharge_minor,
+    recurring_discount_minor = v_pricing.recurring_discount_minor,
+    is_same_day = v_pricing.is_same_day,
+    is_weekend = v_pricing.is_weekend,
+    pricing_version = v_pricing.pricing_version,
+    currency = v_pricing.currency,
+    platform_fee = v_pricing.platform_fee_major,
+    booking_cover = v_include_booking_cover,
+    booking_cover_amount = v_pricing.booking_cover_major,
+    supplies_option = v_pricing.supplies_option,
+    supplies_allowance_minor = v_pricing.supplies_allowance_minor,
+    work_rate_ghs_per_hour = v_pricing.work_rate_ghs_per_hour,
+    cleaner_earnings_minor = v_pricing.cleaner_earnings_minor,
+    tax_amount = v_tax_amount,
+    location_coordinates = CASE
+      WHEN p_draft ? 'location_coordinates' AND v_location_wkt IS NOT NULL
+        THEN v_location_wkt::public.geometry
+      WHEN p_draft ? 'location_coordinates' THEN NULL
+      ELSE b.location_coordinates
+    END,
+    status = 'pending'::public.booking_status,
+    cleaner_hold_expires_at = NULL,
+    home_size = v_home_size,
+    extra_task_ids = v_extra_task_ids,
+    duration_adjustment = v_duration_adjustment,
+    recurrence_interval = v_sub.recurrence_interval,
+    timezone_name = v_timezone_name,
+    service_duration_option_id = v_service_duration_option_id,
+    promotion_id = v_promotion_id,
+    promotion_slug = v_promotion_slug_out,
+    promotion_discount_minor = v_promotion_discount_minor,
+    promotion_code_id = CASE
+      WHEN v_promotion_id IS NULL THEN NULL
+      ELSE v_promotion_code_id
+    END,
+    booking_for_self = v_booking_for_self,
+    site_contact_name = v_site_contact_name,
+    site_contact_phone = v_site_contact_phone,
+    site_contact_relationship = v_site_contact_relationship,
+    property_type = v_property_type,
+    occupant_present = v_occupant_present,
+    requires_key_or_access_code = v_requires_key_or_access_code,
+    access_instructions = v_access_instructions,
+    turnover_guest_checkout_at = v_turnover_guest_checkout_at,
+    turnover_next_checkin_at = v_turnover_next_checkin_at,
+    turnover_linen_handling = v_turnover_linen_handling,
+    turnover_restocking_notes = v_turnover_restocking_notes,
+    turnover_source = v_turnover_source,
+    turnover_opportunity_id = v_turnover_opportunity_id,
+    property_id = v_property_id,
+    updated_at = now()
+  WHERE b.id = p_booking_id
+    AND b.customer_id = p_customer_id
+    AND b.status IN ('pending'::public.booking_status, 'confirmed'::public.booking_status)
+    AND b.subscription_id IS NOT NULL
+    AND lower(trim(coalesce(b.payment_status::text, ''))) IN ('', 'pending', 'failed')
+  RETURNING * INTO v_updated;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_update_failed');
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'booking_id', v_updated.id,
+    'duration_computed', v_updated.duration_computed,
+    'duration_final', v_updated.duration_final,
+    'final_amount_minor', v_updated.final_amount_minor,
+    'recurring_amount_minor', v_recurring_amount,
+    'first_charge_amount_minor', v_first_charge
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.table_owner_is(name, name)
  RETURNS text
  LANGUAGE sql
@@ -41444,6 +41992,8 @@ CREATE TRIGGER trg_bookings_ensure_cleaner_earnings_minor BEFORE INSERT OR UPDAT
 CREATE TRIGGER trg_bookings_guard_payment_status BEFORE UPDATE OF payment_status ON bookings FOR EACH ROW EXECUTE FUNCTION bookings_guard_payment_status();
 
 CREATE TRIGGER trg_bookings_set_completed_at BEFORE UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION set_booking_completed_at();
+
+CREATE TRIGGER trg_cascade_cancel_pending_subscription_after_booking_cancel AFTER UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION cascade_cancel_pending_subscription_after_booking_cancel();
 
 CREATE TRIGGER trg_credit_cleaner_wallet_on_completion AFTER UPDATE OF status ON bookings FOR EACH ROW WHEN (new.status = 'completed'::booking_status AND old.status IS DISTINCT FROM 'completed'::booking_status) EXECUTE FUNCTION handle_job_completion();
 
