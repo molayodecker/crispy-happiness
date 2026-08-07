@@ -54,6 +54,25 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public._acquire_payout_methods_user_lock(p_user_id uuid)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+BEGIN
+  IF p_user_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  -- Transaction-scoped advisory lock. Same key used by reconcile and payout_methods trigger.
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('instaclean.payout_methods.user:' || p_user_id::text, 0)
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public._add(text, integer)
  RETURNS integer
  LANGUAGE sql
@@ -2509,6 +2528,51 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public._normalize_payout_name_compare(p_name text)
+ RETURNS text
+ LANGUAGE sql
+ IMMUTABLE PARALLEL SAFE
+AS $function$
+  SELECT trim(
+    both ' '
+    FROM regexp_replace(
+      regexp_replace(
+        lower(
+          regexp_replace(
+            normalize(
+              replace(
+                replace(
+                  replace(
+                    replace(coalesce(p_name, ''), E'\u00A0', ' '),
+                    E'\u200B',
+                    ''
+                  ),
+                  E'\u200C',
+                  ''
+                ),
+                E'\u200D',
+                ''
+              ),
+              NFKD
+            ),
+            -- Strip combining diacritical marks (U+0300–U+036F).
+            E'[\u0300-\u036F]',
+            '',
+            'g'
+          )
+        ),
+        '[^a-z0-9[:space:]]+',
+        ' ',
+        'g'
+      ),
+      '[[:space:]]+',
+      ' ',
+      'g'
+    )
+  );
+$function$
+
+
 CREATE OR REPLACE FUNCTION public._nosuch(name, name, name[])
  RETURNS text
  LANGUAGE sql
@@ -2668,6 +2732,206 @@ AS $function$
      WHERE n.nspname = $1
        AND c.relname = $2
        AND c.relkind = 'p'
+$function$
+
+
+CREATE OR REPLACE FUNCTION public._payout_levenshtein(p_a text, p_b text)
+ RETURNS integer
+ LANGUAGE plpgsql
+ IMMUTABLE PARALLEL SAFE STRICT
+AS $function$
+DECLARE
+  v_a text := p_a;
+  v_b text := p_b;
+  v_la integer;
+  v_lb integer;
+  v_i integer;
+  v_j integer;
+  v_cost integer;
+  v_prev integer[];
+  v_curr integer[];
+BEGIN
+  IF v_a = v_b THEN
+    RETURN 0;
+  END IF;
+
+  v_la := char_length(v_a);
+  v_lb := char_length(v_b);
+
+  -- Cap inputs to bound O(n*m) work even if called from a privileged role.
+  IF v_la > 128 OR v_lb > 128 THEN
+    RETURN 2147483647;
+  END IF;
+
+  IF v_la = 0 THEN
+    RETURN v_lb;
+  END IF;
+  IF v_lb = 0 THEN
+    RETURN v_la;
+  END IF;
+
+  v_prev := ARRAY(SELECT generate_series(0, v_lb));
+  v_curr := array_fill(0, ARRAY[v_lb + 1]);
+
+  FOR v_i IN 1..v_la LOOP
+    v_curr[1] := v_i;
+    FOR v_j IN 1..v_lb LOOP
+      v_cost := CASE
+        WHEN substr(v_a, v_i, 1) = substr(v_b, v_j, 1) THEN 0
+        ELSE 1
+      END;
+      v_curr[v_j + 1] := LEAST(
+        v_curr[v_j] + 1,
+        v_prev[v_j + 1] + 1,
+        v_prev[v_j] + v_cost
+      );
+    END LOOP;
+    v_prev := v_curr;
+    v_curr := array_fill(0, ARRAY[v_lb + 1]);
+  END LOOP;
+
+  RETURN v_prev[v_lb + 1];
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public._payout_max_typo_distance(p_token text)
+ RETURNS integer
+ LANGUAGE sql
+ IMMUTABLE PARALLEL SAFE
+AS $function$
+  SELECT CASE
+    WHEN char_length(coalesce(p_token, '')) <= 3 THEN 0
+    WHEN char_length(p_token) <= 5 THEN 1
+    ELSE 2
+  END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public._payout_methods_acquire_user_lock_trigger()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    PERFORM public._acquire_payout_methods_user_lock(NEW.user_id);
+    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    PERFORM public._acquire_payout_methods_user_lock(OLD.user_id);
+    RETURN OLD;
+  ELSE
+    -- Deterministic lock order avoids deadlocks when two txs reassign user_id opposite ways.
+    IF OLD.user_id IS DISTINCT FROM NEW.user_id THEN
+      IF OLD.user_id < NEW.user_id THEN
+        PERFORM public._acquire_payout_methods_user_lock(OLD.user_id);
+        PERFORM public._acquire_payout_methods_user_lock(NEW.user_id);
+      ELSE
+        PERFORM public._acquire_payout_methods_user_lock(NEW.user_id);
+        PERFORM public._acquire_payout_methods_user_lock(OLD.user_id);
+      END IF;
+    ELSE
+      PERFORM public._acquire_payout_methods_user_lock(NEW.user_id);
+    END IF;
+    RETURN NEW;
+  END IF;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public._payout_mismatch_flags_same_event(p_a jsonb, p_b jsonb)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ IMMUTABLE PARALLEL SAFE
+AS $function$
+DECLARE
+  v_a_at timestamptz;
+  v_b_at timestamptz;
+BEGIN
+  IF p_a IS NULL OR p_b IS NULL
+     OR jsonb_typeof(p_a) <> 'object'
+     OR jsonb_typeof(p_b) <> 'object' THEN
+    RETURN false;
+  END IF;
+
+  BEGIN
+    v_a_at := nullif(btrim(coalesce(p_a ->> 'flagged_at', '')), '')::timestamptz;
+    v_b_at := nullif(btrim(coalesce(p_b ->> 'flagged_at', '')), '')::timestamptz;
+  EXCEPTION
+    WHEN others THEN
+      RETURN false;
+  END;
+
+  IF v_a_at IS NULL OR v_b_at IS NULL OR v_a_at IS DISTINCT FROM v_b_at THEN
+    RETURN false;
+  END IF;
+
+  RETURN
+    nullif(btrim(coalesce(p_a ->> 'profile_name', '')), '')
+      IS NOT DISTINCT FROM nullif(btrim(coalesce(p_b ->> 'profile_name', '')), '')
+    AND nullif(btrim(coalesce(p_a ->> 'payout_account_name', '')), '')
+      IS NOT DISTINCT FROM nullif(btrim(coalesce(p_b ->> 'payout_account_name', '')), '');
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public._payout_names_match(p_profile_name text, p_payout_account_name text)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ IMMUTABLE PARALLEL SAFE
+AS $function$
+DECLARE
+  v_profile text;
+  v_payout text;
+  v_profile_tokens text[];
+  v_payout_tokens text[];
+  v_i integer;
+BEGIN
+  -- Reject oversized inputs before normalization / Levenshtein (client DoS defense).
+  IF char_length(coalesce(p_profile_name, '')) > 200
+     OR char_length(coalesce(p_payout_account_name, '')) > 200 THEN
+    RETURN false;
+  END IF;
+
+  v_profile := public._normalize_payout_name_compare(p_profile_name);
+  v_payout := public._normalize_payout_name_compare(p_payout_account_name);
+
+  IF v_profile = '' OR v_payout = '' THEN
+    RETURN true;
+  END IF;
+
+  IF v_profile = v_payout THEN
+    RETURN true;
+  END IF;
+
+  v_profile_tokens := string_to_array(v_profile, ' ');
+  v_payout_tokens := string_to_array(v_payout, ' ');
+
+  IF coalesce(array_length(v_profile_tokens, 1), 0) <> coalesce(array_length(v_payout_tokens, 1), 0) THEN
+    RETURN false;
+  END IF;
+
+  SELECT array_agg(t ORDER BY t)
+  INTO v_profile_tokens
+  FROM unnest(v_profile_tokens) AS t;
+
+  SELECT array_agg(t ORDER BY t)
+  INTO v_payout_tokens
+  FROM unnest(v_payout_tokens) AS t;
+
+  FOR v_i IN 1..coalesce(array_length(v_profile_tokens, 1), 0) LOOP
+    IF v_profile_tokens[v_i] = v_payout_tokens[v_i] THEN
+      CONTINUE;
+    END IF;
+    IF public._payout_levenshtein(v_profile_tokens[v_i], v_payout_tokens[v_i])
+         > public._payout_max_typo_distance(v_profile_tokens[v_i]) THEN
+      RETURN false;
+    END IF;
+  END LOOP;
+
+  RETURN true;
+END;
 $function$
 
 
@@ -3003,6 +3267,33 @@ BEGIN
     -- Quote the non-precision part and concatenate with precision.
     RETURN quote_ident(substring($1 FOR char_length($1) - char_length(pcision)))
         || pcision;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public._reconcile_payout_test_pause_if_configured()
+ RETURNS void
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  v_raw text;
+  v_ms numeric;
+BEGIN
+  v_raw := nullif(current_setting('instaclean.reconcile_payout_test_pause_ms', true), '');
+  IF v_raw IS NULL THEN
+    RETURN;
+  END IF;
+
+  BEGIN
+    v_ms := v_raw::numeric;
+  EXCEPTION
+    WHEN others THEN
+      RETURN;
+  END;
+
+  IF v_ms > 0 THEN
+    PERFORM pg_sleep(v_ms / 1000.0);
+  END IF;
 END;
 $function$
 
@@ -13662,6 +13953,293 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.dblink(text)
+ RETURNS SETOF record
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_record$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink(text, boolean)
+ RETURNS SETOF record
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_record$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink(text, text)
+ RETURNS SETOF record
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_record$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink(text, text, boolean)
+ RETURNS SETOF record
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_record$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_build_sql_delete(text, int2vector, integer, text[])
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_build_sql_delete$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_build_sql_insert(text, int2vector, integer, text[], text[])
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_build_sql_insert$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_build_sql_update(text, int2vector, integer, text[], text[])
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_build_sql_update$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_cancel_query(text)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_cancel_query$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_close(text)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_close$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_close(text, boolean)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_close$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_close(text, text)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_close$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_close(text, text, boolean)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_close$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_connect(text)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_connect$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_connect(text, text)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_connect$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_connect_u(text)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT SECURITY DEFINER
+AS '$libdir/dblink', $function$dblink_connect$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_connect_u(text, text)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT SECURITY DEFINER
+AS '$libdir/dblink', $function$dblink_connect$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_current_query()
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED
+AS '$libdir/dblink', $function$dblink_current_query$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_disconnect()
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_disconnect$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_disconnect(text)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_disconnect$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_error_message(text)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_error_message$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_exec(text)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_exec$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_exec(text, boolean)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_exec$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_exec(text, text)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_exec$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_exec(text, text, boolean)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_exec$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_fdw_validator(options text[], catalog oid)
+ RETURNS void
+ LANGUAGE c
+ PARALLEL SAFE STRICT
+AS '$libdir/dblink', $function$dblink_fdw_validator$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_fetch(text, integer)
+ RETURNS SETOF record
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_fetch$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_fetch(text, integer, boolean)
+ RETURNS SETOF record
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_fetch$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_fetch(text, text, integer)
+ RETURNS SETOF record
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_fetch$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_fetch(text, text, integer, boolean)
+ RETURNS SETOF record
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_fetch$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_get_connections()
+ RETURNS text[]
+ LANGUAGE c
+ PARALLEL RESTRICTED
+AS '$libdir/dblink', $function$dblink_get_connections$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_get_notify(conname text, OUT notify_name text, OUT be_pid integer, OUT extra text)
+ RETURNS SETOF record
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_get_notify$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_get_notify(OUT notify_name text, OUT be_pid integer, OUT extra text)
+ RETURNS SETOF record
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_get_notify$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_get_pkey(text)
+ RETURNS SETOF dblink_pkey_results
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_get_pkey$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_get_result(text)
+ RETURNS SETOF record
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_get_result$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_get_result(text, boolean)
+ RETURNS SETOF record
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_get_result$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_is_busy(text)
+ RETURNS integer
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_is_busy$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_open(text, text)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_open$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_open(text, text, boolean)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_open$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_open(text, text, text)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_open$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_open(text, text, text, boolean)
+ RETURNS text
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_open$function$
+
+
+CREATE OR REPLACE FUNCTION public.dblink_send_query(text, text)
+ RETURNS integer
+ LANGUAGE c
+ PARALLEL RESTRICTED STRICT
+AS '$libdir/dblink', $function$dblink_send_query$function$
+
+
 CREATE OR REPLACE FUNCTION public.decline_booking_by_cleaner(p_booking_id uuid, p_reason text DEFAULT NULL::text)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -20479,6 +21057,71 @@ BEGIN
     p_customer_id,
     p_booking_id
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_latest_paystack_reference_for_booking(p_booking_id uuid)
+ RETURNS text
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_customer_id uuid;
+  v_ref text;
+BEGIN
+  IF p_booking_id IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT b.customer_id
+  INTO v_customer_id
+  FROM public.bookings b
+  WHERE b.id = p_booking_id;
+
+  IF v_customer_id IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  -- Authenticated callers may only read their own booking reference.
+  IF auth.uid() IS NOT NULL AND auth.uid() <> v_customer_id THEN
+    RAISE EXCEPTION 'not authorized'
+      USING ERRCODE = '42501';
+  END IF;
+
+  SELECT NULLIF(btrim(t.reference), '')
+  INTO v_ref
+  FROM public.transactions t
+  WHERE t.booking_id = p_booking_id
+    AND t.reference IS NOT NULL
+    AND btrim(t.reference) <> ''
+  ORDER BY t.created_at DESC NULLS LAST
+  LIMIT 1;
+
+  IF v_ref IS NOT NULL THEN
+    RETURN v_ref;
+  END IF;
+
+  SELECT NULLIF(btrim(p.reference), '')
+  INTO v_ref
+  FROM public.psk_transaction p
+  WHERE p.booking_id = p_booking_id
+    AND p.reference IS NOT NULL
+    AND btrim(p.reference) <> ''
+  ORDER BY p.created_at DESC NULLS LAST
+  LIMIT 1;
+
+  IF v_ref IS NOT NULL THEN
+    RETURN v_ref;
+  END IF;
+
+  SELECT NULLIF(btrim(b.reference), '')
+  INTO v_ref
+  FROM public.bookings b
+  WHERE b.id = p_booking_id;
+
+  RETURN v_ref;
 END;
 $function$
 
@@ -27491,6 +28134,45 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.mark_conversation_messages_read(p_conversation_id uuid)
+ RETURNS integer
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_updated integer := 0;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'not_authenticated' USING ERRCODE = '42501';
+  END IF;
+
+  IF p_conversation_id IS NULL THEN
+    RAISE EXCEPTION 'missing_conversation_id' USING ERRCODE = '22023';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.conversations c
+    WHERE c.id = p_conversation_id
+      AND (c.customer_id = v_uid OR c.cleaner_id = v_uid)
+  ) THEN
+    RAISE EXCEPTION 'not_authorized' USING ERRCODE = '42501';
+  END IF;
+
+  UPDATE public.messages m
+  SET read_at = now()
+  WHERE m.conversation_id = p_conversation_id
+    AND m.sender_id IS DISTINCT FROM v_uid
+    AND m.read_at IS NULL;
+
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+  RETURN v_updated;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.matches(anyelement, text)
  RETURNS text
  LANGUAGE sql
@@ -30839,6 +31521,308 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.reconcile_payout_name_mismatch_flag(p_user_id uuid, p_purpose text DEFAULT 'payout'::text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_purpose text := lower(btrim(coalesce(p_purpose, 'payout')));
+  v_profile public.profiles%ROWTYPE;
+  v_prefs jsonb;
+  v_flag jsonb;
+  v_flag_source text; -- 'nested' | 'legacy' | 'both_same'
+  v_nested jsonb;
+  v_legacy jsonb;
+  v_flagged_at text;
+  v_stored_profile text;
+  v_stored_payout text;
+  v_payout_type text;
+  v_current_profile text;
+  v_method_count integer := 0;
+  v_blank_count integer := 0;
+  v_flagged_name_present boolean := false;
+  v_all_match_profile boolean := false;
+  v_should_clear boolean := false;
+  v_clear_reason text := NULL;
+  v_cleared_id uuid;
+  v_active jsonb;
+  v_next_prefs jsonb;
+  v_next_nested jsonb;
+  v_clear_legacy boolean := false;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_user_id IS NULL OR v_uid IS DISTINCT FROM p_user_id THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+  END IF;
+
+  IF v_purpose NOT IN ('payout', 'refund') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_purpose');
+  END IF;
+
+  -- Lock order: advisory user lock, then profile row (matches trigger lock order).
+  PERFORM public._acquire_payout_methods_user_lock(p_user_id);
+
+  SELECT *
+  INTO v_profile
+  FROM public.profiles p
+  WHERE p.id = p_user_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'profile_not_found');
+  END IF;
+
+  v_prefs := coalesce(v_profile.preferences, '{}'::jsonb);
+  v_nested := v_prefs -> 'payout_name_mismatches' -> v_purpose;
+  IF v_purpose = 'payout'
+     AND v_prefs -> 'payout_name_mismatch' IS NOT NULL
+     AND jsonb_typeof(v_prefs -> 'payout_name_mismatch') = 'object' THEN
+    v_legacy := v_prefs -> 'payout_name_mismatch';
+  ELSE
+    v_legacy := NULL;
+  END IF;
+
+  IF v_nested IS NOT NULL AND jsonb_typeof(v_nested) = 'object' AND v_legacy IS NOT NULL THEN
+    -- Dual-write / rollout: never clear both unless they are the same mismatch event.
+    IF NOT public._payout_mismatch_flags_same_event(v_nested, v_legacy) THEN
+      RETURN jsonb_build_object(
+        'success', true,
+        'cleared', false,
+        'clear_confirmed', false,
+        'reason', 'conflicting_flags',
+        'purpose', v_purpose,
+        'active', jsonb_build_object(
+          'profile_name', nullif(btrim(coalesce(v_nested ->> 'profile_name', '')), ''),
+          'payout_account_name', nullif(btrim(coalesce(v_nested ->> 'payout_account_name', '')), ''),
+          'payout_type', coalesce(nullif(btrim(coalesce(v_nested ->> 'payout_type', '')), ''), 'bank'),
+          'flagged_at', nullif(btrim(coalesce(v_nested ->> 'flagged_at', '')), ''),
+          'purpose', v_purpose,
+          'legacy_flagged_at', nullif(btrim(coalesce(v_legacy ->> 'flagged_at', '')), '')
+        )
+      );
+    END IF;
+    v_flag := v_nested;
+    v_flag_source := 'both_same';
+    v_clear_legacy := true;
+  ELSIF v_nested IS NOT NULL AND jsonb_typeof(v_nested) = 'object' THEN
+    v_flag := v_nested;
+    v_flag_source := 'nested';
+    v_clear_legacy := false;
+  ELSIF v_legacy IS NOT NULL THEN
+    -- Legacy single-flag shape defaults to purpose=payout.
+    v_flag := v_legacy;
+    v_flag_source := 'legacy';
+    v_clear_legacy := true;
+  ELSE
+    RETURN jsonb_build_object(
+      'success', true,
+      'cleared', false,
+      'clear_confirmed', false,
+      'reason', 'no_flag',
+      'purpose', v_purpose,
+      'active', NULL
+    );
+  END IF;
+
+  v_flagged_at := nullif(btrim(coalesce(v_flag ->> 'flagged_at', '')), '');
+  v_stored_profile := nullif(btrim(coalesce(v_flag ->> 'profile_name', '')), '');
+  v_stored_payout := nullif(btrim(coalesce(v_flag ->> 'payout_account_name', '')), '');
+  v_payout_type := nullif(btrim(coalesce(v_flag ->> 'payout_type', '')), '');
+
+  IF v_stored_profile IS NULL OR v_stored_payout IS NULL THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'cleared', false,
+      'clear_confirmed', false,
+      'reason', 'incomplete_flag',
+      'purpose', v_purpose,
+      'active', NULL
+    );
+  END IF;
+
+  v_active := jsonb_build_object(
+    'profile_name', v_stored_profile,
+    'payout_account_name', v_stored_payout,
+    'payout_type', coalesce(v_payout_type, 'bank'),
+    'flagged_at', v_flagged_at,
+    'purpose', v_purpose
+  );
+
+  -- Stored names already match under the mobile comparator (case/order/typos).
+  IF public._payout_names_match(v_stored_profile, v_stored_payout) THEN
+    v_should_clear := true;
+    v_clear_reason := 'case_only';
+  ELSE
+    v_current_profile := nullif(
+      btrim(
+        coalesce(
+          nullif(btrim(coalesce(v_profile.fullname, '')), ''),
+          nullif(
+            btrim(
+              concat_ws(
+                ' ',
+                nullif(btrim(coalesce(v_profile.firstname, '')), ''),
+                nullif(btrim(coalesce(v_profile.middlename, '')), ''),
+                nullif(btrim(coalesce(v_profile.lastname, '')), '')
+              )
+            ),
+            ''
+          )
+        )
+      ),
+      ''
+    );
+
+    SELECT
+      count(*)::integer,
+      count(*) FILTER (
+        WHERE nullif(btrim(coalesce(pm.account_name, '')), '') IS NULL
+      )::integer,
+      bool_or(
+        nullif(btrim(coalesce(pm.account_name, '')), '') IS NOT NULL
+        AND public._payout_names_match(pm.account_name, v_stored_payout)
+      ),
+      bool_and(
+        nullif(btrim(coalesce(pm.account_name, '')), '') IS NOT NULL
+        AND public._payout_names_match(v_current_profile, pm.account_name)
+      )
+    INTO
+      v_method_count,
+      v_blank_count,
+      v_flagged_name_present,
+      v_all_match_profile
+    FROM public.payout_methods pm
+    WHERE pm.user_id = p_user_id
+      AND coalesce(pm.purpose, 'payout') = v_purpose;
+
+    -- Pause point for two-session concurrency tests (no-op unless GUC is set).
+    PERFORM public._reconcile_payout_test_pause_if_configured();
+
+    IF v_method_count = 0 THEN
+      v_should_clear := true;
+      v_clear_reason := 'no_methods';
+    ELSIF v_blank_count > 0 THEN
+      v_should_clear := false;
+      v_clear_reason := 'blank_method_names';
+    ELSIF v_flagged_name_present THEN
+      v_should_clear := false;
+      v_clear_reason := 'flagged_name_present';
+    ELSIF nullif(public._normalize_payout_name_compare(v_current_profile), '') IS NOT NULL
+          AND coalesce(v_all_match_profile, false) THEN
+      v_should_clear := true;
+      v_clear_reason := 'methods_corrected';
+    ELSE
+      v_should_clear := false;
+      v_clear_reason := 'still_mismatched';
+    END IF;
+  END IF;
+
+  IF NOT v_should_clear THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'cleared', false,
+      'clear_confirmed', false,
+      'reason', v_clear_reason,
+      'purpose', v_purpose,
+      'active', v_active
+    );
+  END IF;
+
+  v_next_prefs := v_prefs;
+  IF v_flag_source IN ('nested', 'both_same')
+     OR (v_prefs -> 'payout_name_mismatches') IS NOT NULL THEN
+    v_next_nested := coalesce(v_next_prefs -> 'payout_name_mismatches', '{}'::jsonb) - v_purpose;
+    IF v_next_nested = '{}'::jsonb THEN
+      v_next_prefs := v_next_prefs - 'payout_name_mismatches';
+    ELSE
+      v_next_prefs := jsonb_set(v_next_prefs, '{payout_name_mismatches}', v_next_nested, true);
+    END IF;
+  END IF;
+  -- Only drop legacy when it is the source, or dual-write same-event companion.
+  IF v_clear_legacy THEN
+    v_next_prefs := v_next_prefs - 'payout_name_mismatch';
+  END IF;
+
+  UPDATE public.profiles p
+  SET
+    preferences = v_next_prefs,
+    updated_at = now()
+  WHERE p.id = p_user_id
+    AND (
+      v_flagged_at IS NULL
+      OR (
+        v_flag_source = 'legacy'
+        AND p.preferences #>> '{payout_name_mismatch,flagged_at}' = v_flagged_at
+      )
+      OR (
+        v_flag_source IN ('nested', 'both_same')
+        AND p.preferences #>> array['payout_name_mismatches', v_purpose, 'flagged_at'] = v_flagged_at
+        AND (
+          v_flag_source = 'nested'
+          OR p.preferences #>> '{payout_name_mismatch,flagged_at}' = v_flagged_at
+        )
+      )
+    )
+  RETURNING p.id INTO v_cleared_id;
+
+  IF v_cleared_id IS NULL THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'cleared', false,
+      'clear_confirmed', false,
+      'reason', 'concurrent_flag_changed',
+      'purpose', v_purpose,
+      'active', coalesce(
+        (
+          SELECT jsonb_build_object(
+            'profile_name', nullif(btrim(coalesce(
+              p.preferences #>> array['payout_name_mismatches', v_purpose, 'profile_name'],
+              p.preferences #>> '{payout_name_mismatch,profile_name}'
+            )), ''),
+            'payout_account_name', nullif(btrim(coalesce(
+              p.preferences #>> array['payout_name_mismatches', v_purpose, 'payout_account_name'],
+              p.preferences #>> '{payout_name_mismatch,payout_account_name}'
+            )), ''),
+            'payout_type', coalesce(nullif(btrim(coalesce(
+              p.preferences #>> array['payout_name_mismatches', v_purpose, 'payout_type'],
+              p.preferences #>> '{payout_name_mismatch,payout_type}'
+            )), ''), 'bank'),
+            'flagged_at', nullif(btrim(coalesce(
+              p.preferences #>> array['payout_name_mismatches', v_purpose, 'flagged_at'],
+              p.preferences #>> '{payout_name_mismatch,flagged_at}'
+            )), ''),
+            'purpose', v_purpose
+          )
+          FROM public.profiles p
+          WHERE p.id = p_user_id
+            AND (
+              (p.preferences -> 'payout_name_mismatches' -> v_purpose) IS NOT NULL
+              OR (v_purpose = 'payout' AND p.preferences ? 'payout_name_mismatch')
+            )
+        ),
+        v_active
+      )
+    );
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'cleared', true,
+    'clear_confirmed', true,
+    'reason', v_clear_reason,
+    'purpose', v_purpose,
+    'active', NULL
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.record_admin_cash_payout(p_cleaner_id uuid, p_amount_subunit integer, p_recorded_by uuid, p_booking_id uuid DEFAULT NULL::uuid, p_notes text DEFAULT NULL::text)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -34097,6 +35081,88 @@ BEGIN
     NEW.completed_at := COALESCE(NEW.completed_at, now());
   END IF;
   RETURN NEW;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.set_booking_paystack_reference_if_unpaid(p_booking_id uuid, p_reference text)
+ RETURNS TABLE(updated boolean, payment_status text, reference text)
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_customer_id uuid;
+  v_payment_status text;
+  v_reference text;
+  v_incoming text := NULLIF(btrim(p_reference), '');
+BEGIN
+  IF p_booking_id IS NULL OR v_incoming IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT b.customer_id, b.payment_status, b.reference
+  INTO v_customer_id, v_payment_status, v_reference
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+  FOR UPDATE;
+
+  IF v_customer_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  IF auth.uid() IS NOT NULL AND auth.uid() <> v_customer_id THEN
+    RAISE EXCEPTION 'not authorized'
+      USING ERRCODE = '42501';
+  END IF;
+
+  -- Only overwrite while unpaid / pending — never after paid, post_paid, or refunded.
+  IF lower(coalesce(v_payment_status, '')) IN (
+    'paid',
+    'post_paid',
+    'refunded',
+    'partially_refunded'
+  ) THEN
+    updated := false;
+    payment_status := v_payment_status;
+    reference := v_reference;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  UPDATE public.bookings b
+  SET
+    reference = v_incoming,
+    updated_at = now()
+  WHERE b.id = p_booking_id
+    AND b.customer_id = v_customer_id
+    AND lower(coalesce(b.payment_status, '')) NOT IN (
+      'paid',
+      'post_paid',
+      'refunded',
+      'partially_refunded'
+    )
+  RETURNING b.payment_status, b.reference
+  INTO v_payment_status, v_reference;
+
+  IF FOUND THEN
+    updated := true;
+    payment_status := v_payment_status;
+    reference := v_reference;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  -- Lost race: another writer settled payment between SELECT and UPDATE.
+  SELECT b.payment_status, b.reference
+  INTO v_payment_status, v_reference
+  FROM public.bookings b
+  WHERE b.id = p_booking_id;
+
+  updated := false;
+  payment_status := v_payment_status;
+  reference := v_reference;
+  RETURN NEXT;
 END;
 $function$
 
@@ -38755,6 +39821,10 @@ DECLARE
   v_pricing record;
   v_promo_pricing record;
   v_use_promo boolean := false;
+  v_reserve jsonb;
+  v_release jsonb;
+  v_promo_applied boolean := false;
+  v_repriced_without_promo boolean := false;
 
   v_cleaner_id uuid;
   v_service_id integer;
@@ -38820,7 +39890,7 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'invalid_draft');
   END IF;
 
-  -- Reject any client attempt to supply derived financial fields.
+  -- Reject client-supplied derived financial / status / code-id fields.
   IF p_draft ? 'final_amount_minor'
      OR p_draft ? 'total_price'
      OR p_draft ? 'core_amount_minor'
@@ -38840,6 +39910,8 @@ BEGIN
      OR p_draft ? 'currency'
      OR p_draft ? 'promotion_discount_minor'
      OR p_draft ? 'promotion_id'
+     OR p_draft ? 'promotion_code_id'
+     OR p_draft ? 'tax_amount'
      OR p_draft ? 'status'
      OR p_draft ? 'payment_status' THEN
     RETURN jsonb_build_object('success', false, 'error', 'financial_fields_not_allowed');
@@ -38917,7 +39989,17 @@ BEGIN
   ELSE
     v_extra_task_ids := COALESCE(v_booking.extra_task_ids, ARRAY[]::text[]);
   END IF;
-  v_include_booking_cover := COALESCE((p_draft->>'include_booking_cover')::boolean, true);
+
+  IF p_draft ? 'include_booking_cover' THEN
+    v_include_booking_cover := COALESCE(
+      (p_draft->>'include_booking_cover')::boolean,
+      v_booking.booking_cover,
+      true
+    );
+  ELSE
+    v_include_booking_cover := COALESCE(v_booking.booking_cover, true);
+  END IF;
+
   v_supplies_option := COALESCE(
     NULLIF(p_draft->>'supplies_option', ''),
     v_booking.supplies_option,
@@ -38931,18 +40013,22 @@ BEGIN
   v_direct_assigned_cleaner_id := CASE
     WHEN p_draft ? 'direct_assigned_cleaner_id'
       THEN NULLIF(p_draft->>'direct_assigned_cleaner_id', '')::uuid
-    ELSE NULL
+    ELSE v_booking.direct_assigned_cleaner_id
   END;
   v_customer_contact_phone := CASE
     WHEN p_draft ? 'customer_contact_phone' THEN p_draft->>'customer_contact_phone'
     ELSE v_booking.customer_contact_phone
   END;
-  v_tax_amount := COALESCE((p_draft->>'tax_amount')::numeric, COALESCE(v_booking.tax_amount, 0));
+  -- Tax is receipt-facing; never accept client drafts until server-calculated.
+  v_tax_amount := COALESCE(v_booking.tax_amount, 0);
   v_duration_adjustment := COALESCE(
     (p_draft->>'duration_adjustment')::numeric,
     COALESCE(v_booking.duration_adjustment, 0)
   );
-  v_booking_for_self := COALESCE((p_draft->>'booking_for_self')::boolean, true);
+  v_booking_for_self := CASE
+    WHEN p_draft ? 'booking_for_self' THEN COALESCE((p_draft->>'booking_for_self')::boolean, true)
+    ELSE COALESCE(v_booking.booking_for_self, true)
+  END;
   v_site_contact_name := CASE
     WHEN p_draft ? 'site_contact_name' THEN p_draft->>'site_contact_name'
     ELSE v_booking.site_contact_name
@@ -38963,14 +40049,24 @@ BEGIN
     WHEN p_draft ? 'occupant_present' THEN (p_draft->>'occupant_present')::boolean
     ELSE v_booking.occupant_present
   END;
-  v_requires_key_or_access_code := COALESCE(
-    (p_draft->>'requires_key_or_access_code')::boolean,
-    false
-  );
-  v_access_instructions := CASE
-    WHEN v_requires_key_or_access_code THEN NULLIF(p_draft->>'access_instructions', '')
-    ELSE NULL
-  END;
+
+  IF p_draft ? 'requires_key_or_access_code' THEN
+    v_requires_key_or_access_code := COALESCE(
+      (p_draft->>'requires_key_or_access_code')::boolean,
+      false
+    );
+  ELSE
+    v_requires_key_or_access_code := COALESCE(v_booking.requires_key_or_access_code, false);
+  END IF;
+
+  IF NOT v_requires_key_or_access_code THEN
+    v_access_instructions := NULL;
+  ELSIF p_draft ? 'access_instructions' THEN
+    v_access_instructions := NULLIF(btrim(COALESCE(p_draft->>'access_instructions', '')), '');
+  ELSE
+    v_access_instructions := v_booking.access_instructions;
+  END IF;
+
   v_turnover_guest_checkout_at := CASE
     WHEN p_draft ? 'turnover_guest_checkout_at'
       AND nullif(p_draft->>'turnover_guest_checkout_at', '') IS NOT NULL
@@ -39018,7 +40114,8 @@ BEGIN
     WHEN p_draft ? 'promotion_lng' THEN (p_draft->>'promotion_lng')::double precision
     ELSE NULL
   END;
-  v_promotion_code_id := NULLIF(p_draft->>'promotion_code_id', '')::uuid;
+  -- Never accept client promotion_code_id; resolve below from promotion_code.
+  v_promotion_code_id := NULL;
 
   IF v_service_id IS NULL
      OR v_scheduled_date IS NULL
@@ -39070,6 +40167,22 @@ BEGIN
     v_promotion_id := v_promo_pricing.promotion_id;
     v_promotion_slug_out := v_promo_pricing.promotion_slug;
     v_promotion_discount_minor := COALESCE(v_promo_pricing.promotion_discount_minor, 0);
+
+    IF v_promotion_id IS NOT NULL
+       AND v_promotion_discount_minor > 0
+       AND v_promotion_code IS NOT NULL THEN
+      SELECT pc.id
+      INTO v_promotion_code_id
+      FROM public.promotion_codes pc
+      WHERE pc.code = v_promotion_code::citext
+        AND pc.promotion_id = v_promotion_id
+        AND pc.active IS TRUE
+      LIMIT 1;
+
+      IF v_promotion_code_id IS NULL THEN
+        RETURN jsonb_build_object('success', false, 'error', 'promotion_code_unresolved');
+      END IF;
+    END IF;
   ELSE
     SELECT *
     INTO v_pricing
@@ -39095,6 +40208,14 @@ BEGIN
     v_promotion_id := NULL;
     v_promotion_slug_out := NULL;
     v_promotion_discount_minor := 0;
+    v_promotion_code_id := NULL;
+  END IF;
+
+  IF v_promotion_id IS NULL OR v_promotion_discount_minor <= 0 THEN
+    v_promotion_id := NULL;
+    v_promotion_slug_out := NULL;
+    v_promotion_discount_minor := 0;
+    v_promotion_code_id := NULL;
   END IF;
 
   v_recurring_amount := COALESCE(v_pricing.recurring_amount_minor, v_pricing.final_amount_minor);
@@ -39182,10 +40303,7 @@ BEGIN
     promotion_id = v_promotion_id,
     promotion_slug = v_promotion_slug_out,
     promotion_discount_minor = v_promotion_discount_minor,
-    promotion_code_id = CASE
-      WHEN v_promotion_id IS NULL THEN NULL
-      ELSE v_promotion_code_id
-    END,
+    promotion_code_id = v_promotion_code_id,
     booking_for_self = v_booking_for_self,
     site_contact_name = v_site_contact_name,
     site_contact_phone = v_site_contact_phone,
@@ -39213,14 +40331,155 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'booking_update_failed');
   END IF;
 
+  v_promo_applied := v_promotion_id IS NOT NULL AND v_promotion_discount_minor > 0;
+
+  IF v_promo_applied THEN
+    -- Drop prior reservations for a different promotion on this booking before reserving B.
+    UPDATE public.promotion_redemptions
+    SET
+      status = 'released',
+      expires_at = NULL
+    WHERE booking_id = p_booking_id
+      AND status = 'reserved'
+      AND promotion_id IS DISTINCT FROM v_promotion_id;
+
+    v_reserve := public.reserve_promotion_for_booking(p_booking_id);
+    IF coalesce((v_reserve->>'success')::boolean, false) IS NOT TRUE THEN
+      -- Reservation failed: atomically strip promo and reprice both snapshots.
+      SELECT *
+      INTO v_pricing
+      FROM public.compute_booking_pricing(
+        v_service_id,
+        v_duration_hours_raw,
+        v_scheduled_date,
+        v_timezone_name,
+        v_sub.recurrence_interval,
+        true,
+        v_include_booking_cover,
+        v_supplies_option,
+        v_cleaner_id,
+        v_extra_task_ids,
+        v_service_duration_option_id
+      )
+      LIMIT 1;
+
+      IF NOT FOUND THEN
+        RETURN jsonb_build_object('success', false, 'error', 'pricing_failed_after_reserve');
+      END IF;
+
+      v_promotion_id := NULL;
+      v_promotion_slug_out := NULL;
+      v_promotion_discount_minor := 0;
+      v_promotion_code_id := NULL;
+      v_recurring_amount := COALESCE(v_pricing.recurring_amount_minor, v_pricing.final_amount_minor);
+      v_first_charge := COALESCE(v_pricing.first_charge_amount_minor, v_pricing.final_amount_minor);
+      v_discount_bps := COALESCE(v_pricing.discount_rate_bps, 0);
+      v_repriced_without_promo := true;
+
+      UPDATE public.subscriptions s
+      SET
+        amount = v_recurring_amount,
+        recurring_amount_minor = v_recurring_amount,
+        first_charge_amount_minor = v_first_charge,
+        discount_rate_bps = v_discount_bps,
+        pricing_version = v_pricing.pricing_version,
+        currency = v_pricing.currency,
+        duration_hours = ROUND(v_pricing.duration_hours)::integer,
+        updated_at = now()
+      WHERE s.id = v_sub.id
+        AND lower(coalesce(s.status, '')) = 'pending';
+
+      IF NOT FOUND THEN
+        RETURN jsonb_build_object('success', false, 'error', 'subscription_update_failed');
+      END IF;
+
+      UPDATE public.bookings b
+      SET
+        duration_hours = v_pricing.duration_hours,
+        total_price = v_pricing.final_amount_minor,
+        final_amount_minor = v_pricing.final_amount_minor,
+        core_amount_minor = v_pricing.core_amount_minor,
+        same_day_surcharge_minor = v_pricing.same_day_surcharge_minor,
+        weekend_surcharge_minor = v_pricing.weekend_surcharge_minor,
+        recurring_discount_minor = v_pricing.recurring_discount_minor,
+        is_same_day = v_pricing.is_same_day,
+        is_weekend = v_pricing.is_weekend,
+        pricing_version = v_pricing.pricing_version,
+        currency = v_pricing.currency,
+        platform_fee = v_pricing.platform_fee_major,
+        booking_cover = v_include_booking_cover,
+        booking_cover_amount = v_pricing.booking_cover_major,
+        supplies_option = v_pricing.supplies_option,
+        supplies_allowance_minor = v_pricing.supplies_allowance_minor,
+        work_rate_ghs_per_hour = v_pricing.work_rate_ghs_per_hour,
+        cleaner_earnings_minor = v_pricing.cleaner_earnings_minor,
+        promotion_id = NULL,
+        promotion_slug = NULL,
+        promotion_discount_minor = 0,
+        promotion_code_id = NULL,
+        updated_at = now()
+      WHERE b.id = p_booking_id
+        AND b.customer_id = p_customer_id
+      RETURNING * INTO v_updated;
+
+      IF NOT FOUND THEN
+        RETURN jsonb_build_object('success', false, 'error', 'booking_update_failed');
+      END IF;
+
+      -- No promotion remains: release every reserved row for this booking.
+      UPDATE public.promotion_redemptions
+      SET
+        status = 'released',
+        expires_at = NULL
+      WHERE booking_id = p_booking_id
+        AND status = 'reserved';
+    END IF;
+  ELSE
+    -- A → no promotion: release all reserved rows for this booking.
+    UPDATE public.promotion_redemptions
+    SET
+      status = 'released',
+      expires_at = NULL
+    WHERE booking_id = p_booking_id
+      AND status = 'reserved';
+
+    v_release := public.release_own_welcome_promotion_reservation(p_booking_id);
+    IF coalesce((v_release->>'success')::boolean, false) IS NOT TRUE
+       AND coalesce(v_release->>'error', '') NOT IN ('', 'not_authenticated') THEN
+      -- Non-fatal for sync when there was nothing to release; only fail hard on auth.
+      NULL;
+    END IF;
+  END IF;
+
   RETURN jsonb_build_object(
     'success', true,
     'booking_id', v_updated.id,
     'duration_computed', v_updated.duration_computed,
     'duration_final', v_updated.duration_final,
+    'duration_hours', v_pricing.duration_hours,
     'final_amount_minor', v_updated.final_amount_minor,
+    'core_amount_minor', v_updated.core_amount_minor,
     'recurring_amount_minor', v_recurring_amount,
-    'first_charge_amount_minor', v_first_charge
+    'first_charge_amount_minor', v_first_charge,
+    'discount_rate_bps', v_discount_bps,
+    'pricing_version', v_pricing.pricing_version,
+    'currency', v_pricing.currency,
+    'platform_fee_major', v_pricing.platform_fee_major,
+    'booking_cover_major', v_pricing.booking_cover_major,
+    'work_rate_ghs_per_hour', v_pricing.work_rate_ghs_per_hour,
+    'cleaner_earnings_minor', v_pricing.cleaner_earnings_minor,
+    'same_day_surcharge_minor', v_pricing.same_day_surcharge_minor,
+    'weekend_surcharge_minor', v_pricing.weekend_surcharge_minor,
+    'recurring_discount_minor', v_pricing.recurring_discount_minor,
+    'is_same_day', v_pricing.is_same_day,
+    'is_weekend', v_pricing.is_weekend,
+    'supplies_option', v_pricing.supplies_option,
+    'supplies_allowance_minor', v_pricing.supplies_allowance_minor,
+    'promotion_id', v_updated.promotion_id,
+    'promotion_slug', v_updated.promotion_slug,
+    'promotion_discount_minor', coalesce(v_updated.promotion_discount_minor, 0),
+    'promotion_code_id', v_updated.promotion_code_id,
+    'repriced_without_promo', v_repriced_without_promo
   );
 END;
 $function$
@@ -42028,6 +43287,8 @@ CREATE TRIGGER trigger_sync_convo_time AFTER INSERT ON messages FOR EACH ROW EXE
 CREATE TRIGGER trg_micro_tasks_updated_at BEFORE UPDATE ON micro_tasks FOR EACH ROW EXECUTE FUNCTION set_micro_tasks_updated_at();
 
 CREATE TRIGGER trigger_notify_inbox_notification_push AFTER INSERT ON notifications FOR EACH ROW EXECUTE FUNCTION notify_inbox_notification_push();
+
+CREATE TRIGGER payout_methods_acquire_user_lock BEFORE INSERT OR DELETE OR UPDATE ON payout_methods FOR EACH ROW EXECUTE FUNCTION _payout_methods_acquire_user_lock_trigger();
 
 CREATE TRIGGER payout_methods_touch_updated_at BEFORE UPDATE ON payout_methods FOR EACH ROW EXECUTE FUNCTION touch_payout_methods_updated_at();
 
