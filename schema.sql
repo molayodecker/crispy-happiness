@@ -175,7 +175,9 @@ CREATE TYPE "public"."service_category" AS ENUM (
     'ironing',
     'flooding',
     'airbnb',
-    'quick_tasks'
+    'quick_tasks',
+    'caregiving',
+    'pet_care'
 );
 
 
@@ -2444,6 +2446,45 @@ ALTER FUNCTION "public"."approve_cleaner_application"("p_application_id" "uuid")
 
 
 COMMENT ON FUNCTION "public"."approve_cleaner_application"("p_application_id" "uuid") IS 'Transactionally approve or repair a cleaner application. Service-role only. Errors: P0001 application_not_found, P0002 user_not_found.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."assert_care_pet_service_bookable"("p_service_id" integer) RETURNS "void"
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_category public.service_category;
+BEGIN
+  IF p_service_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT st.category
+  INTO v_category
+  FROM public.service_types st
+  WHERE st.id = p_service_id;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF v_category IN (
+    'caregiving'::public.service_category,
+    'pet_care'::public.service_category
+  )
+  AND NOT public.is_care_pet_booking_enabled() THEN
+    RAISE EXCEPTION 'This service is not available yet'
+      USING ERRCODE = 'P0001';
+  END IF;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."assert_care_pet_service_bookable"("p_service_id" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."assert_care_pet_service_bookable"("p_service_id" integer) IS 'Rejects caregiving/pet_care service IDs while CARE_PET_BOOKING is off.';
 
 
 
@@ -5977,6 +6018,8 @@ BEGIN
     RAISE EXCEPTION 'Invalid or inactive service';
   END IF;
 
+  PERFORM public.assert_care_pet_service_bookable(p_service_id);
+
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
   END IF;
@@ -6296,6 +6339,8 @@ BEGIN
   IF NOT FOUND OR v_service_active IS DISTINCT FROM true THEN
     RAISE EXCEPTION 'Invalid or inactive service';
   END IF;
+
+  PERFORM public.assert_care_pet_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -6625,6 +6670,8 @@ BEGIN
   IF NOT FOUND OR v_service_active IS DISTINCT FROM true THEN
     RAISE EXCEPTION 'Invalid or inactive service';
   END IF;
+
+  PERFORM public.assert_care_pet_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -9060,6 +9107,24 @@ $$;
 
 
 ALTER FUNCTION "public"."direct_assignment_hold_minutes"("p_scheduled_date" "date", "p_timezone" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."enforce_care_pet_booking_gate"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  PERFORM public.assert_care_pet_service_bookable(NEW.service_id);
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."enforce_care_pet_booking_gate"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."enforce_care_pet_booking_gate"() IS 'Blocks caregiving/pet_care bookings while CARE_PET_BOOKING is off.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."ensure_single_default_platform_fee"() RETURNS "trigger"
@@ -12988,11 +13053,12 @@ ALTER FUNCTION "public"."get_profile_location_coords"("p_user_id" "uuid") OWNER 
 
 CREATE OR REPLACE FUNCTION "public"."get_service_categories"() RETURNS TABLE("id" bigint, "name" "text", "icon" "text", "service_types" "jsonb")
     LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
     AS $$
 BEGIN
   RETURN QUERY
-  SELECT 
-    sc.id::bigint, -- FIX: Explicitly cast the ID to match the return table definition
+  SELECT
+    sc.id::bigint,
     sc.name,
     sc.icon,
     COALESCE(
@@ -13003,18 +13069,26 @@ BEGIN
           'price', st.price,
           'duration', st.duration
         )
-      ) FILTER (WHERE st.id IS NOT NULL), 
+      ) FILTER (WHERE st.id IS NOT NULL),
       '[]'::jsonb
-    ) as service_types
-  FROM service_categories sc
-  LEFT JOIN service_types st ON st.category_id = sc.id
-  WHERE st.active = true OR st.id IS NULL
+    ) AS service_types
+  FROM public.service_categories sc
+  LEFT JOIN public.service_types st ON st.category_id = sc.id
+  WHERE (st.active = true OR st.id IS NULL)
+    AND (
+      public.is_care_pet_catalog_visible()
+      OR COALESCE(sc.slug, '') NOT IN ('caregiving', 'pet_care')
+    )
   GROUP BY sc.id, sc.name, sc.icon;
 END;
 $$;
 
 
 ALTER FUNCTION "public"."get_service_categories"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_service_categories"() IS 'Active service catalog; Caregiving/Pet Care omitted while CARE_PET_BOOK_NOW is off.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."get_timezone_from_coordinates"("latitude" numeric, "longitude" numeric) RETURNS "text"
@@ -13239,6 +13313,61 @@ $$;
 
 
 ALTER FUNCTION "public"."get_user_role"("p_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_verification_service_catalog"() RETURNS TABLE("category_id" bigint, "category_name" "text", "category_icon" "text", "category_slug" "text", "service_type_id" integer, "service_type_name" "text", "service_category" "public"."service_category", "specialty_slug" "text", "price" numeric, "duration" "text", "features" "text"[], "active" boolean)
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_pet_care_specialization boolean :=
+    public.is_app_feature_enabled('PET_CARE_SPECIALIZATION', 'production');
+BEGIN
+  RETURN QUERY
+  SELECT
+    sc.id::bigint AS category_id,
+    sc.name AS category_name,
+    sc.icon AS category_icon,
+    sc.slug AS category_slug,
+    st.id AS service_type_id,
+    st.name AS service_type_name,
+    st.category AS service_category,
+    st.specialty_slug,
+    st.price,
+    st.duration,
+    st.features,
+    COALESCE(st.active, false) AS active
+  FROM public.service_categories sc
+  INNER JOIN public.service_types st
+    ON st.category_id = sc.id
+   AND COALESCE(st.active, false) = true
+   AND COALESCE(NULLIF(btrim(st.specialty_slug), ''), NULL) IS NOT NULL
+  WHERE
+    (
+      COALESCE(sc.slug, '') NOT IN ('caregiving', 'pet_care')
+      AND st.category IS DISTINCT FROM 'caregiving'::public.service_category
+      AND st.category IS DISTINCT FROM 'pet_care'::public.service_category
+    )
+    OR (
+      v_pet_care_specialization
+      AND (
+        COALESCE(sc.slug, '') IN ('caregiving', 'pet_care')
+        OR st.category IN (
+          'caregiving'::public.service_category,
+          'pet_care'::public.service_category
+        )
+      )
+    )
+  ORDER BY sc.id, st.id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_verification_service_catalog"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_verification_service_catalog"() IS 'Verification services catalog. Includes caregiving/pet_care rows when PET_CARE_SPECIALIZATION is enabled, independent of CARE_PET_BOOK_NOW.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."get_welcome_offer_eligibility"("p_customer_id" "uuid", "p_promotion_slug" "text", "p_channel" "text", "p_service_id" integer DEFAULT NULL::integer, "p_lat" double precision DEFAULT NULL::double precision, "p_lng" double precision DEFAULT NULL::double precision, "p_extra_task_ids" "text"[] DEFAULT NULL::"text"[], "p_is_recurring" boolean DEFAULT false, "p_booking_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
@@ -13649,6 +13778,30 @@ $$;
 ALTER FUNCTION "public"."is_admin"("user_uuid" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."is_app_feature_enabled"("p_key" "text", "p_channel" "text" DEFAULT 'production'::"text") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT COALESCE(
+    (
+      SELECT f.enabled
+      FROM public.app_feature_flags f
+      WHERE f.key = p_key
+        AND f.channel = p_channel
+      LIMIT 1
+    ),
+    false
+  );
+$$;
+
+
+ALTER FUNCTION "public"."is_app_feature_enabled"("p_key" "text", "p_channel" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."is_app_feature_enabled"("p_key" "text", "p_channel" "text") IS 'Fail-closed feature flag lookup. Unknown key/channel returns false.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."is_authorized_quick_tasks_worker"("p_cleaner_id" "uuid", "p_direct_assigned_cleaner_id" "uuid", "p_worker_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -13670,6 +13823,36 @@ ALTER FUNCTION "public"."is_authorized_quick_tasks_worker"("p_cleaner_id" "uuid"
 
 
 COMMENT ON FUNCTION "public"."is_authorized_quick_tasks_worker"("p_cleaner_id" "uuid", "p_direct_assigned_cleaner_id" "uuid", "p_worker_id" "uuid") IS 'Quick Tasks job worker: assigned cleaner_id, or direct_assigned only when cleaner_id is unset.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."is_care_pet_booking_enabled"() RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT public.is_app_feature_enabled('CARE_PET_BOOKING', 'production');
+$$;
+
+
+ALTER FUNCTION "public"."is_care_pet_booking_enabled"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."is_care_pet_booking_enabled"() IS 'True when CARE_PET_BOOKING is enabled on production (pricing/booking lock).';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."is_care_pet_catalog_visible"() RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT public.is_app_feature_enabled('CARE_PET_BOOK_NOW', 'production');
+$$;
+
+
+ALTER FUNCTION "public"."is_care_pet_catalog_visible"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."is_care_pet_catalog_visible"() IS 'True when CARE_PET_BOOK_NOW is enabled on production.';
 
 
 
@@ -18693,6 +18876,20 @@ COMMENT ON FUNCTION "public"."service_schedule_timestamptz"("p_schedule_date" "d
 
 
 
+CREATE OR REPLACE FUNCTION "public"."set_app_feature_flags_updated_at"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  NEW.updated_at := timezone('utc', now());
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."set_app_feature_flags_updated_at"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."set_booking_completed_at"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     SET "search_path" TO 'public'
@@ -22452,6 +22649,39 @@ COMMENT ON TABLE "public"."admin_cash_payouts" IS 'Offline/cash cleaner payouts 
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."app_feature_flags" (
+    "key" "text" NOT NULL,
+    "channel" "text" DEFAULT 'production'::"text" NOT NULL,
+    "enabled" boolean DEFAULT false NOT NULL,
+    "config" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "timezone"('utc'::"text", "now"()) NOT NULL,
+    CONSTRAINT "app_feature_flags_channel_check" CHECK (("channel" = ANY (ARRAY['production'::"text", 'preview'::"text"])))
+);
+
+
+ALTER TABLE "public"."app_feature_flags" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."app_feature_flags" IS 'Runtime feature flags for mobile/server. Unknown keys fail closed (false).';
+
+
+
+COMMENT ON COLUMN "public"."app_feature_flags"."key" IS 'Stable flag name, e.g. CARE_PET_BOOK_NOW, PET_CARE_SPECIALIZATION, CARE_PET_BOOKING.';
+
+
+
+COMMENT ON COLUMN "public"."app_feature_flags"."channel" IS 'Release channel matching app_update_policy (production | preview).';
+
+
+
+COMMENT ON COLUMN "public"."app_feature_flags"."enabled" IS 'When false, feature must remain hidden / rejected. Default false.';
+
+
+
+COMMENT ON COLUMN "public"."app_feature_flags"."config" IS 'Optional non-secret JSON payload for the flag (thresholds, copy keys, etc.).';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."app_update_policy" (
     "channel" "text" NOT NULL,
     "min_version" "text" NOT NULL,
@@ -25273,6 +25503,11 @@ ALTER TABLE ONLY "public"."admin_cash_payouts"
 
 
 
+ALTER TABLE ONLY "public"."app_feature_flags"
+    ADD CONSTRAINT "app_feature_flags_pkey" PRIMARY KEY ("key", "channel");
+
+
+
 ALTER TABLE ONLY "public"."app_update_policy"
     ADD CONSTRAINT "app_update_policy_pkey" PRIMARY KEY ("channel");
 
@@ -27088,6 +27323,10 @@ CREATE INDEX "whatsapp_inbox_messages_business_phone_e164_idx" ON "public"."what
 
 
 
+CREATE OR REPLACE TRIGGER "app_feature_flags_set_updated_at" BEFORE UPDATE ON "public"."app_feature_flags" FOR EACH ROW EXECUTE FUNCTION "public"."set_app_feature_flags_updated_at"();
+
+
+
 CREATE OR REPLACE TRIGGER "bookings_compute_scheduled_at_utc" BEFORE INSERT OR UPDATE OF "scheduled_date", "scheduled_time", "timezone_name" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."compute_booking_scheduled_at_utc"();
 
 
@@ -27197,6 +27436,10 @@ CREATE OR REPLACE TRIGGER "trg_cascade_cancel_pending_subscription_after_booking
 
 
 CREATE OR REPLACE TRIGGER "trg_credit_cleaner_wallet_on_completion" AFTER UPDATE OF "status" ON "public"."bookings" FOR EACH ROW WHEN ((("new"."status" = 'completed'::"public"."booking_status") AND ("old"."status" IS DISTINCT FROM 'completed'::"public"."booking_status"))) EXECUTE FUNCTION "public"."handle_job_completion"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_enforce_care_pet_booking_gate" BEFORE INSERT OR UPDATE OF "service_id" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."enforce_care_pet_booking_gate"();
 
 
 
@@ -28418,11 +28661,11 @@ CREATE POLICY "anon_read_invite_codes" ON "public"."invite_codes" FOR SELECT TO 
 
 
 
-CREATE POLICY "anon_read_service_categories" ON "public"."service_categories" FOR SELECT TO "anon" USING (true);
+CREATE POLICY "anon_read_service_categories" ON "public"."service_categories" FOR SELECT TO "anon" USING (("public"."is_care_pet_catalog_visible"() OR (COALESCE("slug", ''::"text") <> ALL (ARRAY['caregiving'::"text", 'pet_care'::"text"]))));
 
 
 
-CREATE POLICY "anon_read_service_types" ON "public"."service_types" FOR SELECT TO "anon" USING (true);
+CREATE POLICY "anon_read_service_types" ON "public"."service_types" FOR SELECT TO "anon" USING (("public"."is_care_pet_catalog_visible"() OR (("category" IS DISTINCT FROM 'caregiving'::"public"."service_category") AND ("category" IS DISTINCT FROM 'pet_care'::"public"."service_category"))));
 
 
 
@@ -28446,11 +28689,18 @@ CREATE POLICY "anyone_read_roles" ON "public"."roles" FOR SELECT TO "authenticat
 
 
 
-CREATE POLICY "anyone_read_service_categories" ON "public"."service_categories" FOR SELECT USING (true);
+CREATE POLICY "anyone_read_service_categories" ON "public"."service_categories" FOR SELECT USING (("public"."is_care_pet_catalog_visible"() OR (COALESCE("slug", ''::"text") <> ALL (ARRAY['caregiving'::"text", 'pet_care'::"text"]))));
 
 
 
-CREATE POLICY "anyone_read_service_types" ON "public"."service_types" FOR SELECT USING (true);
+CREATE POLICY "anyone_read_service_types" ON "public"."service_types" FOR SELECT USING (("public"."is_care_pet_catalog_visible"() OR (("category" IS DISTINCT FROM 'caregiving'::"public"."service_category") AND ("category" IS DISTINCT FROM 'pet_care'::"public"."service_category"))));
+
+
+
+ALTER TABLE "public"."app_feature_flags" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "app_feature_flags_public_read" ON "public"."app_feature_flags" FOR SELECT TO "authenticated", "anon" USING (true);
 
 
 
@@ -31950,6 +32200,13 @@ GRANT ALL ON FUNCTION "public"."approve_cleaner_application"("p_application_id" 
 
 
 
+REVOKE ALL ON FUNCTION "public"."assert_care_pet_service_bookable"("p_service_id" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."assert_care_pet_service_bookable"("p_service_id" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."assert_care_pet_service_bookable"("p_service_id" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."assert_care_pet_service_bookable"("p_service_id" integer) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") TO "anon";
 GRANT ALL ON FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") TO "authenticated";
@@ -34094,6 +34351,12 @@ GRANT ALL ON FUNCTION "public"."enablelongtransactions"() TO "postgres";
 GRANT ALL ON FUNCTION "public"."enablelongtransactions"() TO "anon";
 GRANT ALL ON FUNCTION "public"."enablelongtransactions"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."enablelongtransactions"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."enforce_care_pet_booking_gate"() TO "anon";
+GRANT ALL ON FUNCTION "public"."enforce_care_pet_booking_gate"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."enforce_care_pet_booking_gate"() TO "service_role";
 
 
 
@@ -36817,6 +37080,13 @@ GRANT ALL ON FUNCTION "public"."get_user_role"("p_user_id" "uuid") TO "service_r
 
 
 
+REVOKE ALL ON FUNCTION "public"."get_verification_service_catalog"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_verification_service_catalog"() TO "anon";
+GRANT ALL ON FUNCTION "public"."get_verification_service_catalog"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_verification_service_catalog"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."get_welcome_offer_eligibility"("p_customer_id" "uuid", "p_promotion_slug" "text", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_welcome_offer_eligibility"("p_customer_id" "uuid", "p_promotion_slug" "text", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."get_welcome_offer_eligibility"("p_customer_id" "uuid", "p_promotion_slug" "text", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid") TO "authenticated";
@@ -38955,8 +39225,29 @@ GRANT ALL ON FUNCTION "public"."is_ancestor_of"("name", "name", "name", "name", 
 
 
 
+REVOKE ALL ON FUNCTION "public"."is_app_feature_enabled"("p_key" "text", "p_channel" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_app_feature_enabled"("p_key" "text", "p_channel" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_app_feature_enabled"("p_key" "text", "p_channel" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_app_feature_enabled"("p_key" "text", "p_channel" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."is_authorized_quick_tasks_worker"("p_cleaner_id" "uuid", "p_direct_assigned_cleaner_id" "uuid", "p_worker_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."is_authorized_quick_tasks_worker"("p_cleaner_id" "uuid", "p_direct_assigned_cleaner_id" "uuid", "p_worker_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."is_care_pet_booking_enabled"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_care_pet_booking_enabled"() TO "anon";
+GRANT ALL ON FUNCTION "public"."is_care_pet_booking_enabled"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_care_pet_booking_enabled"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."is_care_pet_catalog_visible"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_care_pet_catalog_visible"() TO "anon";
+GRANT ALL ON FUNCTION "public"."is_care_pet_catalog_visible"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_care_pet_catalog_visible"() TO "service_role";
 
 
 
@@ -42184,6 +42475,12 @@ GRANT ALL ON FUNCTION "public"."server_privs_are"("name", "name", "name"[], "tex
 GRANT ALL ON FUNCTION "public"."service_schedule_timestamptz"("p_schedule_date" "date", "p_schedule_time" time without time zone, "p_timezone" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."service_schedule_timestamptz"("p_schedule_date" "date", "p_schedule_time" time without time zone, "p_timezone" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."service_schedule_timestamptz"("p_schedule_date" "date", "p_schedule_time" time without time zone, "p_timezone" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."set_app_feature_flags_updated_at"() TO "anon";
+GRANT ALL ON FUNCTION "public"."set_app_feature_flags_updated_at"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_app_feature_flags_updated_at"() TO "service_role";
 
 
 
@@ -46407,6 +46704,12 @@ GRANT ALL ON TABLE "public"."admin_broadcasts" TO "service_role";
 
 
 GRANT ALL ON TABLE "public"."admin_cash_payouts" TO "service_role";
+
+
+
+GRANT SELECT,REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."app_feature_flags" TO "anon";
+GRANT SELECT,REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."app_feature_flags" TO "authenticated";
+GRANT ALL ON TABLE "public"."app_feature_flags" TO "service_role";
 
 
 

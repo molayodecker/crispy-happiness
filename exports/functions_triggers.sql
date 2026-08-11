@@ -6213,6 +6213,40 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.assert_care_pet_service_bookable(p_service_id integer)
+ RETURNS void
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_category public.service_category;
+BEGIN
+  IF p_service_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT st.category
+  INTO v_category
+  FROM public.service_types st
+  WHERE st.id = p_service_id;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF v_category IN (
+    'caregiving'::public.service_category,
+    'pet_care'::public.service_category
+  )
+  AND NOT public.is_care_pet_booking_enabled() THEN
+    RAISE EXCEPTION 'This service is not available yet'
+      USING ERRCODE = 'P0001';
+  END IF;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.assert_quick_tasks_cleaner_eligible(p_cleaner_id uuid, p_customer_id uuid, p_required_specialty_slugs jsonb)
  RETURNS void
  LANGUAGE plpgsql
@@ -11157,6 +11191,8 @@ BEGIN
     RAISE EXCEPTION 'Invalid or inactive service';
   END IF;
 
+  PERFORM public.assert_care_pet_service_bookable(p_service_id);
+
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
   END IF;
@@ -11475,6 +11511,8 @@ BEGIN
   IF NOT FOUND OR v_service_active IS DISTINCT FROM true THEN
     RAISE EXCEPTION 'Invalid or inactive service';
   END IF;
+
+  PERFORM public.assert_care_pet_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -11803,6 +11841,8 @@ BEGIN
   IF NOT FOUND OR v_service_active IS DISTINCT FROM true THEN
     RAISE EXCEPTION 'Invalid or inactive service';
   END IF;
+
+  PERFORM public.assert_care_pet_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -15066,6 +15106,19 @@ BEGIN
 	END IF;
 
 	RETURN 'Long transactions support enabled';
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.enforce_care_pet_booking_gate()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  PERFORM public.assert_care_pet_service_bookable(NEW.service_id);
+  RETURN NEW;
 END;
 $function$
 
@@ -21830,11 +21883,12 @@ CREATE OR REPLACE FUNCTION public.get_service_categories()
  RETURNS TABLE(id bigint, name text, icon text, service_types jsonb)
  LANGUAGE plpgsql
  SECURITY DEFINER
+ SET search_path TO 'public'
 AS $function$
 BEGIN
   RETURN QUERY
-  SELECT 
-    sc.id::bigint, -- FIX: Explicitly cast the ID to match the return table definition
+  SELECT
+    sc.id::bigint,
     sc.name,
     sc.icon,
     COALESCE(
@@ -21845,12 +21899,16 @@ BEGIN
           'price', st.price,
           'duration', st.duration
         )
-      ) FILTER (WHERE st.id IS NOT NULL), 
+      ) FILTER (WHERE st.id IS NOT NULL),
       '[]'::jsonb
-    ) as service_types
-  FROM service_categories sc
-  LEFT JOIN service_types st ON st.category_id = sc.id
-  WHERE st.active = true OR st.id IS NULL
+    ) AS service_types
+  FROM public.service_categories sc
+  LEFT JOIN public.service_types st ON st.category_id = sc.id
+  WHERE (st.active = true OR st.id IS NULL)
+    AND (
+      public.is_care_pet_catalog_visible()
+      OR COALESCE(sc.slug, '') NOT IN ('caregiving', 'pet_care')
+    )
   GROUP BY sc.id, sc.name, sc.icon;
 END;
 $function$
@@ -22068,6 +22126,56 @@ BEGIN
         'cleaner', v_cleaner,
         'roles', COALESCE(v_roles, '{}'::text[])
     );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_verification_service_catalog()
+ RETURNS TABLE(category_id bigint, category_name text, category_icon text, category_slug text, service_type_id integer, service_type_name text, service_category service_category, specialty_slug text, price numeric, duration text, features text[], active boolean)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_pet_care_specialization boolean :=
+    public.is_app_feature_enabled('PET_CARE_SPECIALIZATION', 'production');
+BEGIN
+  RETURN QUERY
+  SELECT
+    sc.id::bigint AS category_id,
+    sc.name AS category_name,
+    sc.icon AS category_icon,
+    sc.slug AS category_slug,
+    st.id AS service_type_id,
+    st.name AS service_type_name,
+    st.category AS service_category,
+    st.specialty_slug,
+    st.price,
+    st.duration,
+    st.features,
+    COALESCE(st.active, false) AS active
+  FROM public.service_categories sc
+  INNER JOIN public.service_types st
+    ON st.category_id = sc.id
+   AND COALESCE(st.active, false) = true
+   AND COALESCE(NULLIF(btrim(st.specialty_slug), ''), NULL) IS NOT NULL
+  WHERE
+    (
+      COALESCE(sc.slug, '') NOT IN ('caregiving', 'pet_care')
+      AND st.category IS DISTINCT FROM 'caregiving'::public.service_category
+      AND st.category IS DISTINCT FROM 'pet_care'::public.service_category
+    )
+    OR (
+      v_pet_care_specialization
+      AND (
+        COALESCE(sc.slug, '') IN ('caregiving', 'pet_care')
+        OR st.category IN (
+          'caregiving'::public.service_category,
+          'pet_care'::public.service_category
+        )
+      )
+    )
+  ORDER BY sc.id, st.id;
 END;
 $function$
 
@@ -25344,6 +25452,25 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.is_app_feature_enabled(p_key text, p_channel text DEFAULT 'production'::text)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT COALESCE(
+    (
+      SELECT f.enabled
+      FROM public.app_feature_flags f
+      WHERE f.key = p_key
+        AND f.channel = p_channel
+      LIMIT 1
+    ),
+    false
+  );
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.is_authorized_quick_tasks_worker(p_cleaner_id uuid, p_direct_assigned_cleaner_id uuid, p_worker_id uuid)
  RETURNS boolean
  LANGUAGE sql
@@ -25360,6 +25487,26 @@ AS $function$
         AND p_direct_assigned_cleaner_id = p_worker_id
       )
     );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.is_care_pet_booking_enabled()
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT public.is_app_feature_enabled('CARE_PET_BOOKING', 'production');
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.is_care_pet_catalog_visible()
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT public.is_app_feature_enabled('CARE_PET_BOOK_NOW', 'production');
 $function$
 
 
@@ -35069,6 +35216,18 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.set_app_feature_flags_updated_at()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  NEW.updated_at := timezone('utc', now());
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.set_booking_completed_at()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -43226,6 +43385,8 @@ CREATE TRIGGER on_auth_user_identity_lookup_sync AFTER INSERT OR DELETE OR UPDAT
 
 CREATE TRIGGER on_auth_user_updated_sync_public AFTER UPDATE ON auth.users FOR EACH ROW EXECUTE FUNCTION sync_auth_user_to_public_user();
 
+CREATE TRIGGER app_feature_flags_set_updated_at BEFORE UPDATE ON app_feature_flags FOR EACH ROW EXECUTE FUNCTION set_app_feature_flags_updated_at();
+
 CREATE TRIGGER trg_booking_micro_tasks_updated_at BEFORE UPDATE ON booking_micro_tasks FOR EACH ROW EXECUTE FUNCTION set_micro_tasks_updated_at();
 
 CREATE TRIGGER trg_booking_refunds_updated_at BEFORE UPDATE ON booking_refunds FOR EACH ROW EXECUTE FUNCTION touch_booking_refunds_updated_at();
@@ -43255,6 +43416,8 @@ CREATE TRIGGER trg_bookings_set_completed_at BEFORE UPDATE OF status ON bookings
 CREATE TRIGGER trg_cascade_cancel_pending_subscription_after_booking_cancel AFTER UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION cascade_cancel_pending_subscription_after_booking_cancel();
 
 CREATE TRIGGER trg_credit_cleaner_wallet_on_completion AFTER UPDATE OF status ON bookings FOR EACH ROW WHEN (new.status = 'completed'::booking_status AND old.status IS DISTINCT FROM 'completed'::booking_status) EXECUTE FUNCTION handle_job_completion();
+
+CREATE TRIGGER trg_enforce_care_pet_booking_gate BEFORE INSERT OR UPDATE OF service_id ON bookings FOR EACH ROW EXECUTE FUNCTION enforce_care_pet_booking_gate();
 
 CREATE TRIGGER trg_init_direct_assignment_on_paid BEFORE INSERT OR UPDATE OF payment_status, cleaner_id ON bookings FOR EACH ROW EXECUTE FUNCTION trg_init_direct_assignment_on_paid();
 
