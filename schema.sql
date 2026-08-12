@@ -4095,6 +4095,380 @@ $$;
 ALTER FUNCTION "public"."cascade_cancel_pending_subscription_after_booking_cancel"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."change_admin_monthly_schedule_weekdays"("p_group_id" "uuid", "p_weekdays" integer[], "p_as_of_date" "date" DEFAULT NULL::"date") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_group public.admin_booking_schedule_groups%ROWTYPE;
+  v_tz text;
+  v_today date;
+  v_remaining_start date;
+  v_weekdays integer[];
+  v_new_dates date[];
+  v_mutable_ids uuid[] := ARRAY[]::uuid[];
+  v_mutable_dates date[] := ARRAY[]::date[];
+  v_created_ids uuid[] := ARRAY[]::uuid[];
+  v_kept_total_minor integer := 0;
+  v_kept_fee_minor integer := 0;
+  v_kept_count integer := 0;
+  v_remaining_total integer;
+  v_remaining_fee integer;
+  v_new_count integer;
+  v_price_share integer;
+  v_price_remainder integer;
+  v_fee_share integer;
+  v_fee_remainder integer;
+  v_idx integer := 0;
+  v_date date;
+  v_bid uuid;
+  v_total_minor integer;
+  v_fee_minor integer;
+  v_service_name text;
+  v_location public.bookings.location_coordinates%TYPE;
+  v_phone text;
+  v_start_local timestamp;
+  v_end_local timestamp;
+  v_old_weekdays integer[];
+  v_month_start date;
+  v_month_end date;
+  v_period_visit_count integer;
+  v_full_month_visit_count integer;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RAISE EXCEPTION 'group id required' USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT coalesce(array_agg(DISTINCT d ORDER BY d), ARRAY[]::integer[])
+  INTO v_weekdays
+  FROM unnest(COALESCE(p_weekdays, ARRAY[]::integer[])) AS d
+  WHERE d BETWEEN 1 AND 7;
+
+  IF coalesce(cardinality(v_weekdays), 0) = 0 THEN
+    RAISE EXCEPTION 'select at least one weekday (ISO 1=Mon … 7=Sun)'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT *
+  INTO v_group
+  FROM public.admin_booking_schedule_groups g
+  WHERE g.id = p_group_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule group not found' USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF v_group.status <> 'open' THEN
+    RAISE EXCEPTION 'only open schedule groups can change weekdays'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- Serialize with settle / concurrent weekday changes on the same visits.
+  PERFORM 1
+  FROM public.bookings b
+  WHERE b.schedule_group_id = v_group.id
+  ORDER BY b.scheduled_date, b.id
+  FOR UPDATE;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.bookings b
+    WHERE b.schedule_group_id = v_group.id
+      AND b.status IS DISTINCT FROM 'cancelled'::public.booking_status
+      AND b.payment_status IN ('paid', 'refunded', 'partially_refunded')
+  ) THEN
+    RAISE EXCEPTION
+      'schedule group contains an already paid or refunded booking'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_tz := nullif(trim(COALESCE(v_group.timezone, '')), '');
+  IF v_tz IS NULL THEN
+    v_tz := 'Africa/Accra';
+  END IF;
+
+  v_today := COALESCE(
+    p_as_of_date,
+    (timezone(v_tz, now()))::date
+  );
+  v_remaining_start := GREATEST(v_today, v_group.period_start);
+
+  IF v_remaining_start > v_group.period_end THEN
+    RAISE EXCEPTION 'this schedule period has already ended'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_new_dates := public.expand_admin_schedule_weekday_dates(
+    v_weekdays,
+    v_remaining_start,
+    v_group.period_end,
+    62
+  );
+  v_new_count := cardinality(v_new_dates);
+
+  SELECT coalesce(array_agg(DISTINCT d ORDER BY d), ARRAY[]::integer[])
+  INTO v_old_weekdays
+  FROM unnest(COALESCE(v_group.weekdays, ARRAY[]::integer[])) AS d
+  WHERE d BETWEEN 1 AND 7;
+
+  SELECT coalesce(
+    array_agg(b.id ORDER BY b.scheduled_date, b.id),
+    ARRAY[]::uuid[]
+  )
+  INTO v_mutable_ids
+  FROM public.bookings b
+  WHERE b.schedule_group_id = v_group.id
+    AND b.scheduled_date >= v_remaining_start
+    AND b.status::text IN ('confirmed', 'scheduled', 'pending');
+
+  SELECT coalesce(
+    array_agg(b.scheduled_date ORDER BY b.scheduled_date, b.id),
+    ARRAY[]::date[]
+  )
+  INTO v_mutable_dates
+  FROM public.bookings b
+  WHERE b.id = ANY (v_mutable_ids);
+
+  IF v_old_weekdays = v_weekdays
+     AND v_mutable_dates IS NOT DISTINCT FROM v_new_dates THEN
+    RETURN jsonb_build_object(
+      'ok', true,
+      'idempotent', true,
+      'group_id', v_group.id,
+      'weekdays', to_jsonb(v_weekdays),
+      'old_weekdays', to_jsonb(v_old_weekdays),
+      'dates', to_jsonb(v_new_dates),
+      'cancelled_booking_ids', '[]'::jsonb,
+      'created_booking_ids', '[]'::jsonb,
+      'period_visit_count', v_group.period_visit_count,
+      'remaining_start', v_remaining_start
+    );
+  END IF;
+
+  SELECT
+    coalesce(sum(
+      CASE
+        WHEN b.final_amount_minor IS NOT NULL THEN greatest(0, b.final_amount_minor)
+        ELSE greatest(0, coalesce(b.total_price, 0)::integer)
+      END
+    ), 0),
+    coalesce(sum(greatest(0, round(coalesce(b.platform_fee, 0) * 100)::integer)), 0),
+    count(*)::integer
+  INTO v_kept_total_minor, v_kept_fee_minor, v_kept_count
+  FROM public.bookings b
+  WHERE b.schedule_group_id = v_group.id
+    AND b.status IS DISTINCT FROM 'cancelled'::public.booking_status
+    AND NOT (b.id = ANY (v_mutable_ids));
+
+  IF v_kept_total_minor > v_group.monthly_amount_minor THEN
+    RAISE EXCEPTION
+      'kept visits already exceed the schedule charge'
+      USING ERRCODE = 'check_violation';
+  END IF;
+  IF v_kept_fee_minor > v_group.platform_fee_minor THEN
+    RAISE EXCEPTION
+      'kept visit fees already exceed the schedule platform fee'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_remaining_total := v_group.monthly_amount_minor - v_kept_total_minor;
+  v_remaining_fee := least(
+    v_remaining_total,
+    v_group.platform_fee_minor - v_kept_fee_minor
+  );
+
+  SELECT st.name
+  INTO v_service_name
+  FROM public.service_types st
+  WHERE st.id = v_group.service_id;
+
+  IF v_service_name IS NULL THEN
+    RAISE EXCEPTION 'service not found for this schedule'
+      USING ERRCODE = 'no_data_found';
+  END IF;
+
+  SELECT b.location_coordinates, b.customer_contact_phone
+  INTO v_location, v_phone
+  FROM public.bookings b
+  WHERE b.schedule_group_id = v_group.id
+    AND b.status IS DISTINCT FROM 'cancelled'::public.booking_status
+  ORDER BY b.scheduled_date, b.id
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    SELECT b.location_coordinates, b.customer_contact_phone
+    INTO v_location, v_phone
+    FROM public.bookings b
+    WHERE b.schedule_group_id = v_group.id
+    ORDER BY b.scheduled_date, b.id
+    LIMIT 1;
+  END IF;
+
+  IF coalesce(cardinality(v_mutable_ids), 0) > 0 THEN
+    UPDATE public.bookings b
+    SET
+      status = 'cancelled'::public.booking_status,
+      special_instructions = concat(
+        'Cancelled: admin changed schedule weekdays (',
+        v_group.id::text,
+        ')'
+      ),
+      updated_at = now()
+    WHERE b.id = ANY (v_mutable_ids);
+  END IF;
+
+  FOREACH v_date IN ARRAY v_new_dates LOOP
+    v_start_local := (v_date + v_group.scheduled_time)::timestamp;
+    v_end_local :=
+      v_start_local + (v_group.duration_hours * interval '1 hour');
+
+    IF public.cleaner_has_booking_conflict(
+      v_group.cleaner_id,
+      v_start_local AT TIME ZONE v_tz,
+      v_end_local AT TIME ZONE v_tz,
+      NULL
+    ) THEN
+      RAISE EXCEPTION
+        'worker is unavailable for visit on %', v_date
+        USING ERRCODE = 'check_violation';
+    END IF;
+  END LOOP;
+
+  v_month_start := date_trunc('month', v_group.period_start::timestamp)::date;
+  v_month_end := (
+    date_trunc('month', v_group.period_start::timestamp)
+    + interval '1 month - 1 day'
+  )::date;
+  -- Keep period/full-month counts consistent with the new weekday set so the
+  -- period_visit_count <= full_month_visit_count check cannot fail on expand.
+  v_period_visit_count := public.count_admin_schedule_weekday_occurrences(
+    v_weekdays,
+    v_group.period_start,
+    v_group.period_end
+  );
+  v_full_month_visit_count := public.count_admin_schedule_weekday_occurrences(
+    v_weekdays,
+    v_month_start,
+    v_month_end
+  );
+
+  v_price_share := v_remaining_total / v_new_count;
+  v_price_remainder := v_remaining_total - (v_price_share * v_new_count);
+  v_fee_share := v_remaining_fee / v_new_count;
+  v_fee_remainder := v_remaining_fee - (v_fee_share * v_new_count);
+
+  FOREACH v_date IN ARRAY v_new_dates LOOP
+    v_idx := v_idx + 1;
+    v_total_minor := v_price_share
+      + CASE WHEN v_idx = v_new_count THEN v_price_remainder ELSE 0 END;
+    v_fee_minor := v_fee_share
+      + CASE WHEN v_idx = v_new_count THEN v_fee_remainder ELSE 0 END;
+    v_bid := gen_random_uuid();
+    v_created_ids := v_created_ids || v_bid;
+
+    INSERT INTO public.bookings (
+      id,
+      customer_id,
+      cleaner_id,
+      service_id,
+      title,
+      scheduled_date,
+      scheduled_time,
+      duration_hours,
+      duration_final,
+      address,
+      location_coordinates,
+      timezone_name,
+      status,
+      payment_status,
+      total_price,
+      final_amount_minor,
+      core_amount_minor,
+      cleaner_earnings_minor,
+      platform_fee,
+      tax_amount,
+      booking_cover,
+      booking_cover_amount,
+      same_day_surcharge_minor,
+      weekend_surcharge_minor,
+      recurring_discount_minor,
+      is_same_day,
+      is_weekend,
+      pricing_version,
+      currency,
+      schedule_group_id,
+      special_instructions,
+      customer_contact_phone
+    )
+    VALUES (
+      v_bid,
+      v_group.customer_id,
+      v_group.cleaner_id,
+      v_group.service_id,
+      concat(v_service_name, ' · ', v_date::text),
+      v_date,
+      v_group.scheduled_time,
+      v_group.duration_hours,
+      v_group.duration_hours,
+      v_group.address,
+      v_location,
+      v_tz,
+      'confirmed'::public.booking_status,
+      'post_paid',
+      v_total_minor,
+      v_total_minor,
+      v_total_minor,
+      v_total_minor - v_fee_minor,
+      (v_fee_minor::numeric / 100.0),
+      0,
+      false,
+      0,
+      0,
+      0,
+      0,
+      false,
+      false,
+      'admin_monthly_v1',
+      coalesce(nullif(v_group.currency, ''), 'GHS'),
+      v_group.id,
+      concat('Admin monthly schedule ', v_group.id::text, ' (weekday change)'),
+      v_phone
+    );
+  END LOOP;
+
+  UPDATE public.admin_booking_schedule_groups g
+  SET
+    weekdays = v_weekdays,
+    period_visit_count = v_period_visit_count,
+    full_month_visit_count = v_full_month_visit_count,
+    updated_at = now()
+  WHERE g.id = v_group.id;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'idempotent', false,
+    'group_id', v_group.id,
+    'weekdays', to_jsonb(v_weekdays),
+    'old_weekdays', to_jsonb(v_old_weekdays),
+    'dates', to_jsonb(v_new_dates),
+    'cancelled_booking_ids', to_jsonb(v_mutable_ids),
+    'created_booking_ids', to_jsonb(v_created_ids),
+    'period_visit_count', v_period_visit_count,
+    'full_month_visit_count', v_full_month_visit_count,
+    'remaining_start', v_remaining_start
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."change_admin_monthly_schedule_weekdays"("p_group_id" "uuid", "p_weekdays" integer[], "p_as_of_date" "date") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."change_admin_monthly_schedule_weekdays"("p_group_id" "uuid", "p_weekdays" integer[], "p_as_of_date" "date") IS 'Atomically move remaining open-group visits onto new ISO weekdays. Locks the group (and child bookings) with FOR UPDATE; service_role only. p_as_of_date overrides “today” for tests.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."claim_booking_reminder"("p_booking_id" "uuid", "p_kind" "text", "p_claim_ttl_minutes" integer DEFAULT 45) RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -9385,6 +9759,68 @@ $$;
 ALTER FUNCTION "public"."evaluate_booking_risk_triggers"("p_booking_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."expand_admin_schedule_weekday_dates"("p_weekdays" integer[], "p_start" "date", "p_end" "date", "p_max_occurrences" integer DEFAULT 62) RETURNS "date"[]
+    LANGUAGE "plpgsql" IMMUTABLE STRICT
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_dates date[] := ARRAY[]::date[];
+  v_day date;
+  v_wanted integer[];
+  v_max integer;
+BEGIN
+  IF p_start > p_end THEN
+    RAISE EXCEPTION 'period start must be on or before period end'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF date_trunc('month', p_start::timestamp)
+     <> date_trunc('month', p_end::timestamp) THEN
+    RAISE EXCEPTION 'period must remain within one calendar month'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_max := greatest(1, COALESCE(p_max_occurrences, 62));
+
+  SELECT coalesce(array_agg(DISTINCT d ORDER BY d), ARRAY[]::integer[])
+  INTO v_wanted
+  FROM unnest(p_weekdays) AS d
+  WHERE d BETWEEN 1 AND 7;
+
+  IF coalesce(cardinality(v_wanted), 0) = 0 THEN
+    RAISE EXCEPTION 'select at least one weekday (ISO 1=Mon … 7=Sun)'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_day := p_start;
+  WHILE v_day <= p_end LOOP
+    IF extract(isodow FROM v_day)::integer = ANY (v_wanted) THEN
+      v_dates := v_dates || v_day;
+      IF cardinality(v_dates) > v_max THEN
+        RAISE EXCEPTION 'too many visits (max %)', v_max
+          USING ERRCODE = 'check_violation';
+      END IF;
+    END IF;
+    v_day := v_day + 1;
+  END LOOP;
+
+  IF coalesce(cardinality(v_dates), 0) = 0 THEN
+    RAISE EXCEPTION 'no matching dates in that range for the selected weekdays'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  RETURN v_dates;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."expand_admin_schedule_weekday_dates"("p_weekdays" integer[], "p_start" "date", "p_end" "date", "p_max_occurrences" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."expand_admin_schedule_weekday_dates"("p_weekdays" integer[], "p_start" "date", "p_end" "date", "p_max_occurrences" integer) IS 'Expand ISO weekdays (1=Mon…7=Sun) within an inclusive same-month date range. service_role only.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."expire_stale_pending_bookings"() RETURNS integer
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -13320,6 +13756,7 @@ CREATE OR REPLACE FUNCTION "public"."get_verification_service_catalog"() RETURNS
     SET "search_path" TO 'public'
     AS $$
 DECLARE
+  -- Launch flags are global: always read the production channel row.
   v_pet_care_specialization boolean :=
     public.is_app_feature_enabled('PET_CARE_SPECIALIZATION', 'production');
 BEGIN
@@ -13343,19 +13780,23 @@ BEGIN
    AND COALESCE(st.active, false) = true
    AND COALESCE(NULLIF(btrim(st.specialty_slug), ''), NULL) IS NOT NULL
   WHERE
+    -- Non-care / non-pet categories (cleaning, etc.)
     (
       COALESCE(sc.slug, '') NOT IN ('caregiving', 'pet_care')
       AND st.category IS DISTINCT FROM 'caregiving'::public.service_category
       AND st.category IS DISTINCT FROM 'pet_care'::public.service_category
     )
+    -- Caregiving is always available to providers (matches mobile verification UI).
+    OR (
+      COALESCE(sc.slug, '') = 'caregiving'
+      OR st.category = 'caregiving'::public.service_category
+    )
+    -- Pet Care follows PET_CARE_SPECIALIZATION (production channel).
     OR (
       v_pet_care_specialization
       AND (
-        COALESCE(sc.slug, '') IN ('caregiving', 'pet_care')
-        OR st.category IN (
-          'caregiving'::public.service_category,
-          'pet_care'::public.service_category
-        )
+        COALESCE(sc.slug, '') = 'pet_care'
+        OR st.category = 'pet_care'::public.service_category
       )
     )
   ORDER BY sc.id, st.id;
@@ -13366,7 +13807,7 @@ $$;
 ALTER FUNCTION "public"."get_verification_service_catalog"() OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."get_verification_service_catalog"() IS 'Verification services catalog. Includes caregiving/pet_care rows when PET_CARE_SPECIALIZATION is enabled, independent of CARE_PET_BOOK_NOW.';
+COMMENT ON FUNCTION "public"."get_verification_service_catalog"() IS 'Verification services catalog. Caregiving is always included; Pet Care follows PET_CARE_SPECIALIZATION (production). Independent of CARE_PET_BOOK_NOW.';
 
 
 
@@ -13535,6 +13976,7 @@ CREATE OR REPLACE FUNCTION "public"."handle_new_user_multi_role"() RETURNS "trig
     AS $$
 DECLARE
   v_phone text;
+  v_email text;
 BEGIN
   v_phone := public.normalize_phone_for_users(
     COALESCE(
@@ -13544,10 +13986,16 @@ BEGIN
     )
   );
 
+  v_email := lower(NULLIF(btrim(NEW.email), ''));
+  IF v_email IS NOT NULL
+     AND v_email LIKE '%@phone.tryinstaclean.local' THEN
+    v_email := NULL;
+  END IF;
+
   INSERT INTO public.users (id, email, phone)
   VALUES (
     NEW.id,
-    lower(NULLIF(btrim(NEW.email), '')),
+    v_email,
     CASE
       WHEN v_phone IS NOT NULL
        AND NOT EXISTS (
@@ -13562,7 +14010,13 @@ BEGIN
   )
   ON CONFLICT (id) DO UPDATE
   SET
-    email = COALESCE(EXCLUDED.email, public.users.email),
+    email = CASE
+      WHEN EXCLUDED.email IS NOT NULL THEN EXCLUDED.email
+      WHEN public.users.email IS NOT NULL
+           AND lower(public.users.email) LIKE '%@phone.tryinstaclean.local'
+        THEN NULL
+      ELSE public.users.email
+    END,
     phone = CASE
       WHEN v_phone IS NOT NULL
        AND NOT EXISTS (
@@ -19980,11 +20434,12 @@ CREATE OR REPLACE FUNCTION "public"."sync_auth_user_to_public_user"() RETURNS "t
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-declare
+DECLARE
   meta_first text;
   meta_last text;
   meta_full text;
-begin
+  synced_email text;
+BEGIN
   meta_first := nullif(trim(coalesce(new.raw_user_meta_data->>'first_name', '')), '');
   meta_last := nullif(trim(coalesce(new.raw_user_meta_data->>'last_name', '')), '');
   meta_full := nullif(
@@ -19998,42 +20453,54 @@ begin
     ''
   );
 
-  insert into public.users (id, email, phone, updated_at, last_updated)
-  values (new.id, new.email, new.phone, now(), now())
-  on conflict (id) do update
-  set
-    email = excluded.email,
+  synced_email := nullif(trim(coalesce(new.email, '')), '');
+  IF synced_email IS NOT NULL
+     AND lower(synced_email) LIKE '%@phone.tryinstaclean.local' THEN
+    synced_email := NULL;
+  END IF;
+
+  INSERT INTO public.users (id, email, phone, updated_at, last_updated)
+  VALUES (new.id, synced_email, new.phone, now(), now())
+  ON CONFLICT (id) DO UPDATE
+  SET
+    email = CASE
+      WHEN excluded.email IS NOT NULL THEN excluded.email
+      WHEN public.users.email IS NOT NULL
+           AND lower(public.users.email) LIKE '%@phone.tryinstaclean.local'
+        THEN NULL
+      ELSE public.users.email
+    END,
     phone = coalesce(excluded.phone, public.users.phone),
     updated_at = now(),
     last_updated = now();
 
-  insert into public.profiles (id, user_id, firstname, lastname, fullname, updated_at)
-  values (new.id, new.id, meta_first, meta_last, meta_full, now())
-  on conflict (id) do update
-  set
-    firstname = case
-      when nullif(trim(coalesce(public.profiles.firstname, '')), '') is null
-        then coalesce(excluded.firstname, public.profiles.firstname)
-      else public.profiles.firstname
-    end,
-    lastname = case
-      when nullif(trim(coalesce(public.profiles.lastname, '')), '') is null
-        then coalesce(excluded.lastname, public.profiles.lastname)
-      else public.profiles.lastname
-    end,
-    fullname = case
-      when nullif(trim(coalesce(public.profiles.fullname, '')), '') is null
-        then coalesce(excluded.fullname, public.profiles.fullname)
-      else public.profiles.fullname
-    end,
+  INSERT INTO public.profiles (id, user_id, firstname, lastname, fullname, updated_at)
+  VALUES (new.id, new.id, meta_first, meta_last, meta_full, now())
+  ON CONFLICT (id) DO UPDATE
+  SET
+    firstname = CASE
+      WHEN nullif(trim(coalesce(public.profiles.firstname, '')), '') IS NULL
+        THEN coalesce(excluded.firstname, public.profiles.firstname)
+      ELSE public.profiles.firstname
+    END,
+    lastname = CASE
+      WHEN nullif(trim(coalesce(public.profiles.lastname, '')), '') IS NULL
+        THEN coalesce(excluded.lastname, public.profiles.lastname)
+      ELSE public.profiles.lastname
+    END,
+    fullname = CASE
+      WHEN nullif(trim(coalesce(public.profiles.fullname, '')), '') IS NULL
+        THEN coalesce(excluded.fullname, public.profiles.fullname)
+      ELSE public.profiles.fullname
+    END,
     updated_at = now();
 
-  insert into public.user_roles (user_id, role_id)
-  values (new.id, coalesce(new.raw_app_meta_data->>'role', 'customer'))
-  on conflict (user_id, role_id) do nothing;
+  INSERT INTO public.user_roles (user_id, role_id)
+  VALUES (new.id, coalesce(new.raw_app_meta_data->>'role', 'customer'))
+  ON CONFLICT (user_id, role_id) DO NOTHING;
 
-  return new;
-end;
+  RETURN new;
+END;
 $$;
 
 
@@ -32560,6 +33027,11 @@ GRANT ALL ON FUNCTION "public"."casts_are"("text"[], "text") TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."change_admin_monthly_schedule_weekdays"("p_group_id" "uuid", "p_weekdays" integer[], "p_as_of_date" "date") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."change_admin_monthly_schedule_weekdays"("p_group_id" "uuid", "p_weekdays" integer[], "p_as_of_date" "date") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."check_test"("text", boolean) TO "postgres";
 GRANT ALL ON FUNCTION "public"."check_test"("text", boolean) TO "anon";
 GRANT ALL ON FUNCTION "public"."check_test"("text", boolean) TO "authenticated";
@@ -34439,6 +34911,11 @@ GRANT ALL ON FUNCTION "public"."escalate_unassigned_paid_bookings_past_grace"() 
 GRANT ALL ON FUNCTION "public"."evaluate_booking_risk_triggers"("p_booking_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."evaluate_booking_risk_triggers"("p_booking_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."evaluate_booking_risk_triggers"("p_booking_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."expand_admin_schedule_weekday_dates"("p_weekdays" integer[], "p_start" "date", "p_end" "date", "p_max_occurrences" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."expand_admin_schedule_weekday_dates"("p_weekdays" integer[], "p_start" "date", "p_end" "date", "p_max_occurrences" integer) TO "service_role";
 
 
 
