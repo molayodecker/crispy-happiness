@@ -12239,19 +12239,41 @@ BEGIN
     v_extra_hours := 0;
   ELSE
     v_extra_hours := COALESCE(public._extra_task_hours_total(p_extra_task_ids), 0);
-    v_base_duration_raw := greatest(0, p_duration_hours_raw - v_extra_hours);
-    v_rounded_base :=
-      round(v_base_duration_raw / v_duration_increment_hours) * v_duration_increment_hours;
 
-    IF v_rounded_base < v_min_duration_hours THEN
+    -- Authenticated callers can invoke this SECURITY DEFINER RPC. Reject
+    -- impossible totals that would zero out base service labor via
+    -- greatest(0, total - extras) while extras alone meet the minimum.
+    IF p_duration_hours_raw < v_extra_hours THEN
+      RAISE EXCEPTION 'Total duration cannot be less than extra-task duration';
+    END IF;
+
+    -- Validate the client-supplied TOTAL before base-duration rounding.
+    -- Rounding base to the service increment can shrink/grow recomposed total
+    -- (e.g. 2.0 total − 0.3 extras → base 1.7 → rounded 1.5 → 1.8) and must
+    -- not reject a cart that already meets the service minimum.
+    IF p_duration_hours_raw < v_min_duration_hours THEN
       RAISE EXCEPTION 'Minimum duration for this service is % hours', v_min_duration_hours;
     END IF;
 
-    v_duration_hours := v_rounded_base + v_extra_hours;
-
-    IF v_duration_hours > v_max_duration_hours THEN
+    IF p_duration_hours_raw > v_max_duration_hours THEN
       RAISE EXCEPTION 'Maximum duration for this service is % hours', v_max_duration_hours;
     END IF;
+
+    v_base_duration_raw := p_duration_hours_raw - v_extra_hours;
+    v_rounded_base :=
+      round(v_base_duration_raw / v_duration_increment_hours) * v_duration_increment_hours;
+
+    v_duration_hours := v_rounded_base + v_extra_hours;
+
+    -- Rounding must never move the authoritative billable total outside the
+    -- service limits (stored on bookings.duration_hours and used for labor).
+    v_duration_hours := greatest(
+      v_min_duration_hours,
+      least(v_max_duration_hours, v_duration_hours)
+    );
+
+    -- Keep base labor consistent with the authoritative total.
+    v_rounded_base := greatest(0, v_duration_hours - v_extra_hours);
   END IF;
 
   SELECT wr.work_rate, wr.work_rate_before_discount, wr.catalog_discount_pct
