@@ -4415,7 +4415,10 @@ BEGIN
       v_location,
       v_tz,
       'confirmed'::public.booking_status,
-      'post_paid',
+      CASE
+        WHEN coalesce(v_group.billing_mode, 'postpaid') = 'postpaid' THEN 'post_paid'
+        ELSE 'pending'
+      END,
       v_total_minor,
       v_total_minor,
       v_total_minor,
@@ -4466,6 +4469,118 @@ ALTER FUNCTION "public"."change_admin_monthly_schedule_weekdays"("p_group_id" "u
 
 
 COMMENT ON FUNCTION "public"."change_admin_monthly_schedule_weekdays"("p_group_id" "uuid", "p_weekdays" integer[], "p_as_of_date" "date") IS 'Atomically move remaining open-group visits onto new ISO weekdays. Locks the group (and child bookings) with FOR UPDATE; service_role only. p_as_of_date overrides “today” for tests.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."claim_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_candidate_reference" "text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_group public.admin_booking_schedule_groups%ROWTYPE;
+  v_candidate text := trim(COALESCE(p_candidate_reference, ''));
+  v_existing text;
+  v_lease_active boolean := false;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RAISE EXCEPTION 'group id required' USING ERRCODE = 'check_violation';
+  END IF;
+  IF length(v_candidate) = 0 THEN
+    RAISE EXCEPTION 'candidate reference required' USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT *
+  INTO v_group
+  FROM public.admin_booking_schedule_groups g
+  WHERE g.id = p_group_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule group not found' USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF v_group.status = 'paid' THEN
+    RETURN jsonb_build_object(
+      'ok', false,
+      'code', 'already_paid',
+      'reference', v_group.paystack_reference,
+      'created', false,
+      'lease_active', false
+    );
+  END IF;
+
+  IF v_group.status IS DISTINCT FROM 'open' THEN
+    RETURN jsonb_build_object(
+      'ok', false,
+      'code', 'not_open',
+      'reference', v_group.paystack_reference,
+      'created', false,
+      'lease_active', false
+    );
+  END IF;
+
+  v_existing := nullif(trim(COALESCE(v_group.paystack_reference, '')), '');
+
+  IF v_existing IS NULL THEN
+    UPDATE public.admin_booking_schedule_groups g
+    SET
+      paystack_reference = v_candidate,
+      paystack_checkout_claimed_at = now(),
+      updated_at = now()
+    WHERE g.id = v_group.id
+      AND g.status = 'open'
+      AND nullif(trim(COALESCE(g.paystack_reference, '')), '') IS NULL;
+
+    IF NOT FOUND THEN
+      SELECT *
+      INTO v_group
+      FROM public.admin_booking_schedule_groups g
+      WHERE g.id = p_group_id;
+
+      v_lease_active :=
+        v_group.paystack_checkout_claimed_at IS NOT NULL
+        AND v_group.paystack_checkout_claimed_at > now() - interval '3 minutes';
+
+      RETURN jsonb_build_object(
+        'ok', true,
+        'code', 'reused',
+        'reference', nullif(trim(COALESCE(v_group.paystack_reference, '')), ''),
+        'created', false,
+        'lease_active', v_lease_active,
+        'claimed_at', v_group.paystack_checkout_claimed_at
+      );
+    END IF;
+
+    RETURN jsonb_build_object(
+      'ok', true,
+      'code', 'created',
+      'reference', v_candidate,
+      'created', true,
+      'lease_active', true,
+      'claimed_at', now()
+    );
+  END IF;
+
+  v_lease_active :=
+    v_group.paystack_checkout_claimed_at IS NOT NULL
+    AND v_group.paystack_checkout_claimed_at > now() - interval '3 minutes';
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'code', 'reused',
+    'reference', v_existing,
+    'created', false,
+    'lease_active', v_lease_active,
+    'claimed_at', v_group.paystack_checkout_claimed_at
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."claim_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_candidate_reference" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."claim_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_candidate_reference" "text") IS 'Atomically establish or reuse one open-group Paystack checkout reference; stamps paystack_checkout_claimed_at.';
 
 
 
@@ -18055,6 +18170,56 @@ $_$;
 ALTER FUNCTION "public"."register_quick_task_upload"("p_storage_path" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."release_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_expected text := trim(COALESCE(p_expected_reference, ''));
+  v_updated integer := 0;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RAISE EXCEPTION 'group id required' USING ERRCODE = 'check_violation';
+  END IF;
+  IF length(v_expected) = 0 THEN
+    RAISE EXCEPTION 'expected reference required' USING ERRCODE = 'check_violation';
+  END IF;
+
+  UPDATE public.admin_booking_schedule_groups g
+  SET
+    paystack_reference = NULL,
+    paystack_checkout_claimed_at = NULL,
+    updated_at = now()
+  WHERE g.id = p_group_id
+    AND g.status = 'open'
+    AND nullif(trim(COALESCE(g.paystack_reference, '')), '') = v_expected;
+
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+
+  IF v_updated = 0 THEN
+    RETURN jsonb_build_object(
+      'ok', false,
+      'code', 'cas_mismatch',
+      'released', false
+    );
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'code', 'released',
+    'released', true
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."release_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."release_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text") IS 'CAS-clear open-group Paystack reference after initialize definitively fails for that claim.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -18189,6 +18354,7 @@ BEGIN
     updated_at = now(),
     last_updated = now()
   WHERE cleaner_id IS NOT NULL
+    AND schedule_group_id IS NULL
     AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
     AND status IN ('confirmed', 'pending')
     AND (
@@ -18220,6 +18386,7 @@ DECLARE
   released_count integer := 0;
 BEGIN
   -- Keep cleaner_assigned_at so clients detect hold expiry (cleaner_id null + assigned_at set).
+  -- schedule_group_id visits are sticky prepaid/postpaid packages — never auto-release.
   UPDATE public.bookings
   SET
     cleaner_id = NULL,
@@ -18233,6 +18400,7 @@ BEGIN
     updated_at = now(),
     last_updated = now()
   WHERE cleaner_id IS NOT NULL
+    AND schedule_group_id IS NULL
     AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
     AND (
       payment_status = 'failed'
@@ -19095,6 +19263,71 @@ $$;
 ALTER FUNCTION "public"."rls_auto_enable"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."rotate_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text", "p_new_reference" "text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_expected text := trim(COALESCE(p_expected_reference, ''));
+  v_new text := trim(COALESCE(p_new_reference, ''));
+  v_updated integer := 0;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RAISE EXCEPTION 'group id required' USING ERRCODE = 'check_violation';
+  END IF;
+  IF length(v_expected) = 0 OR length(v_new) = 0 THEN
+    RAISE EXCEPTION 'expected and new references required' USING ERRCODE = 'check_violation';
+  END IF;
+  IF v_expected = v_new THEN
+    RETURN jsonb_build_object(
+      'ok', true,
+      'code', 'unchanged',
+      'reference', v_new,
+      'rotated', false
+    );
+  END IF;
+
+  -- Lease: do not rotate a freshly claimed reference (initialize may still be in flight).
+  UPDATE public.admin_booking_schedule_groups g
+  SET
+    paystack_reference = v_new,
+    paystack_checkout_claimed_at = now(),
+    updated_at = now()
+  WHERE g.id = p_group_id
+    AND g.status = 'open'
+    AND nullif(trim(COALESCE(g.paystack_reference, '')), '') = v_expected
+    AND (
+      g.paystack_checkout_claimed_at IS NULL
+      OR g.paystack_checkout_claimed_at <= now() - interval '3 minutes'
+    );
+
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+
+  IF v_updated = 0 THEN
+    RETURN jsonb_build_object(
+      'ok', false,
+      'code', 'cas_mismatch_or_lease_active',
+      'rotated', false
+    );
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'code', 'rotated',
+    'reference', v_new,
+    'rotated', true
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."rotate_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text", "p_new_reference" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."rotate_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text", "p_new_reference" "text") IS 'CAS-replace open-group Paystack reference only when lease expired (>= 3 minutes) and expected ref still matches.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."round_coord_for_geocode"("p_value" double precision, "p_precision" integer DEFAULT 4) RETURNS double precision
     LANGUAGE "sql" IMMUTABLE
     AS $$
@@ -19499,6 +19732,12 @@ CREATE OR REPLACE FUNCTION "public"."set_cleaner_assigned_at_for_hold"() RETURNS
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
+  -- Admin monthly schedule visits: sticky cleaner assignment, not a temp hold.
+  IF NEW.schedule_group_id IS NOT NULL THEN
+    NEW.cleaner_hold_expires_at := NULL;
+    RETURN NEW;
+  END IF;
+
   -- Paid / post-paid: sticky assignment, not a temporary unpaid hold.
   IF lower(COALESCE(NEW.payment_status, 'pending')) IN ('paid', 'post_paid') THEN
     NEW.cleaner_hold_expires_at := NULL;
@@ -23003,6 +23242,9 @@ CREATE TABLE IF NOT EXISTS "public"."admin_booking_schedule_groups" (
     "create_notify_customer_claimed_at" timestamp with time zone,
     "create_notify_worker_claimed_at" timestamp with time zone,
     "customer_invoice_seq" integer,
+    "billing_mode" "text" DEFAULT 'postpaid'::"text" NOT NULL,
+    "paystack_checkout_claimed_at" timestamp with time zone,
+    CONSTRAINT "admin_booking_schedule_groups_billing_mode_check" CHECK (("billing_mode" = ANY (ARRAY['postpaid'::"text", 'prepaid_monthly'::"text", 'prepaid_per_visit'::"text"]))),
     CONSTRAINT "admin_booking_schedule_groups_check" CHECK (("period_start" <= "period_end")),
     CONSTRAINT "admin_booking_schedule_groups_check1" CHECK ((("platform_fee_minor" + "cleaner_earnings_minor") = "monthly_amount_minor")),
     CONSTRAINT "admin_booking_schedule_groups_cleaner_earnings_minor_check" CHECK (("cleaner_earnings_minor" >= 0)),
@@ -23067,6 +23309,14 @@ COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."create_notify_worker
 
 
 COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."customer_invoice_seq" IS 'Sticky incremental invoice sequence for monthly schedule receipts (display: PSK_INSTACLN_#### with min-width 4 zero-pad). Global uniqueness depends on allocation RPCs only — do not write this column directly.';
+
+
+
+COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."billing_mode" IS 'postpaid | prepaid_monthly | prepaid_per_visit — controls visit payment_status and invoice/checkout CTAs.';
+
+
+
+COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."paystack_checkout_claimed_at" IS 'When paystack_reference was claimed/rotated. Fresh claims (< 3 minutes) must not be rotated just because Paystack has not seen the reference yet.';
 
 
 
@@ -33222,6 +33472,11 @@ GRANT ALL ON FUNCTION "public"."citext_smaller"("public"."citext", "public"."cit
 
 
 
+REVOKE ALL ON FUNCTION "public"."claim_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_candidate_reference" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."claim_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_candidate_reference" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."claim_booking_reminder"("p_booking_id" "uuid", "p_kind" "text", "p_claim_ttl_minutes" integer) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."claim_booking_reminder"("p_booking_id" "uuid", "p_kind" "text", "p_claim_ttl_minutes" integer) TO "service_role";
 
@@ -42359,6 +42614,11 @@ GRANT ALL ON FUNCTION "public"."relation_owner_is"("name", "name", "name", "text
 
 
 
+REVOKE ALL ON FUNCTION "public"."release_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."release_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid") TO "authenticated";
@@ -42671,6 +42931,11 @@ GRANT ALL ON FUNCTION "public"."roles_are"("name"[], "text") TO "postgres";
 GRANT ALL ON FUNCTION "public"."roles_are"("name"[], "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."roles_are"("name"[], "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."roles_are"("name"[], "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."rotate_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text", "p_new_reference" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."rotate_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text", "p_new_reference" "text") TO "service_role";
 
 
 
