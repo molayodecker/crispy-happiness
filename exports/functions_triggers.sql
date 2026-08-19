@@ -5583,6 +5583,9 @@ DECLARE
   v_anchor_billing date;
   v_next_service date;
   v_next_billing date;
+  v_next_time time;
+  v_interval text;
+  v_ts timestamp;
 BEGIN
   SELECT *
   INTO v_sub
@@ -5603,25 +5606,37 @@ BEGIN
     RETURN jsonb_build_object('action', 'error', 'error', 'missing_next_service_date');
   END IF;
 
+  v_interval := lower(trim(coalesce(v_sub.recurrence_interval, '')));
+  v_next_time := coalesce(v_sub.scheduled_time, time '09:00');
   v_anchor_billing := coalesce(v_sub.next_billing_date, v_anchor_service);
 
-  v_next_service := public.compute_next_recurrence_date(
-    v_anchor_service,
-    v_sub.recurrence_interval,
-    v_sub.recurrence_anchor_date
-  );
-
-  v_next_billing := public.compute_next_recurrence_date(
-    v_anchor_billing,
-    v_sub.recurrence_interval,
-    v_sub.recurrence_anchor_date
-  );
+  IF v_interval = 'hourly' THEN
+    v_ts := (v_anchor_service + v_next_time) + interval '1 hour';
+    v_next_service := v_ts::date;
+    v_next_billing := v_next_service;
+    v_next_time := v_ts::time;
+  ELSE
+    v_next_service := public.compute_next_recurrence_date(
+      v_anchor_service,
+      v_sub.recurrence_interval,
+      v_sub.recurrence_anchor_date
+    );
+    v_next_billing := public.compute_next_recurrence_date(
+      v_anchor_billing,
+      v_sub.recurrence_interval,
+      v_sub.recurrence_anchor_date
+    );
+  END IF;
 
   UPDATE public.subscriptions
   SET
     next_occurrence_date = v_next_service,
     next_billing_date = v_next_billing,
     paystack_start_date = v_next_billing,
+    scheduled_time = CASE
+      WHEN v_interval = 'hourly' THEN v_next_time
+      ELSE scheduled_time
+    END,
     updated_at = now()
   WHERE id = p_subscription_id;
 
@@ -5632,6 +5647,59 @@ BEGIN
     'next_billing_date', v_next_billing,
     'paystack_start_date', v_next_billing
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.advance_subscription_recurrence_for_claimed_invoice(p_subscription_id uuid, p_event_id uuid, p_claim_token uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_event public.subscription_invoice_events%ROWTYPE;
+  v_advance jsonb;
+BEGIN
+  IF p_subscription_id IS NULL OR p_event_id IS NULL OR p_claim_token IS NULL THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'missing_claim');
+  END IF;
+
+  SELECT *
+  INTO v_event
+  FROM public.subscription_invoice_events
+  WHERE id = p_event_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'event_not_found');
+  END IF;
+
+  IF v_event.subscription_id IS DISTINCT FROM p_subscription_id THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'subscription_mismatch');
+  END IF;
+
+  IF v_event.status = 'applied' THEN
+    RETURN jsonb_build_object(
+      'action', 'already_applied',
+      'event_id', v_event.id,
+      'claim_token', v_event.claim_token
+    );
+  END IF;
+
+  IF v_event.claim_token IS DISTINCT FROM p_claim_token THEN
+    RETURN jsonb_build_object(
+      'action', 'stale_claim',
+      'event_id', v_event.id
+    );
+  END IF;
+
+  UPDATE public.subscription_invoice_events
+  SET updated_at = now()
+  WHERE id = v_event.id;
+
+  v_advance := public.advance_subscription_recurrence_dates(p_subscription_id);
+  RETURN v_advance;
 END;
 $function$
 
@@ -8155,6 +8223,65 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.cancel_subscription_with_unpaid_placeholders(p_subscription_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_exists boolean;
+  v_placeholders_cancelled integer := 0;
+BEGIN
+  IF p_subscription_id IS NULL THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'missing_subscription_id');
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.subscriptions
+    WHERE id = p_subscription_id
+  )
+  INTO v_exists;
+
+  IF NOT v_exists THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'subscription_not_found');
+  END IF;
+
+  PERFORM 1
+  FROM public.subscriptions
+  WHERE id = p_subscription_id
+  FOR UPDATE;
+
+  UPDATE public.subscriptions
+  SET
+    status = 'cancelled',
+    updated_at = now()
+  WHERE id = p_subscription_id
+    AND status IN ('active', 'pending');
+
+  UPDATE public.bookings
+  SET
+    status = 'cancelled',
+    updated_at = now()
+  WHERE subscription_id = p_subscription_id
+    AND status IS DISTINCT FROM 'cancelled'
+    AND (
+      payment_status IS NULL
+      OR lower(btrim(coalesce(payment_status, ''))) IN ('pending', 'failed')
+    );
+
+  GET DIAGNOSTICS v_placeholders_cancelled = ROW_COUNT;
+
+  RETURN jsonb_build_object(
+    'action', 'cancelled',
+    'subscription_id', p_subscription_id,
+    'placeholders_cancelled', v_placeholders_cancelled
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.capture_booking_payment_split_snapshot(p_booking_id uuid, p_amount_minor integer)
  RETURNS void
  LANGUAGE plpgsql
@@ -9373,12 +9500,25 @@ BEGIN
     RAISE EXCEPTION 'booking id required' USING ERRCODE = 'check_violation';
   END IF;
 
-  -- Normalize aliases
   IF v_kind = 'customer_24h' THEN
     v_kind := 'customer';
   END IF;
 
-  IF v_kind = 'customer_48h' THEN
+  IF v_kind = 'customer_7d' THEN
+    UPDATE public.bookings b
+    SET
+      customer_reminder_7d_claimed_at = now(),
+      customer_reminder_last_error = NULL,
+      updated_at = now()
+    WHERE b.id = p_booking_id
+      AND b.customer_reminder_7d_sent_at IS NULL
+      AND (
+        b.customer_reminder_7d_claimed_at IS NULL
+        OR b.customer_reminder_7d_claimed_at
+          < now() - make_interval(mins => v_ttl)
+      )
+    RETURNING b.id INTO v_id;
+  ELSIF v_kind = 'customer_48h' THEN
     UPDATE public.bookings b
     SET
       customer_reminder_48h_claimed_at = now(),
@@ -9436,7 +9576,7 @@ BEGIN
       )
     RETURNING b.id INTO v_id;
   ELSE
-    RAISE EXCEPTION 'invalid reminder kind (expected customer_48h|customer|customer_morning|cleaner)'
+    RAISE EXCEPTION 'invalid reminder kind (expected customer_7d|customer_48h|customer|customer_morning|cleaner)'
       USING ERRCODE = 'check_violation';
   END IF;
 
@@ -9652,6 +9792,101 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.claim_subscription_invoice_event(p_subscription_id uuid, p_invoice_reference text, p_occurrence_date date, p_stale_after interval DEFAULT '00:02:00'::interval)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_reference text := nullif(btrim(coalesce(p_invoice_reference, '')), '');
+  v_row public.subscription_invoice_events%ROWTYPE;
+  v_stale interval := coalesce(p_stale_after, interval '2 minutes');
+BEGIN
+  IF p_subscription_id IS NULL OR v_reference IS NULL THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'missing_reference');
+  END IF;
+
+  INSERT INTO public.subscription_invoice_events (
+    subscription_id,
+    invoice_reference,
+    occurrence_date,
+    status,
+    claim_token
+  )
+  VALUES (
+    p_subscription_id,
+    v_reference,
+    p_occurrence_date,
+    'claimed',
+    gen_random_uuid()
+  )
+  ON CONFLICT (subscription_id, invoice_reference) DO NOTHING
+  RETURNING * INTO v_row;
+
+  IF FOUND THEN
+    RETURN jsonb_build_object(
+      'action', 'claimed',
+      'event_id', v_row.id,
+      'occurrence_date', v_row.occurrence_date,
+      'booking_id', v_row.booking_id,
+      'status', v_row.status,
+      'claim_token', v_row.claim_token
+    );
+  END IF;
+
+  SELECT *
+  INTO v_row
+  FROM public.subscription_invoice_events
+  WHERE subscription_id = p_subscription_id
+    AND invoice_reference = v_reference
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'claim_lookup_failed');
+  END IF;
+
+  IF v_row.status = 'applied' THEN
+    RETURN jsonb_build_object(
+      'action', 'already_applied',
+      'event_id', v_row.id,
+      'occurrence_date', v_row.occurrence_date,
+      'booking_id', v_row.booking_id,
+      'status', v_row.status,
+      'claim_token', v_row.claim_token
+    );
+  END IF;
+
+  IF v_row.updated_at > now() - v_stale THEN
+    RETURN jsonb_build_object(
+      'action', 'already_claimed',
+      'event_id', v_row.id,
+      'occurrence_date', v_row.occurrence_date,
+      'booking_id', v_row.booking_id,
+      'status', v_row.status
+    );
+  END IF;
+
+  UPDATE public.subscription_invoice_events
+  SET
+    occurrence_date = coalesce(v_row.occurrence_date, p_occurrence_date),
+    claim_token = gen_random_uuid(),
+    updated_at = now()
+  WHERE id = v_row.id
+  RETURNING * INTO v_row;
+
+  RETURN jsonb_build_object(
+    'action', 'claimed',
+    'event_id', v_row.id,
+    'occurrence_date', v_row.occurrence_date,
+    'booking_id', v_row.booking_id,
+    'status', v_row.status,
+    'claim_token', v_row.claim_token
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.claim_subscription_paystack_activation(p_subscription_id uuid, p_customer_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -9752,11 +9987,8 @@ BEGIN
     RETURN jsonb_build_object('action', 'error', 'error', 'subscription_not_found');
   END IF;
 
-  IF v_sub.recurrence_interval = 'weekly' THEN
-    v_interval := 'weekly';
-  ELSIF v_sub.recurrence_interval = 'monthly' THEN
-    v_interval := 'monthly';
-  ELSE
+  v_interval := public.paystack_plan_interval_for_recurrence(v_sub.recurrence_interval);
+  IF v_interval IS NULL THEN
     RETURN jsonb_build_object('action', 'error', 'error', 'unsupported_interval');
   END IF;
 
@@ -11811,11 +12043,8 @@ BEGIN
     RETURN jsonb_build_object('action', 'lost_claim');
   END IF;
 
-  IF v_sub.recurrence_interval = 'weekly' THEN
-    v_interval := 'weekly';
-  ELSIF v_sub.recurrence_interval = 'monthly' THEN
-    v_interval := 'monthly';
-  ELSE
+  v_interval := public.paystack_plan_interval_for_recurrence(v_sub.recurrence_interval);
+  IF v_interval IS NULL THEN
     RETURN jsonb_build_object('action', 'error', 'error', 'unsupported_interval');
   END IF;
 
@@ -12977,10 +13206,11 @@ BEGIN
   v_recurring_discount_minor := 0;
 
   IF p_is_recurring AND p_recurrence_interval IS NOT NULL THEN
-    v_discount_bps := CASE
-      WHEN p_recurrence_interval = 'monthly' THEN v_recurring_monthly_discount_bps
-      ELSE v_recurring_weekly_bps
-    END;
+    v_discount_bps := public.recurring_discount_bps_for_interval(
+      p_recurrence_interval,
+      v_recurring_weekly_bps,
+      v_recurring_monthly_discount_bps
+    );
     v_discount_bps := greatest(0, least(10000, COALESCE(v_discount_bps, 0)));
 
     v_recurring_amount_minor := round(v_core_minor * (10000 - v_discount_bps) / 10000.0)::integer;
@@ -13968,6 +14198,8 @@ CREATE OR REPLACE FUNCTION public.compute_next_recurrence_date(p_current_date da
  SET search_path TO 'public'
 AS $function$
 DECLARE
+  v_interval text := lower(trim(coalesce(p_recurrence_interval, '')));
+  v_months integer;
   v_next_month date;
   v_last_day date;
   v_target_day integer;
@@ -13979,7 +14211,14 @@ BEGIN
       USING errcode = '22023';
   END IF;
 
-  CASE lower(trim(p_recurrence_interval))
+  CASE v_interval
+    WHEN 'hourly' THEN
+      -- Date-only callers step one calendar day. refresh/advance bump scheduled_time by 1 hour.
+      RETURN p_current_date + 1;
+
+    WHEN 'daily' THEN
+      RETURN p_current_date + 1;
+
     WHEN 'weekly' THEN
       RETURN p_current_date + 7;
 
@@ -13987,35 +14226,43 @@ BEGIN
       RETURN p_current_date + 14;
 
     WHEN 'monthly' THEN
-      IF p_recurrence_anchor_date IS NULL THEN
-        RAISE EXCEPTION 'recurrence_anchor_date is required for monthly intervals'
-          USING errcode = '22023';
-      END IF;
+      v_months := 1;
 
-      v_anchor_is_month_end :=
-        p_recurrence_anchor_date =
-        (date_trunc('month', p_recurrence_anchor_date)::date + interval '1 month - 1 day')::date;
+    WHEN 'quarterly' THEN
+      v_months := 3;
 
-      v_anchor_day := extract(day from p_recurrence_anchor_date)::integer;
-
-      v_next_month :=
-        (date_trunc('month', p_current_date)::date + interval '1 month')::date;
-
-      v_last_day :=
-        (v_next_month + interval '1 month - 1 day')::date;
-
-      IF v_anchor_is_month_end THEN
-        RETURN v_last_day;
-      END IF;
-
-      v_target_day := least(v_anchor_day, extract(day from v_last_day)::integer);
-
-      RETURN v_next_month + (v_target_day - 1);
+    WHEN 'annually' THEN
+      v_months := 12;
 
     ELSE
       RAISE EXCEPTION 'Unsupported recurrence interval: %', p_recurrence_interval
         USING errcode = '22023';
   END CASE;
+
+  IF p_recurrence_anchor_date IS NULL THEN
+    RAISE EXCEPTION 'recurrence_anchor_date is required for % intervals', v_interval
+      USING errcode = '22023';
+  END IF;
+
+  v_anchor_is_month_end :=
+    p_recurrence_anchor_date =
+    (date_trunc('month', p_recurrence_anchor_date)::date + interval '1 month - 1 day')::date;
+
+  v_anchor_day := extract(day from p_recurrence_anchor_date)::integer;
+
+  v_next_month :=
+    (date_trunc('month', p_current_date)::date + make_interval(months => v_months))::date;
+
+  v_last_day :=
+    (v_next_month + interval '1 month - 1 day')::date;
+
+  IF v_anchor_is_month_end THEN
+    RETURN v_last_day;
+  END IF;
+
+  v_target_day := least(v_anchor_day, extract(day from v_last_day)::integer);
+
+  RETURN v_next_month + (v_target_day - 1);
 END;
 $function$
 
@@ -16932,6 +17179,65 @@ BEGIN
   END IF;
 
   RETURN jsonb_build_object('success', true, 'redeemed', true);
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.finalize_subscription_invoice_event(p_event_id uuid, p_claim_token uuid, p_booking_id uuid, p_occurrence_date date)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_event public.subscription_invoice_events%ROWTYPE;
+BEGIN
+  IF p_event_id IS NULL OR p_claim_token IS NULL THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'missing_claim');
+  END IF;
+
+  SELECT *
+  INTO v_event
+  FROM public.subscription_invoice_events
+  WHERE id = p_event_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'event_not_found');
+  END IF;
+
+  IF v_event.status = 'applied' THEN
+    RETURN jsonb_build_object(
+      'action', 'already_applied',
+      'event_id', v_event.id,
+      'booking_id', v_event.booking_id,
+      'claim_token', v_event.claim_token
+    );
+  END IF;
+
+  IF v_event.claim_token IS DISTINCT FROM p_claim_token THEN
+    RETURN jsonb_build_object(
+      'action', 'stale_claim',
+      'event_id', v_event.id
+    );
+  END IF;
+
+  UPDATE public.subscription_invoice_events
+  SET
+    status = 'applied',
+    booking_id = coalesce(p_booking_id, booking_id),
+    occurrence_date = coalesce(p_occurrence_date, occurrence_date),
+    updated_at = now()
+  WHERE id = v_event.id
+  RETURNING * INTO v_event;
+
+  RETURN jsonb_build_object(
+    'action', 'applied',
+    'event_id', v_event.id,
+    'booking_id', v_event.booking_id,
+    'occurrence_date', v_event.occurrence_date,
+    'claim_token', v_event.claim_token
+  );
 END;
 $function$
 
@@ -29648,6 +29954,14 @@ DECLARE
   v_primary public.users%ROWTYPE;
   v_secondary public.users%ROWTYPE;
   v_snapshot jsonb;
+  v_primary_wallet_id uuid;
+  v_secondary_wallet_id uuid;
+  v_cd_cols text;
+  v_cd_select text;
+  v_secondary_slug text;
+  v_secondary_paystack text;
+  v_drop_conversation uuid;
+  v_keep_conversation uuid;
 BEGIN
   IF p_primary IS NULL OR p_secondary IS NULL THEN
     RAISE EXCEPTION 'invalid_user_ids' USING ERRCODE = 'P0001';
@@ -29674,77 +29988,660 @@ BEGIN
     RAISE EXCEPTION 'secondary_is_privileged' USING ERRCODE = 'P0003';
   END IF;
 
+  IF EXISTS (
+    SELECT 1 FROM public.bookings
+    WHERE customer_id IN (p_primary, p_secondary)
+      AND (
+        cleaner_id IN (p_primary, p_secondary)
+        OR direct_assigned_cleaner_id IN (p_primary, p_secondary)
+      )
+  ) THEN
+    RAISE EXCEPTION 'merge_aliases_customer_and_cleaner'
+      USING ERRCODE = 'P0004';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM public.admin_booking_schedule_groups
+    WHERE customer_id IN (p_primary, p_secondary)
+      AND cleaner_id IN (p_primary, p_secondary)
+  ) THEN
+    RAISE EXCEPTION 'merge_aliases_customer_and_cleaner'
+      USING ERRCODE = 'P0004';
+  END IF;
+
+  -- no_double_booking excludes overlapping booking_period for one cleaner.
+  -- Two legal rows on different cleaner ids become illegal after remap.
+  IF EXISTS (
+    SELECT 1
+    FROM public.bookings a
+    JOIN public.bookings b
+      ON a.cleaner_id = p_primary
+     AND b.cleaner_id = p_secondary
+     AND a.id <> b.id
+     AND a.status IS DISTINCT FROM 'cancelled'::public.booking_status
+     AND b.status IS DISTINCT FROM 'cancelled'::public.booking_status
+     AND a.booking_period && b.booking_period
+  ) THEN
+    RAISE EXCEPTION 'merge_cleaner_booking_overlap'
+      USING ERRCODE = 'P0005';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.cleaner_data a
+    JOIN public.cleaner_data b
+      ON a.user_id = p_primary AND b.user_id = p_secondary
+    WHERE (
+      (a.status = 'active'::public.cleaner_status
+        AND b.status = 'suspended'::public.cleaner_status)
+      OR (a.status = 'suspended'::public.cleaner_status
+        AND b.status = 'active'::public.cleaner_status)
+    )
+  ) THEN
+    RAISE EXCEPTION 'merge_conflicting_cleaner_status'
+      USING ERRCODE = 'P0007';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.kyc_profiles a
+    JOIN public.kyc_profiles b
+      ON a.user_id = p_primary
+     AND b.user_id = p_secondary
+     AND a.subject_type = b.subject_type
+    WHERE (
+      (a.kyc_status IN ('approved', 'completed')
+        AND b.kyc_status IN ('rejected', 'failed'))
+      OR (b.kyc_status IN ('approved', 'completed')
+        AND a.kyc_status IN ('rejected', 'failed'))
+    )
+  ) THEN
+    RAISE EXCEPTION 'merge_conflicting_kyc_status'
+      USING ERRCODE = 'P0008';
+  END IF;
+
   v_snapshot := jsonb_build_object(
     'primary', jsonb_build_object('id', v_primary.id, 'email', v_primary.email, 'phone', v_primary.phone),
     'secondary', jsonb_build_object('id', v_secondary.id, 'email', v_secondary.email, 'phone', v_secondary.phone)
   );
 
+  -- -------------------------------------------------------------------------
+  -- Stage cleaner_data first. subscriptions.cleaner_id / feedback.cleaner_id /
+  -- preferred_cleaners.cleaner_id reference cleaner_data(user_id), so the
+  -- primary row must exist before those UUIDs are rewritten. Keep the
+  -- secondary row until dependents are repointed.
+  -- -------------------------------------------------------------------------
+  IF EXISTS (SELECT 1 FROM public.cleaner_data WHERE user_id = p_secondary) THEN
+    SELECT cd.booking_slug, cd.paystack_customer_id
+    INTO v_secondary_slug, v_secondary_paystack
+    FROM public.cleaner_data cd
+    WHERE cd.user_id = p_secondary;
+
+    IF NOT EXISTS (SELECT 1 FROM public.cleaner_data WHERE user_id = p_primary) THEN
+      SELECT
+        string_agg(quote_ident(a.attname), ', ' ORDER BY a.attnum),
+        string_agg(
+          CASE
+            WHEN a.attname = 'booking_slug' THEN 'NULL'
+            ELSE quote_ident(a.attname)
+          END,
+          ', ' ORDER BY a.attnum
+        )
+      INTO v_cd_cols, v_cd_select
+      FROM pg_attribute a
+      JOIN pg_class c ON c.oid = a.attrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public'
+        AND c.relname = 'cleaner_data'
+        AND a.attnum > 0
+        AND NOT a.attisdropped
+        AND a.attname <> 'user_id';
+
+      EXECUTE format(
+        'INSERT INTO public.cleaner_data (user_id, %s)
+         SELECT $1, %s FROM public.cleaner_data WHERE user_id = $2',
+        v_cd_cols,
+        v_cd_select
+      )
+      USING p_primary, p_secondary;
+    ELSE
+      UPDATE public.cleaner_data cd_p SET
+        bio = COALESCE(NULLIF(trim(cd_p.bio), ''), cd_s.bio),
+        skills = NULLIF(
+          (
+            SELECT ARRAY(
+              SELECT DISTINCT unnest(
+                COALESCE(cd_p.skills, '{}'::text[])
+                || COALESCE(cd_s.skills, '{}'::text[])
+              )
+            )
+          ),
+          '{}'::text[]
+        ),
+        certifications = NULLIF(
+          (
+            SELECT ARRAY(
+              SELECT DISTINCT unnest(
+                COALESCE(cd_p.certifications, '{}'::text[])
+                || COALESCE(cd_s.certifications, '{}'::text[])
+              )
+            )
+          ),
+          '{}'::text[]
+        ),
+        service_areas = NULLIF(
+          (
+            SELECT ARRAY(
+              SELECT DISTINCT unnest(
+                COALESCE(cd_p.service_areas, '{}'::text[])
+                || COALESCE(cd_s.service_areas, '{}'::text[])
+              )
+            )
+          ),
+          '{}'::text[]
+        ),
+        specialties = NULLIF(
+          (
+            SELECT ARRAY(
+              SELECT DISTINCT unnest(
+                COALESCE(cd_p.specialties, '{}'::text[])
+                || COALESCE(cd_s.specialties, '{}'::text[])
+              )
+            )
+          ),
+          '{}'::text[]
+        ),
+        languages = NULLIF(
+          (
+            SELECT ARRAY(
+              SELECT DISTINCT unnest(
+                COALESCE(cd_p.languages, '{}'::text[])
+                || COALESCE(cd_s.languages, '{}'::text[])
+              )
+            )
+          ),
+          '{}'::text[]
+        ),
+        equipment_owned = NULLIF(
+          (
+            SELECT ARRAY(
+              SELECT DISTINCT unnest(
+                COALESCE(cd_p.equipment_owned, '{}'::text[])
+                || COALESCE(cd_s.equipment_owned, '{}'::text[])
+              )
+            )
+          ),
+          '{}'::text[]
+        ),
+        hourly_rate = CASE
+          WHEN COALESCE(cd_p.hourly_rate, 0) = 0 THEN cd_s.hourly_rate
+          ELSE cd_p.hourly_rate
+        END,
+        years_experience = GREATEST(
+          COALESCE(cd_p.years_experience, 0),
+          COALESCE(cd_s.years_experience, 0)
+        ),
+        verified = COALESCE(cd_p.verified, false) OR COALESCE(cd_s.verified, false),
+        is_background_checked =
+          COALESCE(cd_p.is_background_checked, false)
+          OR COALESCE(cd_s.is_background_checked, false),
+        service_categories = NULLIF(
+          (
+            SELECT ARRAY(
+              SELECT DISTINCT unnest(
+                COALESCE(cd_p.service_categories, '{}'::public.service_category[])
+                || COALESCE(cd_s.service_categories, '{}'::public.service_category[])
+              )
+            )
+          ),
+          '{}'::public.service_category[]
+        ),
+        completed_jobs = GREATEST(
+          COALESCE(cd_p.completed_jobs, 0),
+          COALESCE(cd_s.completed_jobs, 0)
+        ),
+        status = CASE
+          WHEN cd_p.status = 'suspended'::public.cleaner_status
+            OR cd_s.status = 'suspended'::public.cleaner_status
+            THEN 'suspended'::public.cleaner_status
+          WHEN cd_p.status = 'inactive'::public.cleaner_status
+            OR cd_s.status = 'inactive'::public.cleaner_status
+            THEN 'inactive'::public.cleaner_status
+          WHEN cd_p.status = 'active'::public.cleaner_status
+            OR cd_s.status = 'active'::public.cleaner_status
+            THEN 'active'::public.cleaner_status
+          ELSE COALESCE(cd_s.status, cd_p.status)
+        END,
+        paystack_customer_id = COALESCE(
+          NULLIF(trim(cd_p.paystack_customer_id), ''),
+          cd_s.paystack_customer_id
+        ),
+        pets_comfort = COALESCE(cd_p.pets_comfort, cd_s.pets_comfort),
+        work_history = CASE
+          WHEN cd_p.work_history IS NULL OR cd_p.work_history = '[]'::jsonb
+            THEN cd_s.work_history
+          ELSE cd_p.work_history
+        END,
+        base_location = COALESCE(cd_p.base_location, cd_s.base_location),
+        max_travel_distance_meters = COALESCE(
+          cd_p.max_travel_distance_meters,
+          cd_s.max_travel_distance_meters
+        ),
+        updated_at = now()
+      FROM public.cleaner_data cd_s
+      WHERE cd_p.user_id = p_primary AND cd_s.user_id = p_secondary;
+    END IF;
+  END IF;
+
   -- Low collision risk: direct FK reassignments
   UPDATE public.bookings SET customer_id = p_primary WHERE customer_id = p_secondary;
   UPDATE public.bookings SET cleaner_id = p_primary WHERE cleaner_id = p_secondary;
+  UPDATE public.bookings
+  SET direct_assigned_cleaner_id = p_primary
+  WHERE direct_assigned_cleaner_id = p_secondary;
+  UPDATE public.bookings
+  SET cancelled_by = p_primary
+  WHERE cancelled_by = p_secondary;
+
+  UPDATE public.booking_refunds
+  SET customer_id = p_primary
+  WHERE customer_id = p_secondary;
+
+  DELETE FROM public.booking_assignment_declines d_s
+  WHERE d_s.cleaner_id = p_secondary
+    AND EXISTS (
+      SELECT 1 FROM public.booking_assignment_declines d_p
+      WHERE d_p.booking_id = d_s.booking_id AND d_p.cleaner_id = p_primary
+    );
+  UPDATE public.booking_assignment_declines
+  SET cleaner_id = p_primary
+  WHERE cleaner_id = p_secondary;
+
+  DELETE FROM public.notifications n_s
+  WHERE n_s.user_id = p_secondary
+    AND n_s.dedupe_key IS NOT NULL
+    AND EXISTS (
+      SELECT 1 FROM public.notifications n_p
+      WHERE n_p.user_id = p_primary AND n_p.dedupe_key = n_s.dedupe_key
+    );
   UPDATE public.notifications SET user_id = p_primary WHERE user_id = p_secondary;
+
   UPDATE public.subscriptions SET customer_id = p_primary WHERE customer_id = p_secondary;
   UPDATE public.subscriptions SET cleaner_id = p_primary WHERE cleaner_id = p_secondary;
+
+  DELETE FROM public.reviews r_s
+  WHERE r_s.reviewer_id = p_secondary
+    AND r_s.booking_id IS NOT NULL
+    AND EXISTS (
+      SELECT 1 FROM public.reviews r_p
+      WHERE r_p.reviewer_id = p_primary AND r_p.booking_id = r_s.booking_id
+    );
   UPDATE public.reviews SET reviewer_id = p_primary WHERE reviewer_id = p_secondary;
   UPDATE public.reviews SET reviewee_id = p_primary WHERE reviewee_id = p_secondary;
+  IF EXISTS (SELECT 1 FROM public.cleaner_data WHERE user_id = p_primary) THEN
+    PERFORM public.recompute_cleaner_review_stats(p_primary);
+  END IF;
   UPDATE public.user_login_sessions SET user_id = p_primary WHERE user_id = p_secondary;
   UPDATE public.cleaner_leads SET linked_user_id = p_primary WHERE linked_user_id = p_secondary;
   UPDATE public.feedback SET customer_id = p_primary WHERE customer_id = p_secondary;
   UPDATE public.feedback SET cleaner_id = p_primary WHERE cleaner_id = p_secondary;
   UPDATE public.jobs SET customer_id = p_primary WHERE customer_id = p_secondary;
   UPDATE public.jobs SET claimed_by = p_primary WHERE claimed_by = p_secondary;
+
+  UPDATE public.job_offers j_p SET
+    status = CASE
+      WHEN CASE j_s.status
+             WHEN 'accepted' THEN 4 WHEN 'declined' THEN 3
+             WHEN 'sent' THEN 2 WHEN 'expired' THEN 1 ELSE 0
+           END
+         >
+           CASE j_p.status
+             WHEN 'accepted' THEN 4 WHEN 'declined' THEN 3
+             WHEN 'sent' THEN 2 WHEN 'expired' THEN 1 ELSE 0
+           END
+        THEN j_s.status
+      ELSE j_p.status
+    END,
+    responded_at = CASE
+      WHEN CASE j_s.status
+             WHEN 'accepted' THEN 4 WHEN 'declined' THEN 3
+             WHEN 'sent' THEN 2 WHEN 'expired' THEN 1 ELSE 0
+           END
+         >
+           CASE j_p.status
+             WHEN 'accepted' THEN 4 WHEN 'declined' THEN 3
+             WHEN 'sent' THEN 2 WHEN 'expired' THEN 1 ELSE 0
+           END
+        THEN j_s.responded_at
+      ELSE j_p.responded_at
+    END
+  FROM public.job_offers j_s
+  WHERE j_p.cleaner_id = p_primary
+    AND j_s.cleaner_id = p_secondary
+    AND j_p.job_id = j_s.job_id;
+  DELETE FROM public.job_offers j_s
+  WHERE j_s.cleaner_id = p_secondary
+    AND EXISTS (
+      SELECT 1 FROM public.job_offers j_p
+      WHERE j_p.job_id = j_s.job_id AND j_p.cleaner_id = p_primary
+    );
+  UPDATE public.job_offers SET cleaner_id = p_primary WHERE cleaner_id = p_secondary;
+
+  -- Unique (booking_id, customer_id, cleaner_id): collapse threads that would
+  -- share the post-merge tuple, then rempoint the survivor.
+  LOOP
+    SELECT drop_id, keep_id
+    INTO v_drop_conversation, v_keep_conversation
+    FROM (
+      WITH mapped AS (
+        SELECT
+          c.id,
+          CASE WHEN c.customer_id = p_secondary THEN p_primary ELSE c.customer_id END
+            AS new_customer_id,
+          CASE WHEN c.cleaner_id = p_secondary THEN p_primary ELSE c.cleaner_id END
+            AS new_cleaner_id,
+          c.booking_id,
+          c.last_message_at,
+          c.created_at,
+          (
+            c.customer_id IS DISTINCT FROM p_secondary
+            AND c.cleaner_id IS DISTINCT FROM p_secondary
+          ) AS already_primary
+        FROM public.conversations c
+        WHERE c.customer_id IN (p_primary, p_secondary)
+           OR c.cleaner_id IN (p_primary, p_secondary)
+      ),
+      ranked AS (
+        SELECT
+          id,
+          new_customer_id,
+          new_cleaner_id,
+          booking_id,
+          ROW_NUMBER() OVER (
+            PARTITION BY booking_id, new_customer_id, new_cleaner_id
+            ORDER BY already_primary DESC, last_message_at DESC NULLS LAST,
+              created_at DESC, id
+          ) AS rn
+        FROM mapped
+      )
+      SELECT r.id AS drop_id, s.id AS keep_id
+      FROM ranked r
+      JOIN ranked s
+        ON s.booking_id IS NOT DISTINCT FROM r.booking_id
+       AND s.new_customer_id = r.new_customer_id
+       AND s.new_cleaner_id = r.new_cleaner_id
+       AND s.rn = 1
+      WHERE r.rn > 1
+      LIMIT 1
+    ) dupes;
+    EXIT WHEN NOT FOUND;
+
+    UPDATE public.messages
+    SET conversation_id = v_keep_conversation
+    WHERE conversation_id = v_drop_conversation;
+
+    UPDATE public.conversations keep
+    SET
+      last_message_at = GREATEST(keep.last_message_at, drop.last_message_at),
+      updated_at = now()
+    FROM public.conversations drop
+    WHERE keep.id = v_keep_conversation
+      AND drop.id = v_drop_conversation;
+
+    DELETE FROM public.conversations WHERE id = v_drop_conversation;
+  END LOOP;
+
   UPDATE public.conversations SET customer_id = p_primary WHERE customer_id = p_secondary;
   UPDATE public.conversations SET cleaner_id = p_primary WHERE cleaner_id = p_secondary;
+  UPDATE public.booking_job_photos
+  SET uploaded_by = p_primary
+  WHERE uploaded_by = p_secondary;
+
+  -- Claimed Quick Task uploads keep registry metadata (storage path stays
+  -- {secondary}/...; SELECT policies allow merged prefixes). Unclaimed
+  -- drafts are discarded; the existing orphan cleanup can remove objects.
+  UPDATE public.quick_task_uploads
+  SET uploaded_by = p_primary
+  WHERE uploaded_by = p_secondary
+    AND booking_id IS NOT NULL;
+  DELETE FROM public.quick_task_uploads
+  WHERE uploaded_by = p_secondary
+    AND booking_id IS NULL;
+
   UPDATE public.psk_transaction SET customer_id = p_primary WHERE customer_id = p_secondary;
   UPDATE public.psk_transaction SET cleaner_id = p_primary WHERE cleaner_id = p_secondary;
+  UPDATE public.transactions SET customer_id = p_primary WHERE customer_id = p_secondary;
+  UPDATE public.transactions SET cleaner_id = p_primary WHERE cleaner_id = p_secondary;
+  UPDATE public.withdrawal_requests SET cleaner_id = p_primary WHERE cleaner_id = p_secondary;
 
-  -- cleaner_applications: drop secondary rows that would duplicate primary phone/email
-  DELETE FROM public.cleaner_applications a_s
-  WHERE a_s.user_id = p_secondary
-    AND (
-      EXISTS (
-        SELECT 1 FROM public.cleaner_applications a_p
-        WHERE a_p.user_id = p_primary AND a_p.phone = a_s.phone
-      )
-      OR (
-        a_s.email IS NOT NULL
-        AND EXISTS (
-          SELECT 1 FROM public.cleaner_applications a_p
-          WHERE a_p.user_id = p_primary
-            AND a_p.email IS NOT NULL
-            AND lower(trim(a_p.email)) = lower(trim(a_s.email))
-        )
-      )
-    );
-  UPDATE public.cleaner_applications SET user_id = p_primary WHERE user_id = p_secondary;
+  -- Cleaner team identities (auth.users ON DELETE CASCADE). Remap before
+  -- the app layer deletes the secondary auth user.
+  DELETE FROM public.co_cleaner_relationships
+  WHERE (lead_cleaner_id = p_secondary AND co_cleaner_id = p_primary)
+     OR (lead_cleaner_id = p_primary AND co_cleaner_id = p_secondary);
 
-  -- kyc_profiles: drop secondary rows that would duplicate primary subject_type or sumsub applicant
-  DELETE FROM public.kyc_profiles k_s
-  WHERE k_s.user_id = p_secondary
-    AND (
-      EXISTS (
-        SELECT 1 FROM public.kyc_profiles k_p
-        WHERE k_p.user_id = p_primary AND k_p.subject_type = k_s.subject_type
-      )
-      OR (
-        k_s.sumsub_applicant_id IS NOT NULL
-        AND EXISTS (
-          SELECT 1 FROM public.kyc_profiles k_p
-          WHERE k_p.user_id = p_primary
-            AND k_p.sumsub_applicant_id = k_s.sumsub_applicant_id
-        )
-      )
-    );
-  UPDATE public.kyc_profiles SET user_id = p_primary WHERE user_id = p_secondary;
-
-  -- device_tokens: drop secondary tokens already registered on primary, then reassign
-  DELETE FROM public.device_tokens d_s
-  WHERE d_s.user_id = p_secondary
+  DELETE FROM public.co_cleaner_relationships r_s
+  WHERE r_s.lead_cleaner_id = p_secondary
     AND EXISTS (
-      SELECT 1 FROM public.device_tokens d_p
-      WHERE d_p.user_id = p_primary AND d_p.token = d_s.token
+      SELECT 1 FROM public.co_cleaner_relationships r_p
+      WHERE r_p.lead_cleaner_id = p_primary
+        AND r_p.co_cleaner_id = r_s.co_cleaner_id
     );
-  UPDATE public.device_tokens SET user_id = p_primary WHERE user_id = p_secondary;
+
+  DELETE FROM public.co_cleaner_relationships r_s
+  WHERE r_s.co_cleaner_id = p_secondary
+    AND (
+      EXISTS (
+        SELECT 1 FROM public.co_cleaner_relationships r_p
+        WHERE r_p.co_cleaner_id = p_primary
+      )
+      OR EXISTS (
+        SELECT 1 FROM public.co_cleaner_relationships r_p
+        WHERE r_p.lead_cleaner_id = r_s.lead_cleaner_id
+          AND r_p.co_cleaner_id = p_primary
+      )
+    );
+
+  UPDATE public.co_cleaner_relationships
+  SET lead_cleaner_id = p_primary
+  WHERE lead_cleaner_id = p_secondary;
+  UPDATE public.co_cleaner_relationships
+  SET co_cleaner_id = p_primary
+  WHERE co_cleaner_id = p_secondary;
+
+  UPDATE public.co_cleaner_invitations
+  SET inviter_user_id = p_primary
+  WHERE inviter_user_id = p_secondary;
+  UPDATE public.co_cleaner_invitations
+  SET accepted_user_id = p_primary
+  WHERE accepted_user_id = p_secondary;
+
+  IF EXISTS (
+    SELECT 1 FROM public.cleaner_teams WHERE lead_cleaner_id = p_secondary
+  ) THEN
+    IF EXISTS (
+      SELECT 1 FROM public.cleaner_teams WHERE lead_cleaner_id = p_primary
+    ) THEN
+      UPDATE public.cleaner_teams t_p SET
+        company_name = COALESCE(NULLIF(trim(t_p.company_name), ''), t_s.company_name),
+        updated_at = now()
+      FROM public.cleaner_teams t_s
+      WHERE t_p.lead_cleaner_id = p_primary
+        AND t_s.lead_cleaner_id = p_secondary;
+      DELETE FROM public.cleaner_teams WHERE lead_cleaner_id = p_secondary;
+    ELSE
+      UPDATE public.cleaner_teams
+      SET lead_cleaner_id = p_primary, updated_at = now()
+      WHERE lead_cleaner_id = p_secondary;
+    END IF;
+  END IF;
+
+  UPDATE public.availability SET cleaner_id = p_primary WHERE cleaner_id = p_secondary;
+  UPDATE public.cleaner_schedules SET cleaner_id = p_primary WHERE cleaner_id = p_secondary;
+  UPDATE public.cleaner_tracking SET cleaner_id = p_primary WHERE cleaner_id = p_secondary;
+
+  DELETE FROM public.cleaner_availability_exceptions e_s
+  WHERE e_s.cleaner_id = p_secondary
+    AND EXISTS (
+      SELECT 1 FROM public.cleaner_availability_exceptions e_p
+      WHERE e_p.cleaner_id = p_primary
+        AND e_p.exception_date = e_s.exception_date
+    );
+  UPDATE public.cleaner_availability_exceptions
+  SET cleaner_id = p_primary, updated_at = now()
+  WHERE cleaner_id = p_secondary;
+
+  IF EXISTS (SELECT 1 FROM public.cleaner_verifications WHERE id = p_secondary) THEN
+    IF EXISTS (SELECT 1 FROM public.cleaner_verifications WHERE id = p_primary) THEN
+      UPDATE public.cleaner_verifications cv_p SET
+        full_name = COALESCE(NULLIF(trim(cv_p.full_name), ''), cv_s.full_name),
+        id_number = COALESCE(NULLIF(trim(cv_p.id_number), ''), cv_s.id_number),
+        id_front_url = COALESCE(NULLIF(trim(cv_p.id_front_url), ''), cv_s.id_front_url),
+        id_back_url = COALESCE(NULLIF(trim(cv_p.id_back_url), ''), cv_s.id_back_url),
+        police_report_url = COALESCE(NULLIF(trim(cv_p.police_report_url), ''), cv_s.police_report_url),
+        profile_photo_url = COALESCE(NULLIF(trim(cv_p.profile_photo_url), ''), cv_s.profile_photo_url),
+        bio = COALESCE(NULLIF(trim(cv_p.bio), ''), cv_s.bio),
+        service_area = COALESCE(NULLIF(trim(cv_p.service_area), ''), cv_s.service_area),
+        date_of_birth = COALESCE(cv_p.date_of_birth, cv_s.date_of_birth),
+        status = CASE
+          WHEN cv_p.status IN ('verified', 'approved') THEN cv_p.status
+          WHEN cv_s.status IN ('verified', 'approved') THEN cv_s.status
+          WHEN COALESCE(cv_p.status, 'pending') IS DISTINCT FROM 'pending'
+            THEN cv_p.status
+          ELSE cv_s.status
+        END,
+        updated_at = now()
+      FROM public.cleaner_verifications cv_s
+      WHERE cv_p.id = p_primary AND cv_s.id = p_secondary;
+      DELETE FROM public.cleaner_verifications WHERE id = p_secondary;
+    ELSE
+      UPDATE public.cleaner_verifications
+      SET id = p_primary, updated_at = now()
+      WHERE id = p_secondary;
+    END IF;
+  END IF;
+
+  UPDATE public.admin_booking_schedule_groups
+  SET customer_id = p_primary, updated_at = now()
+  WHERE customer_id = p_secondary;
+  UPDATE public.admin_booking_schedule_groups
+  SET cleaner_id = p_primary, updated_at = now()
+  WHERE cleaner_id = p_secondary;
+  UPDATE public.admin_booking_schedule_groups
+  SET created_by = p_primary, updated_at = now()
+  WHERE created_by = p_secondary;
+
+  UPDATE public.customer_risk_events
+  SET customer_id = p_primary
+  WHERE customer_id = p_secondary;
+  UPDATE public.customer_risk_admin_notes
+  SET customer_id = p_primary
+  WHERE customer_id = p_secondary;
+  UPDATE public.customer_risk_admin_actions
+  SET customer_id = p_primary
+  WHERE customer_id = p_secondary;
+
+  IF EXISTS (
+    SELECT 1 FROM public.customer_trust_profiles WHERE customer_id = p_secondary
+  ) THEN
+    IF EXISTS (
+      SELECT 1 FROM public.customer_trust_profiles WHERE customer_id = p_primary
+    ) THEN
+      UPDATE public.customer_trust_profiles p SET
+        admin_override_reason = COALESCE(p.admin_override_reason, s.admin_override_reason),
+        admin_override_set_at = COALESCE(p.admin_override_set_at, s.admin_override_set_at),
+        admin_override_set_by = COALESCE(p.admin_override_set_by, s.admin_override_set_by),
+        admin_override_stage = COALESCE(p.admin_override_stage, s.admin_override_stage),
+        manual_review_cleared_at = COALESCE(p.manual_review_cleared_at, s.manual_review_cleared_at),
+        last_reviewed_at = COALESCE(p.last_reviewed_at, s.last_reviewed_at),
+        updated_at = now()
+      FROM public.customer_trust_profiles s
+      WHERE p.customer_id = p_primary AND s.customer_id = p_secondary;
+      DELETE FROM public.customer_trust_profiles WHERE customer_id = p_secondary;
+    ELSE
+      UPDATE public.customer_trust_profiles
+      SET customer_id = p_primary, updated_at = now()
+      WHERE customer_id = p_secondary;
+    END IF;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM public.customer_risk_events WHERE customer_id = p_primary
+  ) OR EXISTS (
+    SELECT 1 FROM public.customer_trust_profiles WHERE customer_id = p_primary
+  ) THEN
+    PERFORM public.recalculate_customer_trust_profile(p_primary);
+  END IF;
+
+  UPDATE public.wallet_deductions SET user_id = p_primary WHERE user_id = p_secondary;
+  UPDATE public.payout_recipient_audit SET user_id = p_primary WHERE user_id = p_secondary;
+
+  UPDATE public.cleaner_health_snapshots s_p SET
+    risk_score = GREATEST(COALESCE(s_p.risk_score, 0), COALESCE(s_s.risk_score, 0)),
+    risk_level = CASE
+      WHEN s_p.risk_level = 'red' OR s_s.risk_level = 'red' THEN 'red'
+      WHEN s_p.risk_level = 'yellow' OR s_s.risk_level = 'yellow' THEN 'yellow'
+      ELSE COALESCE(s_p.risk_level, s_s.risk_level)
+    END,
+    complaint_count = GREATEST(
+      COALESCE(s_p.complaint_count, 0), COALESCE(s_s.complaint_count, 0)
+    ),
+    refund_count = GREATEST(
+      COALESCE(s_p.refund_count, 0), COALESCE(s_s.refund_count, 0)
+    ),
+    no_show_count = GREATEST(
+      COALESCE(s_p.no_show_count, 0), COALESCE(s_s.no_show_count, 0)
+    ),
+    late_arrival_count = GREATEST(
+      COALESCE(s_p.late_arrival_count, 0), COALESCE(s_s.late_arrival_count, 0)
+    ),
+    recent_low_ratings = GREATEST(
+      COALESCE(s_p.recent_low_ratings, 0), COALESCE(s_s.recent_low_ratings, 0)
+    ),
+    cancellation_rate = GREATEST(
+      COALESCE(s_p.cancellation_rate, 0), COALESCE(s_s.cancellation_rate, 0)
+    ),
+    risk_reasons = CASE
+      WHEN COALESCE(s_s.risk_score, 0) > COALESCE(s_p.risk_score, 0)
+        OR (s_s.risk_level = 'red' AND s_p.risk_level IS DISTINCT FROM 'red')
+        THEN COALESCE(s_s.risk_reasons, s_p.risk_reasons)
+      ELSE COALESCE(s_p.risk_reasons, s_s.risk_reasons)
+    END
+  FROM public.cleaner_health_snapshots s_s
+  WHERE s_p.cleaner_id = p_primary
+    AND s_s.cleaner_id = p_secondary
+    AND s_p.snapshot_date = s_s.snapshot_date;
+
+  UPDATE public.cleaner_operations_cases c
+  SET snapshot_id = s_p.id
+  FROM public.cleaner_health_snapshots s_s
+  JOIN public.cleaner_health_snapshots s_p
+    ON s_p.cleaner_id = p_primary
+   AND s_p.snapshot_date = s_s.snapshot_date
+  WHERE c.snapshot_id = s_s.id
+    AND s_s.cleaner_id = p_secondary;
+
+  DELETE FROM public.cleaner_health_snapshots s_s
+  WHERE s_s.cleaner_id = p_secondary
+    AND EXISTS (
+      SELECT 1 FROM public.cleaner_health_snapshots s_p
+      WHERE s_p.cleaner_id = p_primary AND s_p.snapshot_date = s_s.snapshot_date
+    );
+  UPDATE public.cleaner_health_snapshots
+  SET cleaner_id = p_primary
+  WHERE cleaner_id = p_secondary;
+
+  UPDATE public.cleaner_operations_cases
+  SET cleaner_id = p_primary
+  WHERE cleaner_id = p_secondary;
+
+  DELETE FROM public.cleaner_devices d_s
+  WHERE d_s.cleaner_id = p_secondary
+    AND EXISTS (
+      SELECT 1 FROM public.cleaner_devices d_p
+      WHERE d_p.cleaner_id = p_primary AND d_p.expo_push_token = d_s.expo_push_token
+    );
+  UPDATE public.cleaner_devices SET cleaner_id = p_primary WHERE cleaner_id = p_secondary;
 
   -- preferred_cleaners (user_id + cleaner_id): upsert merged pairs, remove secondary rows
   INSERT INTO public.preferred_cleaners (user_id, cleaner_id, created_at)
@@ -29759,32 +30656,289 @@ BEGIN
   DELETE FROM public.preferred_cleaners
   WHERE user_id = p_secondary OR cleaner_id = p_secondary;
 
+  UPDATE public.preferred_cleaner_invitations
+  SET inviter_user_id = p_primary, updated_at = now()
+  WHERE inviter_user_id = p_secondary;
+  UPDATE public.preferred_cleaner_invitations
+  SET accepted_cleaner_id = p_primary, updated_at = now()
+  WHERE accepted_cleaner_id = p_secondary;
+
+  -- property_preferred_cleaners: owner and cleaner identities (unique property+cleaner)
+  DELETE FROM public.property_preferred_cleaners ppc
+  WHERE ppc.cleaner_id = p_secondary
+    AND EXISTS (
+      SELECT 1 FROM public.property_preferred_cleaners x
+      WHERE x.property_id = ppc.property_id AND x.cleaner_id = p_primary
+    );
+  UPDATE public.property_preferred_cleaners
+  SET cleaner_id = p_primary
+  WHERE cleaner_id = p_secondary;
+
+  UPDATE public.property_preferred_cleaners
+  SET owner_id = p_primary
+  WHERE owner_id = p_secondary;
+
+  -- Drop secondary cleaner_data now that dependents point at primary.
+  DELETE FROM public.cleaner_data WHERE user_id = p_secondary;
+
+  IF v_secondary_slug IS NOT NULL THEN
+    UPDATE public.cleaner_data
+    SET booking_slug = v_secondary_slug
+    WHERE user_id = p_primary AND booking_slug IS NULL;
+  END IF;
+
+  IF v_secondary_paystack IS NOT NULL THEN
+    UPDATE public.cleaner_data
+    SET paystack_customer_id = COALESCE(
+      NULLIF(trim(paystack_customer_id), ''),
+      v_secondary_paystack
+    )
+    WHERE user_id = p_primary;
+  END IF;
+
+  -- wallets: one row per user_id. History FKs are non-cascading.
+  SELECT id INTO v_primary_wallet_id FROM public.wallets WHERE user_id = p_primary;
+  SELECT id INTO v_secondary_wallet_id FROM public.wallets WHERE user_id = p_secondary;
+
+  IF v_secondary_wallet_id IS NOT NULL THEN
+    IF v_primary_wallet_id IS NOT NULL THEN
+      UPDATE public.wallet_transactions
+      SET wallet_id = v_primary_wallet_id
+      WHERE wallet_id = v_secondary_wallet_id;
+      UPDATE public.withdrawal_requests
+      SET wallet_id = v_primary_wallet_id
+      WHERE wallet_id = v_secondary_wallet_id;
+      UPDATE public.wallets w_p SET
+        balance_subunit = COALESCE(w_p.balance_subunit, 0)
+          + COALESCE(w_s.balance_subunit, 0),
+        updated_at = now()
+      FROM public.wallets w_s
+      WHERE w_p.id = v_primary_wallet_id AND w_s.id = v_secondary_wallet_id;
+      DELETE FROM public.wallets WHERE id = v_secondary_wallet_id;
+    ELSE
+      UPDATE public.wallets
+      SET user_id = p_primary, updated_at = now()
+      WHERE id = v_secondary_wallet_id;
+    END IF;
+  END IF;
+
+  -- properties: one default per customer; owner satellite rows follow auth.users
+  IF EXISTS (
+    SELECT 1 FROM public.properties
+    WHERE customer_id = p_primary AND is_default
+  ) THEN
+    UPDATE public.properties
+    SET is_default = false, updated_at = now()
+    WHERE customer_id = p_secondary AND is_default;
+  END IF;
+
+  UPDATE public.properties
+  SET customer_id = p_primary, updated_at = now()
+  WHERE customer_id = p_secondary;
+
+  UPDATE public.property_private_instructions
+  SET owner_id = p_primary
+  WHERE owner_id = p_secondary;
+
+  UPDATE public.property_media
+  SET owner_id = p_primary
+  WHERE owner_id = p_secondary;
+
+  DELETE FROM public.property_calendar_feeds f_s
+  WHERE f_s.owner_id = p_secondary
+    AND EXISTS (
+      SELECT 1 FROM public.property_calendar_feeds f_p
+      WHERE f_p.owner_id = p_primary AND f_p.feed_url_hash = f_s.feed_url_hash
+    );
+  UPDATE public.property_calendar_feeds
+  SET owner_id = p_primary
+  WHERE owner_id = p_secondary;
+
+  -- payout_methods: unique (user, purpose, type, account, bank)
+  UPDATE public.payout_methods pm_s
+  SET is_default = false
+  WHERE pm_s.user_id = p_secondary
+    AND pm_s.is_default
+    AND EXISTS (
+      SELECT 1 FROM public.payout_methods pm_p
+      WHERE pm_p.user_id = p_primary
+        AND pm_p.purpose = pm_s.purpose
+        AND pm_p.is_default
+    );
+
+  DELETE FROM public.payout_methods pm_s
+  WHERE pm_s.user_id = p_secondary
+    AND EXISTS (
+      SELECT 1 FROM public.payout_methods pm_p
+      WHERE pm_p.user_id = p_primary
+        AND pm_p.purpose = pm_s.purpose
+        AND pm_p.type = pm_s.type
+        AND pm_p.account_number = pm_s.account_number
+        AND COALESCE(pm_p.bank_code, '') = COALESCE(pm_s.bank_code, '')
+    );
+  UPDATE public.payout_methods SET user_id = p_primary WHERE user_id = p_secondary;
+
+  DELETE FROM public.cleaner_payouts cp_s
+  WHERE cp_s.user_id = p_secondary
+    AND EXISTS (
+      SELECT 1 FROM public.cleaner_payouts cp_p
+      WHERE cp_p.user_id = p_primary AND cp_p.reference = cp_s.reference
+    );
+  UPDATE public.cleaner_payouts SET user_id = p_primary WHERE user_id = p_secondary;
+
+  UPDATE public.admin_cash_payouts
+  SET recorded_by = p_primary
+  WHERE recorded_by = p_secondary;
+  UPDATE public.admin_cash_payouts
+  SET cleaner_id = p_primary
+  WHERE cleaner_id = p_secondary;
+
+  -- cleaner_applications: keep the stronger KYC/approval evidence, then
+  -- drop the secondary row (user_id and phone are unique).
+  IF EXISTS (SELECT 1 FROM public.cleaner_applications WHERE user_id = p_secondary)
+     AND EXISTS (SELECT 1 FROM public.cleaner_applications WHERE user_id = p_primary)
+  THEN
+    IF EXISTS (
+      SELECT 1
+      FROM public.cleaner_applications a_p
+      JOIN public.cleaner_applications a_s ON a_s.user_id = p_secondary
+      WHERE a_p.user_id = p_primary
+        AND (
+          (a_p.status = 'approved' AND a_s.status = 'rejected')
+          OR (a_p.status = 'rejected' AND a_s.status = 'approved')
+        )
+    ) THEN
+      RAISE EXCEPTION 'merge_conflicting_application_status'
+        USING ERRCODE = 'P0006';
+    END IF;
+    UPDATE public.cleaner_applications a_p SET
+      status = CASE
+        WHEN a_p.status = 'approved' OR a_s.status = 'approved' THEN 'approved'
+        WHEN a_p.status = 'rejected' OR a_s.status = 'rejected' THEN 'rejected'
+        WHEN a_p.status = 'requested_info' THEN a_p.status
+        WHEN a_s.status = 'requested_info' THEN a_s.status
+        WHEN a_p.status = 'pending' OR a_s.status = 'pending' THEN 'pending'
+        ELSE a_p.status
+      END,
+      kyc_status = CASE
+        WHEN CASE a_s.kyc_status
+               WHEN 'completed' THEN 5 WHEN 'rejected' THEN 4
+               WHEN 'pending' THEN 3 WHEN 'on_hold' THEN 2
+               WHEN 'not_started' THEN 1 ELSE 0
+             END
+           >
+             CASE a_p.kyc_status
+               WHEN 'completed' THEN 5 WHEN 'rejected' THEN 4
+               WHEN 'pending' THEN 3 WHEN 'on_hold' THEN 2
+               WHEN 'not_started' THEN 1 ELSE 0
+             END
+          THEN a_s.kyc_status
+        ELSE a_p.kyc_status
+      END,
+      kyc_review_answer = CASE
+        WHEN a_p.status = 'rejected' THEN COALESCE(a_p.kyc_review_answer, a_s.kyc_review_answer)
+        WHEN a_s.status = 'rejected' THEN COALESCE(a_s.kyc_review_answer, a_p.kyc_review_answer)
+        WHEN upper(COALESCE(a_s.kyc_review_answer, '')) = 'GREEN' THEN a_s.kyc_review_answer
+        ELSE COALESCE(NULLIF(trim(a_p.kyc_review_answer), ''), a_s.kyc_review_answer)
+      END,
+      kyc_review_status = COALESCE(
+        NULLIF(trim(a_p.kyc_review_status), ''),
+        a_s.kyc_review_status
+      ),
+      kyc_completed_at = COALESCE(a_p.kyc_completed_at, a_s.kyc_completed_at),
+      reference1_name = COALESCE(NULLIF(trim(a_p.reference1_name), ''), a_s.reference1_name),
+      reference1_phone = COALESCE(NULLIF(trim(a_p.reference1_phone), ''), a_s.reference1_phone),
+      reference1_relationship = COALESCE(
+        NULLIF(trim(a_p.reference1_relationship), ''),
+        a_s.reference1_relationship
+      ),
+      reference2_name = COALESCE(NULLIF(trim(a_p.reference2_name), ''), a_s.reference2_name),
+      reference2_phone = COALESCE(NULLIF(trim(a_p.reference2_phone), ''), a_s.reference2_phone),
+      reference2_relationship = COALESCE(
+        NULLIF(trim(a_p.reference2_relationship), ''),
+        a_s.reference2_relationship
+      ),
+      reference3_name = COALESCE(NULLIF(trim(a_p.reference3_name), ''), a_s.reference3_name),
+      reference3_phone = COALESCE(NULLIF(trim(a_p.reference3_phone), ''), a_s.reference3_phone),
+      reference3_relationship = COALESCE(
+        NULLIF(trim(a_p.reference3_relationship), ''),
+        a_s.reference3_relationship
+      ),
+      updated_at = now(),
+      last_updated = now()
+    FROM public.cleaner_applications a_s
+    WHERE a_p.user_id = p_primary AND a_s.user_id = p_secondary;
+    DELETE FROM public.cleaner_applications WHERE user_id = p_secondary;
+  ELSE
+    UPDATE public.cleaner_applications SET user_id = p_primary WHERE user_id = p_secondary;
+  END IF;
+
+  -- kyc_profiles: keep the stronger verification when both share subject_type.
+  WITH ranked AS (
+    SELECT
+      id,
+      user_id,
+      subject_type,
+      CASE kyc_status
+        WHEN 'approved' THEN 4
+        WHEN 'completed' THEN 4
+        WHEN 'rejected' THEN 3
+        WHEN 'failed' THEN 3
+        WHEN 'submitted' THEN 2
+        WHEN 'started' THEN 1
+        ELSE 0
+      END AS rank,
+      CASE WHEN user_id = p_primary THEN 1 ELSE 0 END AS is_primary
+    FROM public.kyc_profiles
+    WHERE user_id IN (p_primary, p_secondary)
+  ),
+  losers AS (
+    SELECT r.id
+    FROM ranked r
+    WHERE EXISTS (
+      SELECT 1
+      FROM ranked k
+      WHERE k.subject_type = r.subject_type
+        AND k.id <> r.id
+        AND (k.rank, k.is_primary) > (r.rank, r.is_primary)
+    )
+  )
+  DELETE FROM public.kyc_profiles k
+  USING losers l
+  WHERE k.id = l.id;
+
+  DELETE FROM public.kyc_profiles k_s
+  WHERE k_s.user_id = p_secondary
+    AND k_s.sumsub_applicant_id IS NOT NULL
+    AND EXISTS (
+      SELECT 1 FROM public.kyc_profiles k_p
+      WHERE k_p.user_id = p_primary
+        AND k_p.sumsub_applicant_id = k_s.sumsub_applicant_id
+    );
+  UPDATE public.kyc_profiles SET user_id = p_primary WHERE user_id = p_secondary;
+
+  DELETE FROM public.promotion_redemptions r_s
+  WHERE r_s.user_id = p_secondary
+    AND EXISTS (
+      SELECT 1 FROM public.promotion_redemptions r_p
+      WHERE r_p.user_id = p_primary AND r_p.promotion_id = r_s.promotion_id
+    );
+  UPDATE public.promotion_redemptions SET user_id = p_primary WHERE user_id = p_secondary;
+
+  -- device_tokens: drop secondary tokens already registered on primary, then reassign
+  DELETE FROM public.device_tokens d_s
+  WHERE d_s.user_id = p_secondary
+    AND EXISTS (
+      SELECT 1 FROM public.device_tokens d_p
+      WHERE d_p.user_id = p_primary AND d_p.token = d_s.token
+    );
+  UPDATE public.device_tokens SET user_id = p_primary WHERE user_id = p_secondary;
+
   -- Drafts: one row per user_id
   IF EXISTS (SELECT 1 FROM public.cleaner_application_drafts WHERE user_id = p_primary) THEN
     DELETE FROM public.cleaner_application_drafts WHERE user_id = p_secondary;
   ELSE
     UPDATE public.cleaner_application_drafts SET user_id = p_primary WHERE user_id = p_secondary;
-  END IF;
-
-  -- cleaner_data: one row per user_id
-  IF EXISTS (SELECT 1 FROM public.cleaner_data WHERE user_id = p_secondary) THEN
-    IF EXISTS (SELECT 1 FROM public.cleaner_data WHERE user_id = p_primary) THEN
-      UPDATE public.cleaner_data cd_p SET
-        bio = COALESCE(NULLIF(trim(cd_p.bio), ''), cd_s.bio),
-        skills = COALESCE(cd_p.skills, cd_s.skills),
-        certifications = COALESCE(cd_p.certifications, cd_s.certifications),
-        service_areas = COALESCE(cd_p.service_areas, cd_s.service_areas),
-        hourly_rate = COALESCE(cd_p.hourly_rate, cd_s.hourly_rate),
-        verified = COALESCE(cd_p.verified, cd_s.verified),
-        rating = COALESCE(cd_p.rating, cd_s.rating),
-        completed_jobs = GREATEST(COALESCE(cd_p.completed_jobs, 0), COALESCE(cd_s.completed_jobs, 0)),
-        updated_at = now()
-      FROM public.cleaner_data cd_s
-      WHERE cd_p.user_id = p_primary AND cd_s.user_id = p_secondary;
-      DELETE FROM public.cleaner_data WHERE user_id = p_secondary;
-    ELSE
-      UPDATE public.cleaner_data SET user_id = p_primary WHERE user_id = p_secondary;
-    END IF;
   END IF;
 
   -- Roles: union then drop secondary
@@ -29799,6 +30953,7 @@ BEGIN
       id,
       user_id,
       firstname,
+      middlename,
       lastname,
       fullname,
       bio,
@@ -29807,12 +30962,16 @@ BEGIN
       notification_settings,
       preferences,
       location_wkt,
+      deleted_at,
+      deactivated_at,
+      deletion_status,
       updated_at
     )
     SELECT
       p_primary,
       p_primary,
       s.firstname,
+      s.middlename,
       s.lastname,
       s.fullname,
       s.bio,
@@ -29821,13 +30980,19 @@ BEGIN
       s.notification_settings,
       s.preferences,
       s.location_wkt,
+      s.deleted_at,
+      s.deactivated_at,
+      COALESCE(s.deletion_status, 'none'),
       now()
     FROM public.profiles s
     WHERE s.id = p_secondary
       AND NOT EXISTS (SELECT 1 FROM public.profiles p WHERE p.id = p_primary);
 
+    -- Both profiles exist: primary lifecycle wins so an active surviving
+    -- account is not hidden, and a deleted surviving account is not revived.
     UPDATE public.profiles p SET
       firstname = COALESCE(NULLIF(trim(p.firstname), ''), s.firstname),
+      middlename = COALESCE(NULLIF(trim(p.middlename), ''), s.middlename),
       lastname = COALESCE(NULLIF(trim(p.lastname), ''), s.lastname),
       fullname = COALESCE(NULLIF(trim(p.fullname), ''), s.fullname),
       bio = COALESCE(NULLIF(trim(p.bio), ''), s.bio),
@@ -29840,7 +31005,18 @@ BEGIN
     FROM public.profiles s
     WHERE p.id = p_primary AND s.id = p_secondary;
 
+    UPDATE public.messages
+    SET sender_id = p_primary
+    WHERE sender_id = p_secondary;
+
     DELETE FROM public.profiles WHERE id = p_secondary;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM public.profiles
+    WHERE id = p_primary OR user_id = p_primary
+  ) THEN
+    PERFORM public.recompute_customer_review_stats(p_primary);
   END IF;
 
   -- Contact fields on primary public.users mirror.
@@ -29864,10 +31040,48 @@ BEGIN
     WHERE id = p_secondary;
   END IF;
 
+  -- Inbound referrals must move before deleting secondary (no ON DELETE).
+  UPDATE public.users
+  SET
+    referred_by = p_primary,
+    updated_at = now(),
+    last_updated = now()
+  WHERE referred_by = p_secondary
+    AND id IS DISTINCT FROM p_primary;
+
+  IF NULLIF(trim(v_primary.referral_code), '') IS NULL
+     AND NULLIF(trim(v_secondary.referral_code), '') IS NOT NULL THEN
+    UPDATE public.users
+    SET referral_code = NULL, updated_at = now(), last_updated = now()
+    WHERE id = p_secondary;
+  END IF;
+
   UPDATE public.users
   SET
     email = COALESCE(NULLIF(trim(email), ''), NULLIF(trim(v_secondary.email), '')),
     phone = COALESCE(phone, v_secondary.phone),
+    referral_code = COALESCE(
+      NULLIF(trim(referral_code), ''),
+      NULLIF(trim(v_secondary.referral_code), '')
+    ),
+    referred_by = CASE
+      WHEN referred_by IS NOT NULL AND referred_by IS DISTINCT FROM p_secondary
+        THEN referred_by
+      WHEN v_secondary.referred_by IS NOT NULL
+        AND v_secondary.referred_by IS DISTINCT FROM p_primary
+        AND v_secondary.referred_by IS DISTINCT FROM p_secondary
+        THEN v_secondary.referred_by
+      ELSE NULL
+    END,
+    referred_at = CASE
+      WHEN referred_by IS NOT NULL AND referred_by IS DISTINCT FROM p_secondary
+        THEN referred_at
+      WHEN v_secondary.referred_by IS NOT NULL
+        AND v_secondary.referred_by IS DISTINCT FROM p_primary
+        AND v_secondary.referred_by IS DISTINCT FROM p_secondary
+        THEN COALESCE(referred_at, v_secondary.referred_at)
+      ELSE NULL
+    END,
     updated_at = now(),
     last_updated = now()
   WHERE id = p_primary;
@@ -30575,6 +31789,23 @@ CREATE OR REPLACE FUNCTION public.path(geometry)
  LANGUAGE c
  IMMUTABLE PARALLEL SAFE STRICT
 AS '$libdir/postgis-3', $function$geometry_to_path$function$
+
+
+CREATE OR REPLACE FUNCTION public.paystack_plan_interval_for_recurrence(p_recurrence_interval text)
+ RETURNS text
+ LANGUAGE plpgsql
+ IMMUTABLE
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_interval text := lower(trim(coalesce(p_recurrence_interval, '')));
+BEGIN
+  IF v_interval IN ('daily', 'weekly', 'monthly', 'quarterly', 'annually') THEN
+    RETURN v_interval;
+  END IF;
+  RETURN NULL;
+END;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.peek_customer_booking_verification_requirement(p_customer_id uuid, p_booking_id uuid DEFAULT NULL::uuid)
@@ -32734,6 +33965,29 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.quick_task_path_prefix_owned_by(p_prefix text, p_uid uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  WITH RECURSIVE merged AS (
+    SELECT p_uid AS user_id
+    UNION
+    SELECT m.secondary_user_id
+    FROM public.account_merges m
+    JOIN merged x ON m.primary_user_id = x.user_id
+  )
+  SELECT
+    p_uid IS NOT NULL
+    AND NULLIF(btrim(COALESCE(p_prefix, '')), '') IS NOT NULL
+    AND EXISTS (
+      SELECT 1 FROM merged
+      WHERE merged.user_id::text = btrim(p_prefix)
+    );
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.reattach_admin_schedule_promotion_anchor(p_group_id uuid)
  RETURNS uuid
  LANGUAGE plpgsql
@@ -33666,6 +34920,23 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.recurring_discount_bps_for_interval(p_recurrence_interval text, p_weekly_bps integer, p_monthly_bps integer)
+ RETURNS integer
+ LANGUAGE plpgsql
+ IMMUTABLE
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_interval text := lower(trim(coalesce(p_recurrence_interval, '')));
+BEGIN
+  IF v_interval IN ('monthly', 'quarterly', 'annually') THEN
+    RETURN greatest(0, least(10000, coalesce(p_monthly_bps, 0)));
+  END IF;
+  RETURN greatest(0, least(10000, coalesce(p_weekly_bps, 0)));
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.refresh_auth_identity_lookup(target_user_id uuid)
  RETURNS void
  LANGUAGE plpgsql
@@ -34132,6 +35403,9 @@ DECLARE
   v_recurrence_anchor date;
   v_next_service date;
   v_next_billing date;
+  v_next_time time;
+  v_interval text;
+  v_ts timestamp;
 BEGIN
   IF p_anchor_service_date IS NULL THEN
     RETURN jsonb_build_object('action', 'error', 'error', 'invalid_anchor_date');
@@ -34148,14 +35422,22 @@ BEGIN
   END IF;
 
   v_recurrence_anchor := coalesce(v_sub.recurrence_anchor_date, p_anchor_service_date);
+  v_interval := lower(trim(coalesce(v_sub.recurrence_interval, '')));
+  v_next_time := coalesce(v_sub.scheduled_time, time '09:00');
 
-  v_next_service := public.compute_next_recurrence_date(
-    p_anchor_service_date,
-    v_sub.recurrence_interval,
-    v_recurrence_anchor
-  );
-
-  v_next_billing := v_next_service;
+  IF v_interval = 'hourly' THEN
+    v_ts := (p_anchor_service_date + v_next_time) + interval '1 hour';
+    v_next_service := v_ts::date;
+    v_next_billing := v_next_service;
+    v_next_time := v_ts::time;
+  ELSE
+    v_next_service := public.compute_next_recurrence_date(
+      p_anchor_service_date,
+      v_sub.recurrence_interval,
+      v_recurrence_anchor
+    );
+    v_next_billing := v_next_service;
+  END IF;
 
   UPDATE public.subscriptions
   SET
@@ -34163,6 +35445,10 @@ BEGIN
     next_occurrence_date = v_next_service,
     next_billing_date = v_next_billing,
     paystack_start_date = v_next_billing,
+    scheduled_time = CASE
+      WHEN v_interval = 'hourly' THEN v_next_time
+      ELSE scheduled_time
+    END,
     updated_at = now()
   WHERE id = p_subscription_id;
 
@@ -37569,6 +38855,281 @@ BEGIN
     'cleaner_earnings_minor', v_group.cleaner_earnings_minor,
     'paystack_reference', v_ref,
     'promotion_finalize', v_finalize
+  );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.settle_claimed_invoice_occurrence(p_event_id uuid, p_claim_token uuid, p_subscription_id uuid, p_scheduled_date date, p_scheduled_time time without time zone, p_payload jsonb DEFAULT NULL::jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_event public.subscription_invoice_events%ROWTYPE;
+  v_booking public.bookings%ROWTYPE;
+  v_booking_id uuid;
+  v_payment text;
+  v_wkt text;
+  v_location geometry;
+  v_extra_task_ids text[];
+BEGIN
+  IF p_event_id IS NULL OR p_claim_token IS NULL OR p_subscription_id IS NULL OR p_scheduled_date IS NULL THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'missing_claim');
+  END IF;
+
+  -- Payment-status triggers allow service_role. Direct SQL tests (and this
+  -- definer function) must present that role so paid inserts are not rejected.
+  IF coalesce(auth.role(), '') IS DISTINCT FROM 'service_role' THEN
+    PERFORM set_config('request.jwt.claim.role', 'service_role', true);
+  END IF;
+
+  SELECT *
+  INTO v_event
+  FROM public.subscription_invoice_events
+  WHERE id = p_event_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'event_not_found');
+  END IF;
+
+  IF v_event.subscription_id IS DISTINCT FROM p_subscription_id THEN
+    RETURN jsonb_build_object('action', 'error', 'error', 'subscription_mismatch');
+  END IF;
+
+  IF v_event.status = 'applied' THEN
+    RETURN jsonb_build_object(
+      'action', 'already_applied',
+      'event_id', v_event.id,
+      'booking_id', v_event.booking_id
+    );
+  END IF;
+
+  IF v_event.claim_token IS DISTINCT FROM p_claim_token THEN
+    RETURN jsonb_build_object(
+      'action', 'stale_claim',
+      'event_id', v_event.id
+    );
+  END IF;
+
+  UPDATE public.subscription_invoice_events
+  SET updated_at = now()
+  WHERE id = v_event.id;
+
+  SELECT *
+  INTO v_booking
+  FROM public.bookings
+  WHERE subscription_id = p_subscription_id
+    AND scheduled_date = p_scheduled_date
+    AND scheduled_time IS NOT DISTINCT FROM coalesce(p_scheduled_time, time '09:00')
+    AND status IS DISTINCT FROM 'cancelled'
+  ORDER BY created_at NULLS LAST, id
+  LIMIT 1
+  FOR UPDATE;
+
+  IF FOUND THEN
+    v_payment := lower(btrim(coalesce(v_booking.payment_status, '')));
+    IF v_payment <> '' AND v_payment NOT IN ('pending', 'failed') THEN
+      RETURN jsonb_build_object(
+        'action', 'skip_already_paid',
+        'booking_id', v_booking.id,
+        'event_id', v_event.id
+      );
+    END IF;
+  END IF;
+
+  IF p_payload IS NULL OR jsonb_typeof(p_payload) <> 'object' THEN
+    RETURN jsonb_build_object(
+      'action', 'needs_write',
+      'booking_id', v_booking.id,
+      'event_id', v_event.id
+    );
+  END IF;
+
+  v_wkt := nullif(btrim(coalesce(p_payload->>'location_coordinates', '')), '');
+  IF v_wkt IS NOT NULL AND v_wkt LIKE 'POINT%' THEN
+    v_location := ST_GeomFromText(v_wkt, 4326);
+  ELSE
+    v_location := NULL;
+  END IF;
+
+  IF jsonb_typeof(p_payload->'extra_task_ids') = 'array' THEN
+    SELECT coalesce(array_agg(elem), '{}'::text[])
+    INTO v_extra_task_ids
+    FROM jsonb_array_elements_text(p_payload->'extra_task_ids') AS elem;
+  ELSE
+    v_extra_task_ids := '{}'::text[];
+  END IF;
+
+  IF v_booking.id IS NOT NULL THEN
+    UPDATE public.bookings
+    SET
+      cleaner_id = nullif(p_payload->>'cleaner_id', '')::uuid,
+      title = coalesce(nullif(p_payload->>'title', ''), title),
+      scheduled_date = p_scheduled_date,
+      scheduled_time = coalesce(p_scheduled_time, scheduled_time),
+      duration_hours = coalesce((p_payload->>'duration_hours')::numeric, duration_hours),
+      address = coalesce(nullif(p_payload->>'address', ''), address),
+      location_coordinates = coalesce(v_location, location_coordinates),
+      special_instructions = p_payload->>'special_instructions',
+      total_price = coalesce((p_payload->>'total_price')::numeric, total_price),
+      final_amount_minor = coalesce((p_payload->>'final_amount_minor')::integer, final_amount_minor),
+      core_amount_minor = coalesce((p_payload->>'core_amount_minor')::integer, core_amount_minor),
+      same_day_surcharge_minor = coalesce((p_payload->>'same_day_surcharge_minor')::integer, same_day_surcharge_minor),
+      weekend_surcharge_minor = coalesce((p_payload->>'weekend_surcharge_minor')::integer, weekend_surcharge_minor),
+      is_same_day = coalesce((p_payload->>'is_same_day')::boolean, is_same_day),
+      is_weekend = coalesce((p_payload->>'is_weekend')::boolean, is_weekend),
+      pricing_version = coalesce(nullif(p_payload->>'pricing_version', ''), pricing_version),
+      currency = coalesce(nullif(p_payload->>'currency', ''), currency),
+      status = coalesce(nullif(p_payload->>'status', '')::public.booking_status, status),
+      payment_status = 'paid',
+      payment_method = coalesce(nullif(p_payload->>'payment_method', ''), payment_method),
+      platform_fee = coalesce((p_payload->>'platform_fee')::numeric, platform_fee),
+      booking_cover = coalesce((p_payload->>'booking_cover')::boolean, booking_cover),
+      booking_cover_amount = coalesce((p_payload->>'booking_cover_amount')::numeric, booking_cover_amount),
+      work_rate_ghs_per_hour = coalesce((p_payload->>'work_rate_ghs_per_hour')::numeric, work_rate_ghs_per_hour),
+      timezone_name = coalesce(nullif(p_payload->>'timezone_name', ''), timezone_name),
+      home_size = coalesce(nullif(p_payload->>'home_size', ''), home_size),
+      extra_task_ids = v_extra_task_ids,
+      reference = coalesce(nullif(p_payload->>'reference', ''), reference),
+      last_updated = now()
+    WHERE id = v_booking.id
+    RETURNING id INTO v_booking_id;
+
+    RETURN jsonb_build_object(
+      'action', 'settle_pending',
+      'booking_id', v_booking_id,
+      'event_id', v_event.id
+    );
+  END IF;
+
+  BEGIN
+    INSERT INTO public.bookings (
+      customer_id,
+      cleaner_id,
+      service_id,
+      title,
+      scheduled_date,
+      scheduled_time,
+      duration_hours,
+      address,
+      location_coordinates,
+      special_instructions,
+      total_price,
+      final_amount_minor,
+      core_amount_minor,
+      same_day_surcharge_minor,
+      weekend_surcharge_minor,
+      is_same_day,
+      is_weekend,
+      pricing_version,
+      currency,
+      subscription_id,
+      status,
+      payment_status,
+      payment_method,
+      platform_fee,
+      booking_cover,
+      booking_cover_amount,
+      work_rate_ghs_per_hour,
+      timezone_name,
+      home_size,
+      extra_task_ids,
+      reference,
+      supplies_option,
+      supplies_allowance_minor,
+      idempotency_key
+    )
+    VALUES (
+      (p_payload->>'customer_id')::uuid,
+      nullif(p_payload->>'cleaner_id', '')::uuid,
+      (p_payload->>'service_id')::integer,
+      coalesce(nullif(p_payload->>'title', ''), 'Recurring cleaning'),
+      p_scheduled_date,
+      coalesce(p_scheduled_time, time '09:00'),
+      coalesce((p_payload->>'duration_hours')::numeric, 2),
+      coalesce(nullif(p_payload->>'address', ''), 'Recurring booking'),
+      v_location,
+      p_payload->>'special_instructions',
+      coalesce((p_payload->>'total_price')::numeric, (p_payload->>'final_amount_minor')::numeric, 0),
+      coalesce((p_payload->>'final_amount_minor')::integer, 0),
+      coalesce((p_payload->>'core_amount_minor')::integer, 0),
+      coalesce((p_payload->>'same_day_surcharge_minor')::integer, 0),
+      coalesce((p_payload->>'weekend_surcharge_minor')::integer, 0),
+      coalesce((p_payload->>'is_same_day')::boolean, false),
+      coalesce((p_payload->>'is_weekend')::boolean, false),
+      coalesce(nullif(p_payload->>'pricing_version', ''), 'v1'),
+      coalesce(nullif(p_payload->>'currency', ''), 'GHS'),
+      p_subscription_id,
+      coalesce(nullif(p_payload->>'status', '')::public.booking_status, 'pending'),
+      'pending',
+      coalesce(nullif(p_payload->>'payment_method', ''), 'paystack'),
+      coalesce((p_payload->>'platform_fee')::numeric, 0),
+      coalesce((p_payload->>'booking_cover')::boolean, false),
+      coalesce((p_payload->>'booking_cover_amount')::numeric, 0),
+      (p_payload->>'work_rate_ghs_per_hour')::numeric,
+      coalesce(nullif(p_payload->>'timezone_name', ''), 'Africa/Accra'),
+      p_payload->>'home_size',
+      v_extra_task_ids,
+      nullif(p_payload->>'reference', ''),
+      'customer_provided',
+      0,
+      gen_random_uuid()
+    )
+    RETURNING id INTO v_booking_id;
+
+    UPDATE public.bookings
+    SET
+      payment_status = 'paid',
+      last_updated = now()
+    WHERE id = v_booking_id;
+  EXCEPTION
+    WHEN unique_violation THEN
+      SELECT *
+      INTO v_booking
+      FROM public.bookings
+      WHERE subscription_id = p_subscription_id
+        AND scheduled_date = p_scheduled_date
+        AND scheduled_time IS NOT DISTINCT FROM coalesce(p_scheduled_time, time '09:00')
+        AND status IS DISTINCT FROM 'cancelled'
+      ORDER BY created_at NULLS LAST, id
+      LIMIT 1
+      FOR UPDATE;
+
+      IF NOT FOUND THEN
+        RETURN jsonb_build_object('action', 'error', 'error', 'occurrence_conflict');
+      END IF;
+
+      v_payment := lower(btrim(coalesce(v_booking.payment_status, '')));
+      IF v_payment <> '' AND v_payment NOT IN ('pending', 'failed') THEN
+        RETURN jsonb_build_object(
+          'action', 'skip_already_paid',
+          'booking_id', v_booking.id,
+          'event_id', v_event.id
+        );
+      END IF;
+
+      UPDATE public.bookings
+      SET
+        payment_status = 'paid',
+        reference = coalesce(nullif(p_payload->>'reference', ''), reference),
+        last_updated = now()
+      WHERE id = v_booking.id
+      RETURNING id INTO v_booking_id;
+
+      RETURN jsonb_build_object(
+        'action', 'settle_pending',
+        'booking_id', v_booking_id,
+        'event_id', v_event.id
+      );
+  END;
+
+  RETURN jsonb_build_object(
+    'action', 'create',
+    'booking_id', v_booking_id,
+    'event_id', v_event.id
   );
 END;
 $function$
@@ -44837,20 +46398,23 @@ AS $function$
 DECLARE
   v_uid uuid := auth.uid();
   v_path text := NULLIF(btrim(COALESCE(p_path, '')), '');
+  v_prefix text;
 BEGIN
   IF v_path IS NULL THEN
     RETURN false;
   END IF;
 
+  -- When there is no JWT (SQL tests / service role), only enforce non-empty path shape.
   IF v_uid IS NULL THEN
     RETURN v_path ~ '^[A-Za-z0-9_./-]+$';
   END IF;
 
-  IF split_part(v_path, '/', 1) IS DISTINCT FROM v_uid::text THEN
+  v_prefix := split_part(v_path, '/', 1);
+  IF NOT public.quick_task_path_prefix_owned_by(v_prefix, v_uid) THEN
     RETURN false;
   END IF;
 
-  IF v_path !~ ('^' || v_uid::text || '/[A-Za-z0-9_.-]+\.(jpg|jpeg|png|webp)$') THEN
+  IF v_path !~ '^[0-9a-f-]{36}/[A-Za-z0-9_.-]+\.(jpg|jpeg|png|webp)$' THEN
     RETURN false;
   END IF;
 
