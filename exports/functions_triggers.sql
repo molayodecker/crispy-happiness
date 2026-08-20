@@ -2340,6 +2340,19 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public._is_referral_promotion_slug(p_slug text)
+ RETURNS boolean
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$
+  SELECT p_slug IN (
+    'referral_25_v1',
+    'referral_25_friend_v1',
+    'referral_25_host_v1'
+  );
+$function$
+
+
 CREATE OR REPLACE FUNCTION public._is_schema(name)
  RETURNS boolean
  LANGUAGE sql
@@ -3316,6 +3329,25 @@ BEGIN
     PERFORM pg_sleep(v_ms / 1000.0);
   END IF;
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public._referral_host_has_paid_invitee(p_referrer_id uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.users invitee
+    JOIN public.bookings booking ON booking.customer_id = invitee.id
+    WHERE invitee.referred_by = p_referrer_id
+      AND invitee.referred_at IS NOT NULL
+      AND booking.status IS DISTINCT FROM 'cancelled'
+      AND lower(coalesce(booking.payment_status, '')) IN ('paid', 'post_paid')
+      AND booking.created_at >= invitee.referred_at
+  );
 $function$
 
 
@@ -6169,76 +6201,69 @@ CREATE OR REPLACE FUNCTION public.apply_referral_code(p_code text)
  RETURNS jsonb
  LANGUAGE plpgsql
  SECURITY DEFINER
- SET search_path TO 'public'
+ SET search_path TO 'public', 'pg_temp'
 AS $function$
-declare
+DECLARE
   v_user uuid := auth.uid();
   v_code text := upper(trim(coalesce(p_code, '')));
   v_referrer_id uuid;
   v_referrer_referred_by uuid;
   v_my_referred_by uuid;
   v_referrer_name text;
-begin
-  if v_user is null then
-    return jsonb_build_object('success', false, 'error', 'not_authenticated');
-  end if;
+BEGIN
+  IF v_user IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
 
-  if v_code = '' then
-    return jsonb_build_object('success', false, 'error', 'invalid_code');
-  end if;
+  IF v_code = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_code');
+  END IF;
 
-  select referred_by into v_my_referred_by from users where id = v_user;
-  if v_my_referred_by is not null then
-    return jsonb_build_object('success', false, 'error', 'already_redeemed');
-  end if;
+  SELECT referred_by INTO v_my_referred_by FROM public.users WHERE id = v_user;
+  IF v_my_referred_by IS NOT NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'already_redeemed');
+  END IF;
 
-  -- Referrals are for new users: anyone already active in the marketplace as
-  -- a customer (any non-cancelled, non-pending booking) cannot redeem.
-  if exists (
-    select 1
-    from bookings b
-    where b.customer_id = v_user
-      and b.status in ('confirmed', 'scheduled', 'en_route', 'arrived', 'in_progress', 'completed')
-  ) then
-    return jsonb_build_object('success', false, 'error', 'not_new_user');
-  end if;
+  IF public._customer_has_prior_booking(v_user) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_new_user');
+  END IF;
 
-  select id, referred_by
-    into v_referrer_id, v_referrer_referred_by
-  from users
-  where referral_code = v_code;
+  SELECT id, referred_by
+    INTO v_referrer_id, v_referrer_referred_by
+  FROM public.users
+  WHERE referral_code = v_code;
 
-  if v_referrer_id is null then
-    return jsonb_build_object('success', false, 'error', 'invalid_code');
-  end if;
+  IF v_referrer_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_code');
+  END IF;
 
-  if v_referrer_id = v_user then
-    return jsonb_build_object('success', false, 'error', 'own_code');
-  end if;
+  IF v_referrer_id = v_user THEN
+    RETURN jsonb_build_object('success', false, 'error', 'own_code');
+  END IF;
 
-  if v_referrer_referred_by = v_user then
-    return jsonb_build_object('success', false, 'error', 'circular_referral');
-  end if;
+  IF v_referrer_referred_by = v_user THEN
+    RETURN jsonb_build_object('success', false, 'error', 'circular_referral');
+  END IF;
 
-  update users
-    set referred_by = v_referrer_id,
+  UPDATE public.users
+    SET referred_by = v_referrer_id,
         referred_at = now()
-  where id = v_user and referred_by is null;
+  WHERE id = v_user AND referred_by IS NULL;
 
-  if not found then
-    return jsonb_build_object('success', false, 'error', 'already_redeemed');
-  end if;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'already_redeemed');
+  END IF;
 
-  select coalesce(nullif(trim(p.fullname), ''), nullif(trim(p.firstname), ''))
-    into v_referrer_name
-  from profiles p
-  where p.id = v_referrer_id;
+  SELECT coalesce(nullif(trim(profile.fullname), ''), nullif(trim(profile.firstname), ''))
+    INTO v_referrer_name
+  FROM public.profiles profile
+  WHERE profile.id = v_referrer_id;
 
-  return jsonb_build_object(
+  RETURN jsonb_build_object(
     'success', true,
     'referrer_name', v_referrer_name
   );
-end;
+END;
 $function$
 
 
@@ -11773,6 +11798,135 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.complete_booking_payment_attempt(p_attempt_id uuid, p_authorization_url text, p_access_code text, p_provider_reference text)
+ RETURNS TABLE(state text, reference text, authorization_url text, access_code text, payment_status text)
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_attempt public.payment_attempts%ROWTYPE;
+  v_booking_id uuid;
+  v_customer_id uuid;
+  v_payment_status text;
+  v_booking_reference text;
+  v_authorization_url text := NULLIF(btrim(p_authorization_url), '');
+  v_access_code text := NULLIF(btrim(p_access_code), '');
+  v_provider_reference text := NULLIF(btrim(p_provider_reference), '');
+  v_pause_ms integer;
+BEGIN
+  IF p_attempt_id IS NULL OR v_authorization_url IS NULL THEN
+    RAISE EXCEPTION 'attempt_id and authorization_url are required'
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT pa.booking_id
+  INTO v_booking_id
+  FROM public.payment_attempts pa
+  WHERE pa.id = p_attempt_id;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  SELECT b.customer_id, b.payment_status, b.reference
+  INTO v_customer_id, v_payment_status, v_booking_reference
+  FROM public.bookings b
+  WHERE b.id = v_booking_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  v_pause_ms := NULLIF(current_setting('instaclean.payment_attempt_lock_test_pause_ms', true), '')::integer;
+  IF v_pause_ms IS NOT NULL AND v_pause_ms > 0 THEN
+    PERFORM pg_sleep(v_pause_ms / 1000.0);
+  END IF;
+
+  SELECT *
+  INTO v_attempt
+  FROM public.payment_attempts
+  WHERE id = p_attempt_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF auth.uid() IS NOT NULL AND auth.uid() <> v_customer_id THEN
+    RAISE EXCEPTION 'not authorized'
+      USING ERRCODE = '42501';
+  END IF;
+
+  IF v_provider_reference IS NOT NULL
+     AND v_provider_reference <> v_attempt.reference THEN
+    RAISE EXCEPTION 'provider reference does not match reserved reference'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF lower(coalesce(v_payment_status, '')) IN (
+    'paid', 'post_paid', 'refunded', 'partially_refunded'
+  ) THEN
+    IF lower(coalesce(v_payment_status, '')) = 'paid' THEN
+      UPDATE public.payment_attempts pa
+      SET
+        status = 'paid',
+        paid_at = coalesce(pa.paid_at, now()),
+        authorization_url = coalesce(pa.authorization_url, v_authorization_url),
+        access_code = coalesce(pa.access_code, v_access_code),
+        updated_at = now()
+      WHERE pa.id = p_attempt_id
+        AND pa.status IN ('initializing', 'ready');
+    END IF;
+
+    state := 'settled';
+    reference := v_booking_reference;
+    authorization_url := NULL;
+    access_code := NULL;
+    payment_status := v_payment_status;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_attempt.status NOT IN ('initializing', 'ready') THEN
+    state := v_attempt.status;
+    reference := v_attempt.reference;
+    authorization_url := v_attempt.authorization_url;
+    access_code := v_attempt.access_code;
+    payment_status := v_payment_status;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  UPDATE public.payment_attempts pa
+  SET
+    status = 'ready',
+    authorization_url = v_authorization_url,
+    access_code = v_access_code,
+    ready_at = coalesce(pa.ready_at, now()),
+    expires_at = 'infinity'::timestamptz,
+    updated_at = now()
+  WHERE pa.id = p_attempt_id
+  RETURNING * INTO v_attempt;
+
+  UPDATE public.bookings b
+  SET reference = v_attempt.reference, updated_at = now()
+  WHERE b.id = v_attempt.booking_id
+    AND lower(coalesce(b.payment_status, '')) NOT IN (
+      'paid', 'post_paid', 'refunded', 'partially_refunded'
+    );
+
+  state := 'ready';
+  reference := v_attempt.reference;
+  authorization_url := v_attempt.authorization_url;
+  access_code := v_attempt.access_code;
+  payment_status := v_payment_status;
+  RETURN NEXT;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.complete_cleaner_booking(p_booking_id uuid, p_completion_notes text DEFAULT NULL::text, p_customer_rating integer DEFAULT NULL::integer, p_customer_comment text DEFAULT NULL::text)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -13270,6 +13424,7 @@ DECLARE
   v_base record;
   v_promo public.promotions;
   v_eligibility jsonb;
+  v_referral jsonb;
   v_extra_hours numeric;
   v_base_promo_hours numeric;
   v_free_hours numeric;
@@ -13394,9 +13549,8 @@ BEGIN
       v_code_row.id
     );
   ELSE
-    v_eligibility := public.get_welcome_offer_eligibility(
+    v_referral := public.get_referral_offer_eligibility(
       p_customer_id,
-      v_resolved_slug,
       p_channel,
       p_service_id,
       p_lat,
@@ -13405,6 +13559,25 @@ BEGIN
       p_is_recurring,
       p_booking_id
     );
+
+    IF COALESCE((v_referral ->> 'eligible')::boolean, false) IS TRUE THEN
+      v_eligibility := v_referral;
+      v_resolved_slug := v_referral ->> 'promotion_slug';
+    ELSIF NOT public._is_referral_promotion_slug(v_resolved_slug) THEN
+      v_eligibility := public.get_welcome_offer_eligibility(
+        p_customer_id,
+        v_resolved_slug,
+        p_channel,
+        p_service_id,
+        p_lat,
+        p_lng,
+        p_extra_task_ids,
+        p_is_recurring,
+        p_booking_id
+      );
+    ELSE
+      v_eligibility := jsonb_build_object('eligible', false, 'reason', 'not_referred');
+    END IF;
   END IF;
 
   IF COALESCE((v_eligibility ->> 'eligible')::boolean, false) IS NOT TRUE THEN
@@ -13484,7 +13657,6 @@ BEGIN
     0,
     coalesce(v_base.first_charge_amount_minor, v_base.final_amount_minor) - v_discount
   );
-  -- Platform-funded: cleaner economics stay at base pricing.
   v_cleaner_earnings_minor := v_base.cleaner_earnings_minor;
 
   RETURN QUERY
@@ -14280,6 +14452,10 @@ DECLARE
   v_req jsonb;
   v_ref text;
   v_promo jsonb;
+  v_extra_hours numeric;
+  v_base_promo_hours numeric;
+  v_expected_discount integer;
+  v_snapshot_before_promo integer;
 BEGIN
   IF v_uid IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
@@ -14336,6 +14512,62 @@ BEGIN
 
   IF v_row.promotion_id IS NULL OR COALESCE(v_row.promotion_discount_minor, 0) <= 0 THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_promo_zero_amount');
+  END IF;
+
+  IF v_row.promotion_slug = 'welcome_risk_free_mobile_v1' THEN
+    -- Welcome is a one-off two-free-hours promotion. Validate only immutable
+    -- booking snapshot data. Do not re-read today's rates, fees, cover settings,
+    -- surcharges, promotion eligibility, or extra-task catalog hours here.
+    IF v_row.subscription_id IS NOT NULL
+       OR COALESCE(v_row.recurring_discount_minor, 0) <> 0
+       OR v_row.work_rate_ghs_per_hour IS NULL
+       OR v_row.work_rate_ghs_per_hour <= 0
+       OR COALESCE(v_row.duration_hours, v_row.duration_final, v_row.duration_computed, 0) <= 0
+       OR v_row.core_amount_minor IS NULL
+       OR v_row.core_amount_minor < 0
+       OR v_row.same_day_surcharge_minor IS NULL
+       OR v_row.weekend_surcharge_minor IS NULL
+    THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'stale_welcome_promotion_pricing'
+      );
+    END IF;
+
+    -- duration_hours is the stored authoritative requested/billable duration when
+    -- present. Derived duration fields are fallbacks only. Extra-task hours come
+    -- from the frozen booking snapshot, not public.extra_tasks.
+    v_extra_hours := COALESCE(v_row.extra_task_hours_total, 0);
+    v_base_promo_hours := greatest(
+      0,
+      COALESCE(v_row.duration_hours, v_row.duration_final, v_row.duration_computed, 0)::numeric
+        - v_extra_hours
+    );
+    v_expected_discount := round(
+      greatest(
+        0,
+        least(2::numeric, v_base_promo_hours) * v_row.work_rate_ghs_per_hour * 100
+      )
+    )::integer;
+
+    IF COALESCE(v_row.promotion_discount_minor, 0) IS DISTINCT FROM v_expected_discount THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'stale_welcome_promotion_pricing'
+      );
+    END IF;
+
+    v_snapshot_before_promo :=
+      v_row.core_amount_minor
+      + greatest(0, v_row.same_day_surcharge_minor)
+      + greatest(0, v_row.weekend_surcharge_minor);
+
+    IF v_snapshot_before_promo IS DISTINCT FROM v_expected_discount THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'stale_welcome_promotion_pricing'
+      );
+    END IF;
   END IF;
 
   v_req := public.customer_risk_booking_verification_requirement_core(v_uid, p_booking_id);
@@ -16334,6 +16566,30 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.enforce_welcome_mobile_free_hours()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  IF NEW.slug = 'welcome_risk_free_mobile_v1'
+     AND (
+       NEW.type IS DISTINCT FROM 'free_hours'
+       OR NEW.value IS DISTINCT FROM 2
+       OR NEW.max_duration_hours IS DISTINCT FROM 2
+     )
+  THEN
+    RAISE EXCEPTION
+      'welcome_risk_free_mobile_v1 must remain free_hours/2 with max_duration_hours=2 (got type=% value=% max=%)',
+      NEW.type,
+      NEW.value,
+      NEW.max_duration_hours
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.ensure_single_default_platform_fee()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -16904,6 +17160,101 @@ CREATE OR REPLACE FUNCTION public.fail(text)
  LANGUAGE sql
 AS $function$
     SELECT ok( FALSE, $1 );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.fail_booking_payment_attempt(p_attempt_id uuid, p_failure_reason text DEFAULT NULL::text)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_attempt public.payment_attempts%ROWTYPE;
+  v_booking_id uuid;
+  v_customer_id uuid;
+  v_payment_status text;
+  v_reason text := NULLIF(left(btrim(coalesce(p_failure_reason, '')), 500), '');
+  v_reason_lower text := lower(coalesce(v_reason, ''));
+  v_provider_status_text text;
+  v_provider_status integer;
+  v_pause_ms integer;
+BEGIN
+  SELECT pa.booking_id
+  INTO v_booking_id
+  FROM public.payment_attempts pa
+  WHERE pa.id = p_attempt_id;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  SELECT b.customer_id, b.payment_status
+  INTO v_customer_id, v_payment_status
+  FROM public.bookings b
+  WHERE b.id = v_booking_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  v_pause_ms := NULLIF(current_setting('instaclean.payment_attempt_lock_test_pause_ms', true), '')::integer;
+  IF v_pause_ms IS NOT NULL AND v_pause_ms > 0 THEN
+    PERFORM pg_sleep(v_pause_ms / 1000.0);
+  END IF;
+
+  SELECT *
+  INTO v_attempt
+  FROM public.payment_attempts
+  WHERE id = p_attempt_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  IF auth.uid() IS NOT NULL AND auth.uid() <> v_customer_id THEN
+    RAISE EXCEPTION 'not authorized'
+      USING ERRCODE = '42501';
+  END IF;
+
+  IF v_attempt.status NOT IN ('initializing', 'ready') THEN
+    RETURN false;
+  END IF;
+
+  -- The Edge Function prefixes provider HTTP failures with "Paystack NNN:".
+  -- Preserve the reservation when the provider outcome is ambiguous. A 5xx,
+  -- timeout/conflict/rate-limit response, or duplicate-reference response could
+  -- mean the transaction exists even though initialization did not return a URL.
+  v_provider_status_text := substring(coalesce(v_reason, '') from '^Paystack ([0-9]{3}):');
+  IF v_provider_status_text IS NOT NULL THEN
+    v_provider_status := v_provider_status_text::integer;
+    IF v_provider_status >= 500
+       OR v_provider_status IN (408, 409, 429)
+       OR (v_reason_lower LIKE '%duplicate%' AND v_reason_lower LIKE '%reference%') THEN
+      RETURN false;
+    END IF;
+  END IF;
+
+  UPDATE public.payment_attempts pa
+  SET
+    status = 'failed',
+    failure_reason = v_reason,
+    failed_at = now(),
+    updated_at = now()
+  WHERE pa.id = p_attempt_id;
+
+  UPDATE public.bookings b
+  SET reference = NULL, updated_at = now()
+  WHERE b.id = v_attempt.booking_id
+    AND b.reference = v_attempt.reference
+    AND lower(coalesce(b.payment_status, '')) NOT IN (
+      'paid', 'post_paid', 'refunded', 'partially_refunded'
+    );
+
+  RETURN true;
+END;
 $function$
 
 
@@ -22783,56 +23134,75 @@ CREATE OR REPLACE FUNCTION public.get_my_referral_info()
  SECURITY DEFINER
  SET search_path TO 'public'
 AS $function$
-declare
+DECLARE
   v_user uuid := auth.uid();
   v_code text;
   v_candidate_code text;
   v_referred_by uuid;
   v_referred_count bigint;
-begin
-  if v_user is null then
-    return jsonb_build_object('success', false, 'error', 'not_authenticated');
-  end if;
+  v_eligibility jsonb;
+BEGIN
+  IF v_user IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
 
-  select referral_code, referred_by
-    into v_code, v_referred_by
-  from users
-  where id = v_user;
+  SELECT referral_code, referred_by
+    INTO v_code, v_referred_by
+  FROM users
+  WHERE id = v_user;
 
-  if not found then
-    return jsonb_build_object('success', false, 'error', 'user_not_found');
-  end if;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'user_not_found');
+  END IF;
 
-  while v_code is null loop
+  WHILE v_code IS NULL LOOP
     v_candidate_code := public.generate_referral_code();
 
-    begin
-      update users
-        set referral_code = v_candidate_code
-      where id = v_user
-        and referral_code is null
-      returning referral_code into v_code;
+    BEGIN
+      UPDATE users
+        SET referral_code = v_candidate_code
+      WHERE id = v_user
+        AND referral_code IS NULL
+      RETURNING referral_code INTO v_code;
 
-      if v_code is null then
-        -- A concurrent first call won the race and set the code: the UPDATE
-        -- matched zero rows. Re-read instead of looping forever.
-        select referral_code into v_code from users where id = v_user;
-      end if;
-    exception when unique_violation then
-      -- Extremely unlikely collision with another user's code: retry.
-      v_code := null;
-    end;
-  end loop;
+      IF v_code IS NULL THEN
+        SELECT referral_code INTO v_code FROM users WHERE id = v_user;
+      END IF;
+    EXCEPTION WHEN unique_violation THEN
+      v_code := NULL;
+    END;
+  END LOOP;
 
-  select count(*) into v_referred_count from users where referred_by = v_user;
+  SELECT count(*) INTO v_referred_count FROM users WHERE referred_by = v_user;
 
-  return jsonb_build_object(
+  v_eligibility := public.get_referral_offer_eligibility(
+    v_user,
+    'mobile',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    false,
+    NULL
+  );
+
+  RETURN jsonb_build_object(
     'success', true,
     'referral_code', v_code,
     'referred_count', v_referred_count,
-    'already_redeemed', v_referred_by is not null
+    'already_redeemed', v_referred_by IS NOT NULL,
+    'discount_percent', 25,
+    'offer_eligible', COALESCE((v_eligibility ->> 'eligible')::boolean, false),
+    'offer_role', CASE
+      WHEN COALESCE((v_eligibility ->> 'eligible')::boolean, false)
+        THEN v_eligibility ->> 'reason'
+      ELSE NULL
+    END,
+    'host_offer_pending',
+      v_referred_count > 0
+      AND NOT public._referral_host_has_paid_invitee(v_user)
   );
-end;
+END;
 $function$
 
 
@@ -23244,15 +23614,16 @@ $function$
 
 
 CREATE OR REPLACE FUNCTION public.get_pending_booking_for_edit(p_customer_id uuid, p_booking_id uuid)
- RETURNS TABLE(id uuid, customer_id uuid, cleaner_id uuid, service_id integer, title text, scheduled_date date, scheduled_time time without time zone, duration_hours numeric, address text, special_instructions text, status booking_status, payment_status text, subscription_id uuid, home_size text, extra_task_ids text[], duration_adjustment numeric, duration_computed numeric, duration_final numeric, timezone_name text, cleaner_assigned_at timestamp with time zone, service_duration_option_id uuid, location_latitude double precision, location_longitude double precision, customer_contact_phone text, service jsonb)
+ RETURNS TABLE(id uuid, customer_id uuid, cleaner_id uuid, direct_assigned_cleaner_id uuid, service_id integer, title text, scheduled_date date, scheduled_time time without time zone, duration_hours numeric, address text, special_instructions text, status booking_status, payment_status text, subscription_id uuid, home_size text, extra_task_ids text[], duration_adjustment numeric, duration_computed numeric, duration_final numeric, timezone_name text, cleaner_assigned_at timestamp with time zone, service_duration_option_id uuid, location_latitude double precision, location_longitude double precision, customer_contact_phone text, service jsonb)
  LANGUAGE sql
  STABLE
- SET search_path TO 'public'
+ SET search_path TO 'public', 'pg_temp'
 AS $function$
   SELECT
     b.id,
     b.customer_id,
     b.cleaner_id,
+    b.direct_assigned_cleaner_id,
     b.service_id,
     b.title,
     b.scheduled_date,
@@ -23325,6 +23696,97 @@ AS $function$
 	RETURN proj4text::text FROM public.spatial_ref_sys WHERE srid= $1;
 	END;
 	$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_referral_offer_eligibility(p_customer_id uuid, p_channel text, p_service_id integer DEFAULT NULL::integer, p_lat double precision DEFAULT NULL::double precision, p_lng double precision DEFAULT NULL::double precision, p_extra_task_ids text[] DEFAULT NULL::text[], p_is_recurring boolean DEFAULT false, p_booking_id uuid DEFAULT NULL::uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_caller uuid := auth.uid();
+  v_friend_promo public.promotions;
+  v_host_promo public.promotions;
+  v_promo public.promotions;
+  v_referred_by uuid;
+  v_is_friend boolean := false;
+  v_is_host boolean := false;
+  v_role text;
+BEGIN
+  IF v_caller IS NULL OR v_caller <> p_customer_id THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'not_authenticated');
+  END IF;
+
+  IF p_channel IS NULL
+     OR btrim(p_channel) = ''
+     OR p_channel NOT IN ('mobile', 'web') THEN
+    RAISE EXCEPTION 'Invalid promotion channel: %', p_channel;
+  END IF;
+
+  SELECT * INTO v_friend_promo FROM public._load_active_promotion('referral_25_friend_v1');
+  SELECT * INTO v_host_promo FROM public._load_active_promotion('referral_25_host_v1');
+
+  IF v_friend_promo.id IS NULL AND v_host_promo.id IS NULL THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'promotion_inactive');
+  END IF;
+
+  IF p_is_recurring THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'recurring_not_eligible');
+  END IF;
+
+  SELECT u.referred_by INTO v_referred_by
+  FROM public.users u
+  WHERE u.id = p_customer_id;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'user_not_found');
+  END IF;
+
+  v_is_friend := v_friend_promo.id IS NOT NULL
+    AND v_referred_by IS NOT NULL
+    AND NOT public._customer_has_prior_booking(p_customer_id, p_booking_id)
+    AND NOT public._welcome_promotion_has_active_claim(
+      p_customer_id, v_friend_promo.id, p_booking_id
+    );
+
+  v_is_host := v_host_promo.id IS NOT NULL
+    AND public._referral_host_has_paid_invitee(p_customer_id)
+    AND NOT public._welcome_promotion_has_active_claim(
+      p_customer_id, v_host_promo.id, p_booking_id
+    );
+
+  IF NOT v_is_friend AND NOT v_is_host THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'not_referred');
+  END IF;
+
+  IF v_is_friend THEN
+    v_promo := v_friend_promo;
+    v_role := 'friend';
+  ELSE
+    v_promo := v_host_promo;
+    v_role := 'host';
+  END IF;
+
+  IF v_promo.channel NOT IN (p_channel, 'all') THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'promotion_inactive');
+  END IF;
+
+  IF v_promo.requires_service_area
+     AND p_lat IS NOT NULL
+     AND p_lng IS NOT NULL
+     AND NOT public.is_location_in_active_service_area(p_lat, p_lng) THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'outside_service_area');
+  END IF;
+
+  RETURN jsonb_build_object(
+    'eligible', true,
+    'reason', v_role,
+    'promotion_slug', v_promo.slug,
+    'promotion', public._welcome_promotion_display_json(v_promo)
+  );
+END;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.get_service_categories()
@@ -23643,13 +24105,29 @@ CREATE OR REPLACE FUNCTION public.get_welcome_offer_eligibility(p_customer_id uu
  RETURNS jsonb
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
- SET search_path TO 'public'
+ SET search_path TO 'public', 'pg_temp'
 AS $function$
 DECLARE
   v_caller uuid := auth.uid();
+  v_referral jsonb;
 BEGIN
   IF v_caller IS NULL OR v_caller <> p_customer_id THEN
     RETURN jsonb_build_object('eligible', false, 'reason', 'not_authenticated');
+  END IF;
+
+  v_referral := public.get_referral_offer_eligibility(
+    p_customer_id,
+    p_channel,
+    p_service_id,
+    p_lat,
+    p_lng,
+    p_extra_task_ids,
+    p_is_recurring,
+    p_booking_id
+  );
+
+  IF COALESCE((v_referral ->> 'eligible')::boolean, false) IS TRUE THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'superseded_by_referral');
   END IF;
 
   RETURN public._welcome_offer_eligibility_core(
@@ -36300,6 +36778,295 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.reprice_stale_welcome_mobile_zero_snapshots()
+ RETURNS integer
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_booking public.bookings%ROWTYPE;
+  v_pricing record;
+  v_channel text;
+  v_lat double precision;
+  v_lng double precision;
+  v_duration numeric;
+  v_updated integer := 0;
+BEGIN
+  FOR v_booking IN
+    SELECT *
+    FROM public.bookings
+    WHERE promotion_slug = 'welcome_risk_free_mobile_v1'
+      AND status IN ('pending', 'confirmed')
+      AND lower(COALESCE(payment_status, '')) IN ('pending', 'failed')
+      AND COALESCE(final_amount_minor, 0) = 0
+      AND COALESCE(promotion_discount_minor, 0) > 0
+  LOOP
+    SELECT CASE
+      WHEN p.channel IN ('mobile', 'web') THEN p.channel
+      ELSE 'mobile'
+    END
+    INTO v_channel
+    FROM public.promotions p
+    WHERE p.slug = 'welcome_risk_free_mobile_v1'
+    LIMIT 1;
+
+    v_duration := COALESCE(
+      v_booking.duration_final,
+      v_booking.duration_computed,
+      v_booking.duration_hours,
+      2
+    );
+
+    IF v_booking.location_coordinates IS NOT NULL THEN
+      v_lat := ST_Y(v_booking.location_coordinates::geometry);
+      v_lng := ST_X(v_booking.location_coordinates::geometry);
+    ELSE
+      v_lat := NULL;
+      v_lng := NULL;
+    END IF;
+
+    PERFORM set_config('request.jwt.claim.sub', v_booking.customer_id::text, true);
+    PERFORM set_config(
+      'request.jwt.claims',
+      json_build_object(
+        'sub', v_booking.customer_id,
+        'role', 'authenticated'
+      )::text,
+      true
+    );
+
+    BEGIN
+      SELECT *
+      INTO v_pricing
+      FROM public.compute_booking_pricing_with_promotion(
+        v_booking.service_id,
+        v_duration,
+        v_booking.scheduled_date,
+        COALESCE(NULLIF(btrim(v_booking.timezone_name), ''), 'Africa/Accra'),
+        v_booking.cleaner_id,
+        COALESCE(v_channel, 'mobile'),
+        NULL,
+        v_booking.subscription_id IS NOT NULL,
+        COALESCE(v_booking.booking_cover, true),
+        COALESCE(v_booking.supplies_option, 'customer_provided'),
+        v_booking.customer_id,
+        v_booking.promotion_slug,
+        v_lat,
+        v_lng,
+        v_booking.extra_task_ids,
+        v_booking.id,
+        v_booking.service_duration_option_id,
+        NULL
+      );
+
+      IF v_pricing.final_amount_minor IS NULL THEN
+        CONTINUE;
+      END IF;
+
+      UPDATE public.bookings
+      SET
+        final_amount_minor = v_pricing.final_amount_minor,
+        total_price = v_pricing.final_amount_minor,
+        core_amount_minor = v_pricing.core_amount_minor,
+        promotion_discount_minor = COALESCE(v_pricing.promotion_discount_minor, 0),
+        platform_fee = v_pricing.platform_fee_major,
+        booking_cover_amount = v_pricing.booking_cover_major,
+        cleaner_earnings_minor = v_pricing.cleaner_earnings_minor,
+        same_day_surcharge_minor = v_pricing.same_day_surcharge_minor,
+        weekend_surcharge_minor = v_pricing.weekend_surcharge_minor,
+        work_rate_ghs_per_hour = v_pricing.work_rate_ghs_per_hour,
+        pricing_version = v_pricing.pricing_version,
+        currency = COALESCE(v_pricing.currency, currency),
+        updated_at = now()
+      WHERE id = v_booking.id
+        AND COALESCE(final_amount_minor, 0) = 0
+        AND lower(COALESCE(payment_status, '')) IN ('pending', 'failed');
+
+      IF FOUND THEN
+        v_updated := v_updated + 1;
+      END IF;
+    EXCEPTION
+      WHEN OTHERS THEN
+        CONTINUE;
+    END;
+  END LOOP;
+
+  RETURN v_updated;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.reserve_booking_payment_attempt(p_booking_id uuid, p_request_fingerprint text, p_amount_minor bigint, p_currency text)
+ RETURNS TABLE(attempt_id uuid, created boolean, state text, reference text, authorization_url text, access_code text, payment_status text, expires_at timestamp with time zone, amount_minor bigint, currency text, request_fingerprint text)
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_customer_id uuid;
+  v_payment_status text;
+  v_booking_reference text;
+  v_fingerprint text := NULLIF(btrim(p_request_fingerprint), '');
+  v_currency text := upper(NULLIF(btrim(p_currency), ''));
+  v_attempt public.payment_attempts%ROWTYPE;
+  v_new_attempt_id uuid;
+  v_new_reference text;
+BEGIN
+  IF p_booking_id IS NULL OR v_fingerprint IS NULL THEN
+    RAISE EXCEPTION 'booking_id and request_fingerprint are required'
+      USING ERRCODE = '22023';
+  END IF;
+  IF p_amount_minor IS NULL OR p_amount_minor <= 0 OR v_currency IS NULL THEN
+    RAISE EXCEPTION 'amount_minor and currency must be valid'
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT b.customer_id, b.payment_status, b.reference
+  INTO v_customer_id, v_payment_status, v_booking_reference
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF auth.uid() IS NOT NULL AND auth.uid() <> v_customer_id THEN
+    RAISE EXCEPTION 'not authorized'
+      USING ERRCODE = '42501';
+  END IF;
+
+  IF lower(coalesce(v_payment_status, '')) IN (
+    'paid', 'post_paid', 'refunded', 'partially_refunded'
+  ) THEN
+    attempt_id := NULL;
+    created := false;
+    state := 'settled';
+    reference := v_booking_reference;
+    authorization_url := NULL;
+    access_code := NULL;
+    payment_status := v_payment_status;
+    expires_at := NULL;
+    amount_minor := NULL;
+    currency := NULL;
+    request_fingerprint := NULL;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  SELECT pa.*
+  INTO v_attempt
+  FROM public.payment_attempts pa
+  WHERE pa.booking_id = p_booking_id
+    AND pa.status IN ('initializing', 'ready')
+  ORDER BY pa.created_at DESC
+  LIMIT 1
+  FOR UPDATE;
+
+  IF FOUND THEN
+    IF v_attempt.status = 'initializing' AND v_attempt.expires_at <= now() THEN
+      attempt_id := v_attempt.id;
+      created := false;
+      state := 'stale';
+      reference := v_attempt.reference;
+      authorization_url := NULL;
+      access_code := NULL;
+      payment_status := v_payment_status;
+      expires_at := v_attempt.expires_at;
+      amount_minor := v_attempt.amount_minor;
+      currency := v_attempt.currency;
+      request_fingerprint := v_attempt.request_fingerprint;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    IF v_attempt.request_fingerprint = v_fingerprint
+       AND v_attempt.amount_minor = p_amount_minor
+       AND v_attempt.currency = v_currency THEN
+      attempt_id := v_attempt.id;
+      created := false;
+      state := v_attempt.status;
+      reference := v_attempt.reference;
+      authorization_url := v_attempt.authorization_url;
+      access_code := v_attempt.access_code;
+      payment_status := v_payment_status;
+      expires_at := v_attempt.expires_at;
+      amount_minor := v_attempt.amount_minor;
+      currency := v_attempt.currency;
+      request_fingerprint := v_attempt.request_fingerprint;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    attempt_id := v_attempt.id;
+    created := false;
+    state := 'conflict';
+    reference := v_attempt.reference;
+    authorization_url := NULL;
+    access_code := NULL;
+    payment_status := v_payment_status;
+    expires_at := v_attempt.expires_at;
+    amount_minor := v_attempt.amount_minor;
+    currency := v_attempt.currency;
+    request_fingerprint := v_attempt.request_fingerprint;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  v_new_attempt_id := gen_random_uuid();
+  v_new_reference := format(
+    'BK-%s-%s',
+    p_booking_id::text,
+    left(replace(v_new_attempt_id::text, '-', ''), 16)
+  );
+
+  INSERT INTO public.payment_attempts (
+    id,
+    booking_id,
+    provider,
+    reference,
+    request_fingerprint,
+    status,
+    amount_minor,
+    currency,
+    expires_at
+  ) VALUES (
+    v_new_attempt_id,
+    p_booking_id,
+    'paystack',
+    v_new_reference,
+    v_fingerprint,
+    'initializing',
+    p_amount_minor,
+    v_currency,
+    now() + interval '5 minutes'
+  )
+  RETURNING * INTO v_attempt;
+
+  UPDATE public.bookings b
+  SET reference = v_attempt.reference, updated_at = now()
+  WHERE b.id = p_booking_id
+    AND lower(coalesce(b.payment_status, '')) NOT IN (
+      'paid', 'post_paid', 'refunded', 'partially_refunded'
+    );
+
+  attempt_id := v_attempt.id;
+  created := true;
+  state := v_attempt.status;
+  reference := v_attempt.reference;
+  authorization_url := NULL;
+  access_code := NULL;
+  payment_status := v_payment_status;
+  expires_at := v_attempt.expires_at;
+  amount_minor := v_attempt.amount_minor;
+  currency := v_attempt.currency;
+  request_fingerprint := v_attempt.request_fingerprint;
+  RETURN NEXT;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.reserve_promotion_for_booking(p_booking_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -39170,6 +39937,23 @@ BEGIN
         );
     END LOOP;
     RETURN array_to_string(output, E'\n');
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.snapshot_booking_extra_task_hours()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  IF TG_OP = 'INSERT'
+     OR NEW.extra_task_ids IS DISTINCT FROM OLD.extra_task_ids THEN
+    NEW.extra_task_hours_total := COALESCE(
+      public._extra_task_hours_total(NEW.extra_task_ids),
+      0
+    );
+  END IF;
+  RETURN NEW;
 END;
 $function$
 
@@ -43153,6 +43937,29 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.sync_paid_booking_payment_attempt()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF lower(coalesce(NEW.payment_status, '')) = 'paid'
+     AND NULLIF(btrim(NEW.reference), '') IS NOT NULL THEN
+    UPDATE public.payment_attempts pa
+    SET
+      status = 'paid',
+      paid_at = coalesce(pa.paid_at, now()),
+      updated_at = now()
+    WHERE pa.booking_id = NEW.id
+      AND pa.reference = NEW.reference
+      AND pa.status IN ('initializing', 'ready');
+  END IF;
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.sync_profile_name_from_payout(p_user_id uuid, p_payout_account_name text, p_previous_profile_name text DEFAULT NULL::text, p_payout_type text DEFAULT NULL::text, p_source text DEFAULT 'payout_name_mismatch'::text, p_apply boolean DEFAULT false)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -46809,6 +47616,10 @@ CREATE TRIGGER trg_init_direct_assignment_on_paid BEFORE INSERT OR UPDATE OF pay
 
 CREATE TRIGGER trg_set_cleaner_assigned_at_for_hold BEFORE INSERT OR UPDATE OF cleaner_id, payment_status, status, pricing_version ON bookings FOR EACH ROW EXECUTE FUNCTION set_cleaner_assigned_at_for_hold();
 
+CREATE TRIGGER trg_snapshot_booking_extra_task_hours BEFORE INSERT OR UPDATE OF extra_task_ids ON bookings FOR EACH ROW EXECUTE FUNCTION snapshot_booking_extra_task_hours();
+
+CREATE TRIGGER trg_sync_paid_booking_payment_attempt AFTER UPDATE OF payment_status, reference ON bookings FOR EACH ROW WHEN (new.payment_status IS DISTINCT FROM old.payment_status OR new.reference IS DISTINCT FROM old.reference) EXECUTE FUNCTION sync_paid_booking_payment_attempt();
+
 CREATE TRIGGER trg_zz_guard_booking_assignment_column_writes BEFORE INSERT OR UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION guard_booking_assignment_column_writes();
 
 CREATE TRIGGER trigger_calculate_booking_period BEFORE INSERT OR UPDATE OF scheduled_date, scheduled_time, duration_hours, timezone ON bookings FOR EACH ROW EXECUTE FUNCTION calculate_booking_period();
@@ -46852,6 +47663,8 @@ CREATE TRIGGER trg_profiles_fullname BEFORE INSERT OR UPDATE OF firstname, middl
 CREATE TRIGGER promotion_config_audit_no_delete BEFORE DELETE ON promotion_config_audit FOR EACH ROW EXECUTE FUNCTION prevent_promotion_config_audit_mutation();
 
 CREATE TRIGGER promotion_config_audit_no_update BEFORE UPDATE ON promotion_config_audit FOR EACH ROW EXECUTE FUNCTION prevent_promotion_config_audit_mutation();
+
+CREATE TRIGGER trg_enforce_welcome_mobile_free_hours BEFORE INSERT OR UPDATE ON promotions FOR EACH ROW EXECUTE FUNCTION enforce_welcome_mobile_free_hours();
 
 CREATE TRIGGER properties_guard_auto_booking_enabled BEFORE INSERT OR UPDATE OF auto_booking_enabled ON properties FOR EACH ROW EXECUTE FUNCTION properties_guard_auto_booking_enabled();
 
