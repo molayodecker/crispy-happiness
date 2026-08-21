@@ -23395,6 +23395,61 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.get_own_booking_voucher_identity(p_booking_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_promotion_code_id uuid;
+  v_voucher_code text;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_booking_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  SELECT b.promotion_code_id
+  INTO v_promotion_code_id
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+    AND b.customer_id = v_uid;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF v_promotion_code_id IS NULL THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'promotion_code_id', null,
+      'voucher_code', null
+    );
+  END IF;
+
+  SELECT pc.code::text
+  INTO v_voucher_code
+  FROM public.promotion_codes pc
+  WHERE pc.id = v_promotion_code_id;
+
+  IF v_voucher_code IS NULL OR trim(v_voucher_code) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'voucher_unavailable');
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'promotion_code_id', v_promotion_code_id,
+    'voucher_code', trim(v_voucher_code)
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.get_own_cleaner_location()
  RETURNS jsonb
  LANGUAGE plpgsql

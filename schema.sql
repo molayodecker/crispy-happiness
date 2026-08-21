@@ -14655,6 +14655,66 @@ COMMENT ON FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id"
 
 
 
+CREATE OR REPLACE FUNCTION "public"."get_own_booking_voucher_identity"("p_booking_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_promotion_code_id uuid;
+  v_voucher_code text;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_booking_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  SELECT b.promotion_code_id
+  INTO v_promotion_code_id
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+    AND b.customer_id = v_uid;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF v_promotion_code_id IS NULL THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'promotion_code_id', null,
+      'voucher_code', null
+    );
+  END IF;
+
+  SELECT pc.code::text
+  INTO v_voucher_code
+  FROM public.promotion_codes pc
+  WHERE pc.id = v_promotion_code_id;
+
+  IF v_voucher_code IS NULL OR trim(v_voucher_code) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'voucher_unavailable');
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'promotion_code_id', v_promotion_code_id,
+    'voucher_code', trim(v_voucher_code)
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_own_booking_voucher_identity"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_own_booking_voucher_identity"("p_booking_id" "uuid") IS 'Returns the caller''s own booking promotion_code_id and voucher code for unpaid recovery/edit. Does not expose other codes.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."get_own_cleaner_location"() RETURNS "jsonb"
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public', 'pg_temp'
@@ -41797,6 +41857,13 @@ GRANT ALL ON FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" doub
 REVOKE ALL ON FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."get_own_booking_voucher_identity"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_own_booking_voucher_identity"("p_booking_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_own_booking_voucher_identity"("p_booking_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_own_booking_voucher_identity"("p_booking_id" "uuid") TO "service_role";
 
 
 
