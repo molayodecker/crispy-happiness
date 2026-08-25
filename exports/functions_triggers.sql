@@ -1062,19 +1062,17 @@ $function$
 CREATE OR REPLACE FUNCTION public._extra_task_hours_total(p_extra_task_ids text[])
  RETURNS numeric
  LANGUAGE sql
- STABLE SECURITY DEFINER
- SET search_path TO 'public'
+ STABLE
+ SET search_path TO 'public', 'pg_temp'
 AS $function$
-  SELECT COALESCE(
-    (
-      SELECT SUM(et.hours)
-      FROM public.extra_tasks et
-      WHERE p_extra_task_ids IS NOT NULL
-        AND cardinality(p_extra_task_ids) > 0
-        AND et.id::text = ANY (p_extra_task_ids)
-    ),
-    0
-  )::numeric;
+  SELECT COALESCE(sum(et.hours), 0)::numeric
+  FROM (
+    SELECT DISTINCT requested.extra_task_id
+    FROM unnest(COALESCE(p_extra_task_ids, ARRAY[]::text[])) AS requested(extra_task_id)
+  ) requested
+  JOIN public.extra_tasks et
+    ON et.id = requested.extra_task_id
+  WHERE COALESCE(et.pricing_mode, 'labor_hours') IN ('labor_hours', 'minimum_capped');
 $function$
 
 
@@ -3541,6 +3539,48 @@ BEGIN
     catalog_discount_pct := greatest(0, least(100, v_discount_pct));
     work_rate := round((work_rate * (1 - catalog_discount_pct / 100.0))::numeric, 2);
   END IF;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public._resolve_uber_transportation_quote(p_quote_id uuid, p_cleaner_id uuid)
+ RETURNS integer
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_amount_minor integer;
+  v_caller uuid := auth.uid();
+BEGIN
+  IF p_quote_id IS NULL THEN
+    RETURN 0;
+  END IF;
+
+  IF v_caller IS NULL THEN
+    RAISE EXCEPTION 'Transportation quote requires an authenticated customer';
+  END IF;
+
+  IF NOT public.is_booking_uber_transportation_enabled() THEN
+    RAISE EXCEPTION 'Cleaner transportation is currently unavailable';
+  END IF;
+
+  SELECT q.amount_minor
+  INTO v_amount_minor
+  FROM public.uber_transportation_quotes q
+  WHERE q.id = p_quote_id
+    AND q.customer_id = v_caller
+    AND q.cleaner_id = p_cleaner_id
+    AND q.currency = 'GHS'
+    AND q.revoked_at IS NULL
+    AND q.expires_at > now()
+  LIMIT 1;
+
+  IF v_amount_minor IS NULL THEN
+    RAISE EXCEPTION 'Transportation quote is invalid, expired, or belongs to another booking context';
+  END IF;
+
+  RETURN v_amount_minor;
 END;
 $function$
 
@@ -13676,6 +13716,175 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.compute_booking_pricing_with_promotion_and_transportation(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_cleaner_id uuid DEFAULT NULL::uuid, p_channel text DEFAULT NULL::text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true, p_supplies_option text DEFAULT 'customer_provided'::text, p_customer_id uuid DEFAULT NULL::uuid, p_promotion_slug text DEFAULT NULL::text, p_lat double precision DEFAULT NULL::double precision, p_lng double precision DEFAULT NULL::double precision, p_extra_task_ids text[] DEFAULT NULL::text[], p_booking_id uuid DEFAULT NULL::uuid, p_service_duration_option_id uuid DEFAULT NULL::uuid, p_promotion_code text DEFAULT NULL::text, p_transportation_quote_id uuid DEFAULT NULL::uuid)
+ RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, supplies_option text, supplies_allowance_minor integer, transportation_minor integer, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, minimum_duration_hours numeric, cleaner_earnings_minor integer, catalog_discount_pct numeric, catalog_discount_minor integer, promotion_id uuid, promotion_slug text, promotion_discount_minor integer)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_base record;
+  v_transportation_minor integer := 0;
+BEGIN
+  IF p_transportation_quote_id IS NOT NULL AND p_is_recurring THEN
+    RAISE EXCEPTION 'Prepaid transportation is currently available for one-time bookings only';
+  END IF;
+
+  IF p_transportation_quote_id IS NOT NULL THEN
+    v_transportation_minor := public._resolve_uber_transportation_quote(
+      p_transportation_quote_id,
+      p_cleaner_id
+    );
+  END IF;
+
+  SELECT *
+  INTO v_base
+  FROM public.compute_booking_pricing_with_promotion(
+    p_service_id,
+    p_duration_hours_raw,
+    p_scheduled_date,
+    p_service_timezone,
+    p_cleaner_id,
+    p_channel,
+    p_recurrence_interval,
+    p_is_recurring,
+    p_include_booking_cover,
+    p_supplies_option,
+    p_customer_id,
+    p_promotion_slug,
+    p_lat,
+    p_lng,
+    p_extra_task_ids,
+    p_booking_id,
+    p_service_duration_option_id,
+    p_promotion_code
+  )
+  LIMIT 1;
+
+  RETURN QUERY
+  SELECT
+    v_base.pricing_version,
+    v_base.currency,
+    v_base.work_rate_ghs_per_hour,
+    v_base.duration_hours,
+    v_base.subtotal_labor_major,
+    v_base.platform_fee_major,
+    v_base.booking_cover_major,
+    v_base.supplies_option,
+    v_base.supplies_allowance_minor,
+    v_transportation_minor,
+    v_base.core_amount_minor,
+    v_base.same_day_surcharge_bps,
+    v_base.weekend_surcharge_bps,
+    v_base.recurring_weekly_discount_bps,
+    v_base.recurring_monthly_discount_bps,
+    v_base.same_day_surcharge_minor,
+    v_base.weekend_surcharge_minor,
+    v_base.recurring_discount_minor,
+    v_base.final_amount_minor + v_transportation_minor,
+    v_base.recurring_amount_minor,
+    CASE
+      WHEN v_base.first_charge_amount_minor IS NULL THEN NULL
+      ELSE v_base.first_charge_amount_minor + v_transportation_minor
+    END,
+    v_base.discount_rate_bps,
+    v_base.is_same_day,
+    v_base.is_weekend,
+    v_base.minimum_duration_hours,
+    CASE
+      WHEN v_base.cleaner_earnings_minor IS NULL THEN NULL
+      ELSE v_base.cleaner_earnings_minor + v_transportation_minor
+    END,
+    v_base.catalog_discount_pct,
+    v_base.catalog_discount_minor,
+    v_base.promotion_id,
+    v_base.promotion_slug,
+    v_base.promotion_discount_minor;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.compute_booking_pricing_with_transportation(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true, p_supplies_option text DEFAULT 'customer_provided'::text, p_cleaner_id uuid DEFAULT NULL::uuid, p_extra_task_ids text[] DEFAULT NULL::text[], p_service_duration_option_id uuid DEFAULT NULL::uuid, p_transportation_quote_id uuid DEFAULT NULL::uuid)
+ RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, supplies_option text, supplies_allowance_minor integer, transportation_minor integer, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, minimum_duration_hours numeric, cleaner_earnings_minor integer, catalog_discount_pct numeric, catalog_discount_minor integer, promotion_id uuid, promotion_slug text, promotion_discount_minor integer)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_base record;
+  v_transportation_minor integer := 0;
+BEGIN
+  IF p_transportation_quote_id IS NOT NULL AND p_is_recurring THEN
+    RAISE EXCEPTION 'Prepaid transportation is currently available for one-time bookings only';
+  END IF;
+
+  IF p_transportation_quote_id IS NOT NULL THEN
+    v_transportation_minor := public._resolve_uber_transportation_quote(
+      p_transportation_quote_id,
+      p_cleaner_id
+    );
+  END IF;
+
+  SELECT *
+  INTO v_base
+  FROM public.compute_booking_pricing(
+    p_service_id,
+    p_duration_hours_raw,
+    p_scheduled_date,
+    p_service_timezone,
+    p_recurrence_interval,
+    p_is_recurring,
+    p_include_booking_cover,
+    p_supplies_option,
+    p_cleaner_id,
+    p_extra_task_ids,
+    p_service_duration_option_id
+  )
+  LIMIT 1;
+
+  RETURN QUERY
+  SELECT
+    v_base.pricing_version,
+    v_base.currency,
+    v_base.work_rate_ghs_per_hour,
+    v_base.duration_hours,
+    v_base.subtotal_labor_major,
+    v_base.platform_fee_major,
+    v_base.booking_cover_major,
+    v_base.supplies_option,
+    v_base.supplies_allowance_minor,
+    v_transportation_minor,
+    v_base.core_amount_minor,
+    v_base.same_day_surcharge_bps,
+    v_base.weekend_surcharge_bps,
+    v_base.recurring_weekly_discount_bps,
+    v_base.recurring_monthly_discount_bps,
+    v_base.same_day_surcharge_minor,
+    v_base.weekend_surcharge_minor,
+    v_base.recurring_discount_minor,
+    v_base.final_amount_minor + v_transportation_minor,
+    v_base.recurring_amount_minor,
+    CASE
+      WHEN v_base.first_charge_amount_minor IS NULL THEN NULL
+      ELSE v_base.first_charge_amount_minor + v_transportation_minor
+    END,
+    v_base.discount_rate_bps,
+    v_base.is_same_day,
+    v_base.is_weekend,
+    v_base.minimum_duration_hours,
+    CASE
+      WHEN v_base.cleaner_earnings_minor IS NULL THEN NULL
+      ELSE v_base.cleaner_earnings_minor + v_transportation_minor
+    END,
+    v_base.catalog_discount_pct,
+    v_base.catalog_discount_minor,
+    NULL::uuid,
+    NULL::text,
+    0;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.compute_booking_scheduled_at_utc()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -14536,7 +14745,16 @@ BEGIN
 
     -- duration_hours is the stored authoritative requested/billable duration when
     -- present. Derived duration fields are fallbacks only. Extra-task hours come
-    -- from the frozen booking snapshot, not public.extra_tasks.
+    -- from the frozen booking snapshot, not public.extra_tasks. Legacy rows with
+    -- extras but no snapshot fail closed.
+    IF COALESCE(cardinality(v_row.extra_task_ids), 0) > 0
+       AND v_row.extra_task_hours_total IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'stale_welcome_promotion_pricing'
+      );
+    END IF;
+
     v_extra_hours := COALESCE(v_row.extra_task_hours_total, 0);
     v_base_promo_hours := greatest(
       0,
@@ -22796,6 +23014,23 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.get_cleaner_trip_origin(p_cleaner_id uuid)
+ RETURNS TABLE(latitude double precision, longitude double precision)
+ LANGUAGE sql
+ STABLE
+ SET search_path TO 'public', 'extensions', 'pg_temp'
+AS $function$
+  SELECT
+    ST_Y(p.location_wkt::geometry) AS latitude,
+    ST_X(p.location_wkt::geometry) AS longitude
+  FROM public.profiles p
+  WHERE p.user_id = p_cleaner_id
+    AND p.location_wkt IS NOT NULL
+    AND NOT ST_IsEmpty(p.location_wkt::geometry)
+  LIMIT 1;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.get_cleaner_wallet(p_user_id uuid)
  RETURNS json
  LANGUAGE plpgsql
@@ -23669,7 +23904,7 @@ $function$
 
 
 CREATE OR REPLACE FUNCTION public.get_pending_booking_for_edit(p_customer_id uuid, p_booking_id uuid)
- RETURNS TABLE(id uuid, customer_id uuid, cleaner_id uuid, direct_assigned_cleaner_id uuid, service_id integer, title text, scheduled_date date, scheduled_time time without time zone, duration_hours numeric, address text, special_instructions text, status booking_status, payment_status text, subscription_id uuid, home_size text, extra_task_ids text[], duration_adjustment numeric, duration_computed numeric, duration_final numeric, timezone_name text, cleaner_assigned_at timestamp with time zone, service_duration_option_id uuid, location_latitude double precision, location_longitude double precision, customer_contact_phone text, service jsonb)
+ RETURNS TABLE(id uuid, customer_id uuid, cleaner_id uuid, direct_assigned_cleaner_id uuid, service_id integer, title text, scheduled_date date, scheduled_time time without time zone, duration_hours numeric, address text, special_instructions text, status booking_status, payment_status text, subscription_id uuid, home_size text, extra_task_ids text[], duration_adjustment numeric, duration_computed numeric, duration_final numeric, timezone_name text, cleaner_assigned_at timestamp with time zone, service_duration_option_id uuid, location_latitude double precision, location_longitude double precision, customer_contact_phone text, booking_cover boolean, booking_cover_amount numeric, platform_fee numeric, work_rate_ghs_per_hour numeric, pricing_version text, currency text, promotion_id uuid, promotion_slug text, promotion_discount_minor integer, final_amount_minor integer, supplies_option text, supplies_allowance_minor integer, transportation_included boolean, transportation_minor integer, transportation_quote_id uuid, service jsonb)
  LANGUAGE sql
  STABLE
  SET search_path TO 'public', 'pg_temp'
@@ -23708,11 +23943,27 @@ AS $function$
       ELSE NULL
     END AS location_longitude,
     b.customer_contact_phone,
+    COALESCE(b.booking_cover, true) AS booking_cover,
+    b.booking_cover_amount,
+    b.platform_fee,
+    b.work_rate_ghs_per_hour,
+    b.pricing_version,
+    b.currency,
+    b.promotion_id,
+    b.promotion_slug,
+    COALESCE(b.promotion_discount_minor, 0) AS promotion_discount_minor,
+    COALESCE(NULLIF(b.final_amount_minor, 0), NULLIF(b.total_price, 0), 0) AS final_amount_minor,
+    b.supplies_option,
+    COALESCE(b.supplies_allowance_minor, 0) AS supplies_allowance_minor,
+    COALESCE(b.transportation_included, false) AS transportation_included,
+    COALESCE(b.transportation_minor, 0) AS transportation_minor,
+    b.transportation_quote_id,
     to_jsonb(s.*) AS service
   FROM public.bookings b
   JOIN public.service_types s
     ON s.id = b.service_id
   WHERE b.id = p_booking_id
+    AND b.customer_id = auth.uid()
     AND b.customer_id = p_customer_id
     AND b.status IN ('pending', 'confirmed', 'scheduled')
     AND b.subscription_id IS NULL
@@ -24363,6 +24614,123 @@ BEGIN
     RAISE EXCEPTION
       'cannot change payment_status of a paid booking from client'
       USING ERRCODE = '42501';
+  END IF;
+
+  RETURN NEW;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.guard_booking_uber_transportation_snapshot()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_quote public.uber_transportation_quotes%ROWTYPE;
+  v_booking_geog geography;
+  v_quote_geog geography;
+  v_requires_live_quote boolean := true;
+  v_location_changed boolean := false;
+BEGIN
+  IF COALESCE(NEW.transportation_included, false) IS FALSE THEN
+    IF COALESCE(NEW.transportation_minor, 0) <> 0 OR NEW.transportation_quote_id IS NOT NULL THEN
+      RAISE EXCEPTION 'Transportation snapshot is inconsistent with transportation_included=false';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF NEW.transportation_quote_id IS NULL OR COALESCE(NEW.transportation_minor, 0) <= 0 THEN
+    RAISE EXCEPTION 'Included transportation requires an authoritative quote';
+  END IF;
+
+  IF TG_OP = 'UPDATE' THEN
+    IF NEW.location_coordinates IS NOT NULL
+       AND OLD.location_coordinates IS NOT NULL THEN
+      v_location_changed := NOT ST_DWithin(
+        NEW.location_coordinates::geography,
+        OLD.location_coordinates::geography,
+        75
+      );
+    ELSIF NEW.location_coordinates IS DISTINCT FROM OLD.location_coordinates THEN
+      v_location_changed := true;
+    END IF;
+
+    IF v_location_changed
+       AND COALESCE(OLD.transportation_included, false)
+       AND lower(COALESCE(OLD.payment_status::text, '')) = 'paid' THEN
+      RAISE EXCEPTION 'Paid bookings with prepaid cleaner transportation cannot change location';
+    END IF;
+
+    v_requires_live_quote :=
+      NEW.transportation_quote_id IS DISTINCT FROM OLD.transportation_quote_id
+      OR NEW.transportation_minor IS DISTINCT FROM OLD.transportation_minor
+      OR COALESCE(NEW.transportation_included, false)
+        IS DISTINCT FROM COALESCE(OLD.transportation_included, false)
+      OR NEW.customer_id IS DISTINCT FROM OLD.customer_id
+      OR NEW.cleaner_id IS DISTINCT FROM OLD.cleaner_id
+      OR v_location_changed;
+  END IF;
+
+  IF v_requires_live_quote THEN
+    IF NOT public.is_booking_uber_transportation_enabled() THEN
+      RAISE EXCEPTION 'Cleaner transportation is currently unavailable';
+    END IF;
+
+    SELECT q.*
+    INTO v_quote
+    FROM public.uber_transportation_quotes q
+    WHERE q.id = NEW.transportation_quote_id
+      AND q.customer_id = NEW.customer_id
+      AND q.cleaner_id = NEW.cleaner_id
+      AND q.currency = 'GHS'
+      AND q.revoked_at IS NULL
+      AND q.expires_at > now()
+    LIMIT 1;
+
+    IF v_quote.id IS NULL THEN
+      RAISE EXCEPTION 'Transportation quote is invalid, expired, or belongs to another booking context';
+    END IF;
+
+    IF NEW.transportation_minor <> v_quote.amount_minor THEN
+      RAISE EXCEPTION 'Transportation amount does not match the authoritative quote';
+    END IF;
+
+    IF NEW.location_coordinates IS NULL
+       OR v_quote.customer_latitude IS NULL
+       OR v_quote.customer_longitude IS NULL THEN
+      RAISE EXCEPTION 'Transportation quote is missing destination coordinates';
+    END IF;
+
+    v_booking_geog := NEW.location_coordinates::geography;
+    v_quote_geog := ST_SetSRID(
+      ST_MakePoint(v_quote.customer_longitude, v_quote.customer_latitude),
+      4326
+    )::geography;
+
+    IF NOT ST_DWithin(v_booking_geog, v_quote_geog, 75) THEN
+      RAISE EXCEPTION 'Transportation quote destination does not match the booking location';
+    END IF;
+
+    RETURN NEW;
+  END IF;
+
+  SELECT q.*
+  INTO v_quote
+  FROM public.uber_transportation_quotes q
+  WHERE q.id = NEW.transportation_quote_id
+    AND q.customer_id = NEW.customer_id
+    AND q.cleaner_id = NEW.cleaner_id
+    AND q.currency = 'GHS'
+  LIMIT 1;
+
+  IF v_quote.id IS NULL THEN
+    RAISE EXCEPTION 'Transportation quote is invalid or belongs to another booking context';
+  END IF;
+
+  IF NEW.transportation_minor <> v_quote.amount_minor THEN
+    RAISE EXCEPTION 'Transportation amount does not match the authoritative quote';
   END IF;
 
   RETURN NEW;
@@ -26756,20 +27124,32 @@ CREATE OR REPLACE FUNCTION public.inbox_notification_android_channel(p_type text
  IMMUTABLE
 AS $function$
   SELECT CASE p_type
-    WHEN 'broadcast_assignment_offer' THEN 'job_offers'
-    WHEN 'direct_assignment_offer' THEN 'job_offers'
-    WHEN 'direct_assignment_reminder' THEN 'job_offers'
-    WHEN 'job_offer' THEN 'job_offers'
-    WHEN 'payment_received' THEN 'new_booking'
-    WHEN 'booking_confirmed' THEN 'new_booking'
+    WHEN 'broadcast_assignment_offer' THEN 'job_offers_v2'
+    WHEN 'job_offer' THEN 'job_offers_v2'
+    WHEN 'direct_assignment_offer' THEN 'new_booking_v2'
+    WHEN 'direct_assignment_reminder' THEN 'new_booking_v2'
     WHEN 'booking_cancelled' THEN 'booking_cancellations'
     WHEN 'booking_rescheduled' THEN 'booking_updates'
-    WHEN 'review_request' THEN 'booking_updates'
     WHEN 'unassigned_booking_escalated' THEN 'booking_cancellations'
     WHEN 'new_message' THEN 'messages'
     WHEN 'cleaner_en_route' THEN 'cleaner_milestones'
     WHEN 'cleaner_arrived' THEN 'cleaner_milestones'
     ELSE 'booking_updates'
+  END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.inbox_notification_android_sound(p_type text)
+ RETURNS text
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$
+  SELECT CASE p_type
+    WHEN 'broadcast_assignment_offer' THEN 'instaclean_job_offer.wav'
+    WHEN 'job_offer' THEN 'instaclean_job_offer.wav'
+    WHEN 'direct_assignment_offer' THEN 'instaclean_job_assignment.wav'
+    WHEN 'direct_assignment_reminder' THEN 'instaclean_job_assignment.wav'
+    ELSE 'default'
   END;
 $function$
 
@@ -27514,6 +27894,16 @@ AS $function$
         AND p_direct_assigned_cleaner_id = p_worker_id
       )
     );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.is_booking_uber_transportation_enabled()
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT public.is_app_feature_enabled('BOOKING_UBER_TRANSPORTATION', 'production');
 $function$
 
 
@@ -34409,6 +34799,7 @@ DECLARE
   v_body text;
   v_type text;
   v_channel text;
+  v_sound text;
   v_interruption text;
   v_badge integer := 0;
   v_messages jsonb := '[]'::jsonb;
@@ -34425,6 +34816,7 @@ BEGIN
   v_body := coalesce(nullif(trim(p_body), ''), 'You have a new notification.');
   v_type := coalesce(nullif(trim(p_type), ''), 'unknown');
   v_channel := public.inbox_notification_android_channel(v_type);
+  v_sound := public.inbox_notification_android_sound(v_type);
 
   v_push_data := coalesce(p_data, '{}'::jsonb);
   IF NOT (v_push_data ? 'type') THEN
@@ -34463,7 +34855,7 @@ BEGIN
       'to', v_token,
       'title', v_title,
       'body', v_body,
-      'sound', 'default',
+      'sound', v_sound,
       'priority', 'high',
       'channelId', v_channel,
       'badge', v_badge,
@@ -36748,7 +37140,6 @@ DECLARE
   v_updated integer;
   v_schedule_owned boolean := false;
 BEGIN
-  -- Read-only ownership check: no FOR UPDATE on the schedule group.
   SELECT EXISTS (
     SELECT 1
     FROM public.bookings b
@@ -43338,6 +43729,23 @@ CREATE OR REPLACE FUNCTION public.st_zmin(box3d)
 AS '$libdir/postgis-3', $function$BOX3D_zmin$function$
 
 
+CREATE OR REPLACE FUNCTION public.stamp_profile_location_confirmation()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public', 'extensions', 'pg_temp'
+AS $function$
+BEGIN
+  IF NEW.location_wkt IS NULL OR ST_IsEmpty(NEW.location_wkt::geometry) THEN
+    NEW.location_confirmed_at := NULL;
+  ELSE
+    NEW.location_confirmed_at := now();
+  END IF;
+
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.start_booking_micro_task(p_booking_micro_task_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -45579,21 +45987,17 @@ CREATE OR REPLACE FUNCTION public.trg_init_direct_assignment_on_paid()
 AS $function$
 DECLARE
   v_hold_minutes integer;
+  v_trust_booking_id uuid;
 BEGIN
   IF lower(COALESCE(NEW.payment_status, '')) <> 'paid' THEN
     RETURN NEW;
   END IF;
 
-  -- Admin exclusive-hold reset must keep cleaner_id; skip dispatch-gate strip.
-  IF coalesce(
-       nullif(current_setting('app.admin_reset_exclusive_hold', true), ''),
-       ''
-     ) = '1' THEN
-    RETURN NEW;
-  END IF;
+  -- Row is not visible during BEFORE INSERT; avoid booking-not-found raise.
+  v_trust_booking_id := CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE NEW.id END;
 
   IF NEW.customer_id IS NOT NULL
-     AND NOT public.customer_trust_can_dispatch_cleaner(NEW.customer_id, NEW.id) THEN
+     AND NOT public.customer_trust_can_dispatch_cleaner(NEW.customer_id, v_trust_booking_id) THEN
     IF NEW.cleaner_id IS NOT NULL THEN
       IF NEW.direct_assigned_cleaner_id IS NULL THEN
         NEW.direct_assigned_cleaner_id := NEW.cleaner_id;
@@ -46393,18 +46797,21 @@ CREATE OR REPLACE FUNCTION public.update_own_cleaner_location(p_lat double preci
  SET search_path TO 'public', 'pg_temp'
 AS $function$
 DECLARE
-  v_user_id uuid := auth.uid();
-  v_geom    geometry(Point, 4326);
-  v_geog    geography(Point, 4326);
-  v_now     timestamptz := now();
+  v_user_id      uuid := auth.uid();
+  v_geom         geometry(Point, 4326);
+  v_geog         geography(Point, 4326);
+  v_now          timestamptz := now();
+  v_profile_rows integer := 0;
 BEGIN
   IF v_user_id IS NULL THEN
     RAISE EXCEPTION 'Not authorized';
   END IF;
 
   IF NOT EXISTS (
-    SELECT 1 FROM public.user_roles ur
-    WHERE ur.user_id = v_user_id AND ur.role_id = 'cleaner'
+    SELECT 1
+    FROM public.user_roles ur
+    WHERE ur.user_id = v_user_id
+      AND ur.role_id = 'cleaner'
   ) THEN
     RAISE EXCEPTION 'forbidden' USING ERRCODE = '42501';
   END IF;
@@ -46412,9 +46819,12 @@ BEGIN
   v_geom := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326);
   v_geog := v_geom::geography;
 
-  -- cleaner_data row may not yet exist for the very newest cleaners
-  -- (approval RPC always creates one, but defence in depth).
-  INSERT INTO public.cleaner_data (user_id, base_location, max_travel_distance_meters, updated_at)
+  INSERT INTO public.cleaner_data (
+    user_id,
+    base_location,
+    max_travel_distance_meters,
+    updated_at
+  )
   VALUES (
     v_user_id,
     v_geom,
@@ -46422,21 +46832,30 @@ BEGIN
     v_now
   )
   ON CONFLICT (user_id) DO UPDATE SET
-    base_location              = EXCLUDED.base_location,
-    max_travel_distance_meters = COALESCE(EXCLUDED.max_travel_distance_meters, public.cleaner_data.max_travel_distance_meters),
-    updated_at                 = v_now;
+    base_location = EXCLUDED.base_location,
+    max_travel_distance_meters = COALESCE(
+      EXCLUDED.max_travel_distance_meters,
+      public.cleaner_data.max_travel_distance_meters
+    ),
+    updated_at = v_now;
 
-  -- profiles row exists for every signed-in user (created by trigger).
   UPDATE public.profiles
   SET location_wkt = v_geog,
-      updated_at   = v_now
-  WHERE id = v_user_id;
+      location_confirmed_at = v_now,
+      updated_at = v_now
+  WHERE user_id = v_user_id;
+
+  GET DIAGNOSTICS v_profile_rows = ROW_COUNT;
+  IF v_profile_rows = 0 THEN
+    RAISE EXCEPTION 'profile_not_found' USING ERRCODE = 'P0002';
+  END IF;
 
   RETURN jsonb_build_object(
-    'user_id',                    v_user_id,
-    'latitude',                   p_lat,
-    'longitude',                  p_lng,
-    'max_travel_distance_meters', COALESCE(p_max_distance_meters, 30000)
+    'user_id', v_user_id,
+    'latitude', p_lat,
+    'longitude', p_lng,
+    'max_travel_distance_meters', COALESCE(p_max_distance_meters, 30000),
+    'location_confirmed_at', v_now
   );
 END;
 $function$
@@ -47643,6 +48062,8 @@ CREATE TRIGGER bookings_compute_scheduled_at_utc BEFORE INSERT OR UPDATE OF sche
 
 CREATE TRIGGER bookings_guard_payment_status BEFORE UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION guard_booking_payment_status_writes();
 
+CREATE TRIGGER bookings_guard_uber_transportation_snapshot BEFORE INSERT OR UPDATE OF transportation_included, transportation_minor, transportation_quote_id, customer_id, cleaner_id, location_coordinates ON bookings FOR EACH ROW EXECUTE FUNCTION guard_booking_uber_transportation_snapshot();
+
 CREATE TRIGGER bookings_link_turnover_opportunity AFTER INSERT OR UPDATE OF turnover_opportunity_id ON bookings FOR EACH ROW WHEN (new.turnover_opportunity_id IS NOT NULL) EXECUTE FUNCTION link_turnover_opportunity_to_booking();
 
 CREATE TRIGGER bookings_refresh_customer_review_eligibility AFTER INSERT OR UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION trg_bookings_refresh_customer_review_eligibility();
@@ -47712,6 +48133,10 @@ CREATE TRIGGER platform_config_set_updated_at BEFORE UPDATE ON platform_config F
 CREATE TRIGGER ensure_single_default_platform_fee_trigger BEFORE INSERT OR UPDATE ON platform_fees FOR EACH ROW WHEN (new.is_default = true) EXECUTE FUNCTION ensure_single_default_platform_fee();
 
 CREATE TRIGGER update_platform_fees_updated_at BEFORE UPDATE ON platform_fees FOR EACH ROW EXECUTE FUNCTION update_platform_fees_updated_at();
+
+CREATE TRIGGER profiles_location_confirmation_insert BEFORE INSERT ON profiles FOR EACH ROW EXECUTE FUNCTION stamp_profile_location_confirmation();
+
+CREATE TRIGGER profiles_location_confirmation_update BEFORE UPDATE OF location_wkt ON profiles FOR EACH ROW EXECUTE FUNCTION stamp_profile_location_confirmation();
 
 CREATE TRIGGER trg_profiles_fullname BEFORE INSERT OR UPDATE OF firstname, middlename, lastname ON profiles FOR EACH ROW EXECUTE FUNCTION fn_sync_profile_fullname();
 
