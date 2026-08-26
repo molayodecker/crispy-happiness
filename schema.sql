@@ -8007,6 +8007,7 @@ DECLARE
   v_weekend_bps integer;
   v_recurring_weekly_bps integer;
   v_recurring_monthly_discount_bps integer;
+  v_interval_bps jsonb;
   v_service_timezone text;
   v_today date;
   v_is_same_day boolean;
@@ -8157,14 +8158,16 @@ BEGIN
     pr.same_day_surcharge_bps,
     pr.weekend_surcharge_bps,
     pr.recurring_weekly_discount_bps,
-    pr.recurring_monthly_discount_bps
+    pr.recurring_monthly_discount_bps,
+    pr.recurring_discount_bps_by_interval
   INTO
     v_pricing_version,
     v_currency,
     v_same_day_bps,
     v_weekend_bps,
     v_recurring_weekly_bps,
-    v_recurring_monthly_discount_bps
+    v_recurring_monthly_discount_bps,
+    v_interval_bps
   FROM public.get_active_pricing_rule() pr
   LIMIT 1;
 
@@ -8175,6 +8178,7 @@ BEGIN
     v_weekend_bps := 500;
     v_recurring_weekly_bps := 700;
     v_recurring_monthly_discount_bps := 1200;
+    v_interval_bps := NULL;
   END IF;
 
   v_pricing_version := COALESCE(v_pricing_version, 'v1');
@@ -8285,8 +8289,9 @@ BEGIN
   v_recurring_discount_minor := 0;
 
   IF p_is_recurring AND p_recurrence_interval IS NOT NULL THEN
-    v_discount_bps := public.recurring_discount_bps_for_interval(
+    v_discount_bps := public.recurring_discount_bps_from_rule(
       p_recurrence_interval,
+      v_interval_bps,
       v_recurring_weekly_bps,
       v_recurring_monthly_discount_bps
     );
@@ -12123,7 +12128,7 @@ $$;
 ALTER FUNCTION "public"."generate_referral_code"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_active_pricing_rule"() RETURNS TABLE("pricing_version" "text", "currency" "text", "same_day_surcharge_bps" integer, "weekend_surcharge_bps" integer, "recurring_weekly_discount_bps" integer, "recurring_monthly_discount_bps" integer)
+CREATE OR REPLACE FUNCTION "public"."get_active_pricing_rule"() RETURNS TABLE("pricing_version" "text", "currency" "text", "same_day_surcharge_bps" integer, "weekend_surcharge_bps" integer, "recurring_weekly_discount_bps" integer, "recurring_monthly_discount_bps" integer, "recurring_discount_bps_by_interval" "jsonb")
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -12133,7 +12138,8 @@ CREATE OR REPLACE FUNCTION "public"."get_active_pricing_rule"() RETURNS TABLE("p
     pr.same_day_surcharge_bps,
     pr.weekend_surcharge_bps,
     pr.recurring_weekly_discount_bps,
-    pr.recurring_monthly_discount_bps
+    pr.recurring_monthly_discount_bps,
+    pr.recurring_discount_bps_by_interval
   FROM public.pricing_rules pr
   WHERE pr.is_active = true
     AND (pr.effective_from IS NULL OR pr.effective_from <= now())
@@ -16120,14 +16126,30 @@ $$;
 ALTER FUNCTION "public"."has_role"("_role" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."inbox_notification_android_channel"("p_type" "text") RETURNS "text"
+CREATE OR REPLACE FUNCTION "public"."inbox_notification_android_channel"("p_type" "text", "p_android_notification_channel_version" integer DEFAULT NULL::integer) RETURNS "text"
     LANGUAGE "sql" IMMUTABLE
     AS $$
   SELECT CASE p_type
-    WHEN 'broadcast_assignment_offer' THEN 'job_offers_v2'
-    WHEN 'job_offer' THEN 'job_offers_v2'
-    WHEN 'direct_assignment_offer' THEN 'new_booking_v2'
-    WHEN 'direct_assignment_reminder' THEN 'new_booking_v2'
+    WHEN 'broadcast_assignment_offer' THEN
+      CASE
+        WHEN coalesce(p_android_notification_channel_version, 0) >= 3 THEN 'job_offers_v3'
+        ELSE 'job_offers_v2'
+      END
+    WHEN 'job_offer' THEN
+      CASE
+        WHEN coalesce(p_android_notification_channel_version, 0) >= 3 THEN 'job_offers_v3'
+        ELSE 'job_offers_v2'
+      END
+    WHEN 'direct_assignment_offer' THEN
+      CASE
+        WHEN coalesce(p_android_notification_channel_version, 0) >= 3 THEN 'new_booking_v3'
+        ELSE 'new_booking_v2'
+      END
+    WHEN 'direct_assignment_reminder' THEN
+      CASE
+        WHEN coalesce(p_android_notification_channel_version, 0) >= 3 THEN 'new_booking_v3'
+        ELSE 'new_booking_v2'
+      END
     WHEN 'booking_cancelled' THEN 'booking_cancellations'
     WHEN 'booking_rescheduled' THEN 'booking_updates'
     WHEN 'unassigned_booking_escalated' THEN 'booking_cancellations'
@@ -16139,10 +16161,10 @@ CREATE OR REPLACE FUNCTION "public"."inbox_notification_android_channel"("p_type
 $$;
 
 
-ALTER FUNCTION "public"."inbox_notification_android_channel"("p_type" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."inbox_notification_android_channel"("p_type" "text", "p_android_notification_channel_version" integer) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."inbox_notification_android_channel"("p_type" "text") IS 'Android Expo channelId for inbox pushes. Job offers use job_offers_v2; direct assignment uses new_booking_v2.';
+COMMENT ON FUNCTION "public"."inbox_notification_android_channel"("p_type" "text", "p_android_notification_channel_version" integer) IS 'Android Expo channelId for inbox pushes. Job alerts use _v3 only when device reported channel version >= 3; otherwise _v2.';
 
 
 
@@ -19552,6 +19574,7 @@ DECLARE
   v_badge integer := 0;
   v_messages jsonb := '[]'::jsonb;
   v_token text;
+  v_channel_version integer;
   v_request_id bigint;
   v_push_data jsonb;
   v_message jsonb;
@@ -19563,7 +19586,6 @@ BEGIN
   v_title := coalesce(nullif(trim(p_title), ''), 'Instaclean');
   v_body := coalesce(nullif(trim(p_body), ''), 'You have a new notification.');
   v_type := coalesce(nullif(trim(p_type), ''), 'unknown');
-  v_channel := public.inbox_notification_android_channel(v_type);
   v_sound := public.inbox_notification_android_sound(v_type);
 
   v_push_data := coalesce(p_data, '{}'::jsonb);
@@ -19584,21 +19606,23 @@ BEGIN
 
   v_badge := least(greatest(coalesce(v_badge, 0), 1), 999);
 
-  FOR v_token IN
-    SELECT DISTINCT t.token
+  FOR v_token, v_channel_version IN
+    SELECT t.token, max(t.android_notification_channel_version)::integer
     FROM (
-      SELECT dt.token
+      SELECT dt.token, dt.android_notification_channel_version
       FROM public.device_tokens dt
       WHERE dt.user_id = p_user_id
         AND dt.token ~ '^(Expo(nent)?PushToken)\[.+\]$'
-      UNION
-      SELECT cd.expo_push_token AS token
+      UNION ALL
+      SELECT cd.expo_push_token AS token, NULL::integer AS android_notification_channel_version
       FROM public.cleaner_devices cd
       WHERE cd.cleaner_id = p_user_id
         AND cd.expo_push_token ~ '^(Expo(nent)?PushToken)\[.+\]$'
     ) t
     WHERE t.token IS NOT NULL
+    GROUP BY t.token
   LOOP
+    v_channel := public.inbox_notification_android_channel(v_type, v_channel_version);
     v_message := jsonb_build_object(
       'to', v_token,
       'title', v_title,
@@ -20626,17 +20650,91 @@ $$;
 ALTER FUNCTION "public"."record_ops_event"("p_level" "text", "p_source" "text", "p_event_type" "text", "p_message" "text", "p_metadata" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."recurring_discount_bps_for_interval"("p_recurrence_interval" "text", "p_weekly_bps" integer, "p_monthly_bps" integer) RETURNS integer
+CREATE OR REPLACE FUNCTION "public"."recurring_discount_bps_by_interval_is_valid"("p_interval_bps" "jsonb") RETURNS boolean
     LANGUAGE "plpgsql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $_$
+DECLARE
+  v_key text;
+  v_value jsonb;
+  v_text text;
+  v_bps integer;
+  c_allowed constant text[] := ARRAY[
+    'hourly',
+    'daily',
+    'weekly',
+    'bi-weekly',
+    'monthly',
+    'quarterly',
+    'annually'
+  ];
+BEGIN
+  IF p_interval_bps IS NULL THEN
+    RETURN true;
+  END IF;
+
+  IF jsonb_typeof(p_interval_bps) <> 'object' THEN
+    RETURN false;
+  END IF;
+
+  FOR v_key, v_value IN
+    SELECT key, value FROM jsonb_each(p_interval_bps)
+  LOOP
+    IF v_key IS NULL OR NOT (v_key = ANY (c_allowed)) THEN
+      RETURN false;
+    END IF;
+
+    IF jsonb_typeof(v_value) <> 'number' THEN
+      RETURN false;
+    END IF;
+
+    v_text := v_value #>> '{}';
+    IF v_text IS NULL OR v_text !~ '^[0-9]+$' THEN
+      RETURN false;
+    END IF;
+
+    v_bps := v_text::integer;
+    IF v_bps < 0 OR v_bps > 10000 THEN
+      RETURN false;
+    END IF;
+  END LOOP;
+
+  RETURN true;
+END;
+$_$;
+
+
+ALTER FUNCTION "public"."recurring_discount_bps_by_interval_is_valid"("p_interval_bps" "jsonb") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."recurring_discount_bps_by_interval_is_valid"("p_interval_bps" "jsonb") IS 'True when recurring_discount_bps_by_interval is NULL, {}, or an object of known interval keys with integer bps in [0, 10000].';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."recurring_discount_bps_for_interval"("p_recurrence_interval" "text", "p_weekly_bps" integer, "p_monthly_bps" integer) RETURNS integer
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
 DECLARE
-  v_interval text := lower(trim(coalesce(p_recurrence_interval, '')));
+  v_interval_bps jsonb;
+  v_weekly_bps integer := p_weekly_bps;
+  v_monthly_bps integer := p_monthly_bps;
 BEGIN
-  IF v_interval IN ('monthly', 'quarterly', 'annually') THEN
-    RETURN greatest(0, least(10000, coalesce(p_monthly_bps, 0)));
-  END IF;
-  RETURN greatest(0, least(10000, coalesce(p_weekly_bps, 0)));
+  SELECT pr.recurring_discount_bps_by_interval
+  INTO v_interval_bps
+  FROM public.pricing_rules pr
+  WHERE pr.is_active = true
+    AND (pr.effective_from IS NULL OR pr.effective_from <= now())
+    AND (pr.effective_to IS NULL OR pr.effective_to > now())
+  ORDER BY pr.updated_at DESC
+  LIMIT 1;
+
+  RETURN public.recurring_discount_bps_from_rule(
+    p_recurrence_interval,
+    v_interval_bps,
+    v_weekly_bps,
+    v_monthly_bps
+  );
 END;
 $$;
 
@@ -20644,7 +20742,50 @@ $$;
 ALTER FUNCTION "public"."recurring_discount_bps_for_interval"("p_recurrence_interval" "text", "p_weekly_bps" integer, "p_monthly_bps" integer) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."recurring_discount_bps_for_interval"("p_recurrence_interval" "text", "p_weekly_bps" integer, "p_monthly_bps" integer) IS 'Weekly-bucket discount for hourly/daily/weekly/bi-weekly; monthly-bucket for monthly/quarterly/annually.';
+COMMENT ON FUNCTION "public"."recurring_discount_bps_for_interval"("p_recurrence_interval" "text", "p_weekly_bps" integer, "p_monthly_bps" integer) IS 'Loads active pricing_rules.recurring_discount_bps_by_interval when present; falls back to weekly/monthly bucket bps.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."recurring_discount_bps_from_rule"("p_recurrence_interval" "text", "p_interval_bps" "jsonb", "p_weekly_bps" integer, "p_monthly_bps" integer) RETURNS integer
+    LANGUAGE "plpgsql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $_$
+DECLARE
+  v_interval text := lower(trim(coalesce(p_recurrence_interval, '')));
+  v_value jsonb;
+  v_text text;
+  v_mapped integer;
+BEGIN
+  IF v_interval = '' THEN
+    RETURN 0;
+  END IF;
+
+  IF p_interval_bps IS NOT NULL
+     AND jsonb_typeof(p_interval_bps) = 'object'
+     AND p_interval_bps ? v_interval THEN
+    v_value := p_interval_bps -> v_interval;
+    IF jsonb_typeof(v_value) = 'number' THEN
+      v_text := v_value #>> '{}';
+      IF v_text IS NOT NULL AND v_text ~ '^[0-9]+$' THEN
+        v_mapped := v_text::integer;
+        RETURN greatest(0, least(10000, v_mapped));
+      END IF;
+    END IF;
+  END IF;
+
+  IF v_interval IN ('monthly', 'quarterly', 'annually') THEN
+    RETURN greatest(0, least(10000, coalesce(p_monthly_bps, 0)));
+  END IF;
+
+  RETURN greatest(0, least(10000, coalesce(p_weekly_bps, 0)));
+END;
+$_$;
+
+
+ALTER FUNCTION "public"."recurring_discount_bps_from_rule"("p_recurrence_interval" "text", "p_interval_bps" "jsonb", "p_weekly_bps" integer, "p_monthly_bps" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."recurring_discount_bps_from_rule"("p_recurrence_interval" "text", "p_interval_bps" "jsonb", "p_weekly_bps" integer, "p_monthly_bps" integer) IS 'Resolve recurring discount bps from a valid interval map; skip malformed values and fall back to weekly/monthly buckets.';
 
 
 
@@ -21276,23 +21417,30 @@ $$;
 ALTER FUNCTION "public"."register_booking_job_photo"("p_booking_id" "uuid", "p_photo_type" "text", "p_storage_path" "text", "p_caption" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text", "p_android_notification_channel_version" integer DEFAULT NULL::integer, "p_app_version" "text" DEFAULT NULL::"text") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
 DECLARE
   v_user_id uuid := auth.uid();
+  v_token text := btrim(coalesce(p_token, ''));
+  v_app_version text := nullif(btrim(coalesce(p_app_version, '')), '');
 BEGIN
   IF v_user_id IS NULL THEN
     RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
   END IF;
 
-  IF p_token IS NULL OR btrim(p_token) = '' THEN
+  IF v_token = '' THEN
     RAISE EXCEPTION 'token is required' USING ERRCODE = '22004';
   END IF;
 
   IF p_platform NOT IN ('ios', 'android') THEN
     RAISE EXCEPTION 'invalid platform' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_android_notification_channel_version IS NOT NULL
+     AND p_android_notification_channel_version < 1 THEN
+    RAISE EXCEPTION 'invalid android_notification_channel_version' USING ERRCODE = '22023';
   END IF;
 
   -- Legacy accounts may exist in auth.users without a public.users shell row.
@@ -21302,17 +21450,35 @@ BEGIN
   WHERE au.id = v_user_id
   ON CONFLICT (id) DO NOTHING;
 
-  INSERT INTO public.device_tokens (user_id, token, platform, updated_at)
-  VALUES (v_user_id, btrim(p_token), p_platform, now())
+  INSERT INTO public.device_tokens (
+    user_id,
+    token,
+    platform,
+    android_notification_channel_version,
+    app_version,
+    updated_at
+  )
+  VALUES (
+    v_user_id,
+    v_token,
+    p_platform,
+    p_android_notification_channel_version,
+    v_app_version,
+    now()
+  )
   ON CONFLICT (token) DO UPDATE SET
     user_id = EXCLUDED.user_id,
     platform = EXCLUDED.platform,
+    -- Always store the reported capability (including NULL) so a failed channel
+    -- verification can clear a previously incorrect `_v3` claim.
+    android_notification_channel_version = EXCLUDED.android_notification_channel_version,
+    app_version = COALESCE(EXCLUDED.app_version, public.device_tokens.app_version),
     updated_at = EXCLUDED.updated_at;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text", "p_android_notification_channel_version" integer, "p_app_version" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."register_quick_task_upload"("p_storage_path" "text") RETURNS "uuid"
@@ -28808,11 +28974,21 @@ CREATE TABLE IF NOT EXISTS "public"."device_tokens" (
     "platform" "text" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "android_notification_channel_version" integer,
+    "app_version" "text",
     CONSTRAINT "device_tokens_platform_check" CHECK (("platform" = ANY (ARRAY['ios'::"text", 'android'::"text"])))
 );
 
 
 ALTER TABLE "public"."device_tokens" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."device_tokens"."android_notification_channel_version" IS 'Highest Android job-alert channel generation this device has initialized (e.g. 3 for job_offers_v3). NULL = unknown/legacy → send _v2.';
+
+
+
+COMMENT ON COLUMN "public"."device_tokens"."app_version" IS 'Marketing app version reported at push-token registration (e.g. 1.6.10).';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."discounts" (
@@ -29707,7 +29883,9 @@ CREATE TABLE IF NOT EXISTS "public"."pricing_rules" (
     "effective_to" timestamp with time zone,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "recurring_discount_bps_by_interval" "jsonb",
     CONSTRAINT "pricing_rules_effective_window_valid" CHECK ((("effective_to" IS NULL) OR ("effective_from" IS NULL) OR ("effective_to" > "effective_from"))),
+    CONSTRAINT "pricing_rules_recurring_discount_bps_by_interval_valid" CHECK ("public"."recurring_discount_bps_by_interval_is_valid"("recurring_discount_bps_by_interval")),
     CONSTRAINT "pricing_rules_recurring_monthly_bps_range" CHECK ((("recurring_monthly_discount_bps" >= 0) AND ("recurring_monthly_discount_bps" <= 10000))),
     CONSTRAINT "pricing_rules_recurring_weekly_bps_range" CHECK ((("recurring_weekly_discount_bps" >= 0) AND ("recurring_weekly_discount_bps" <= 10000))),
     CONSTRAINT "pricing_rules_same_day_bps_range" CHECK ((("same_day_surcharge_bps" >= 0) AND ("same_day_surcharge_bps" <= 10000))),
@@ -29716,6 +29894,10 @@ CREATE TABLE IF NOT EXISTS "public"."pricing_rules" (
 
 
 ALTER TABLE "public"."pricing_rules" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."pricing_rules"."recurring_discount_bps_by_interval" IS 'Authoritative per-interval recurring discount bps, e.g. {"weekly":1500,"monthly":1000}. Update this JSON (and/or activate a new pricing_rules row) to change discounts without an app release. Legacy recurring_weekly_discount_bps / recurring_monthly_discount_bps are used only when a key is absent.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."promotion_codes" (
@@ -44351,9 +44533,9 @@ GRANT ALL ON FUNCTION "public"."in_todo"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."inbox_notification_android_channel"("p_type" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."inbox_notification_android_channel"("p_type" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."inbox_notification_android_channel"("p_type" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."inbox_notification_android_channel"("p_type" "text", "p_android_notification_channel_version" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."inbox_notification_android_channel"("p_type" "text", "p_android_notification_channel_version" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."inbox_notification_android_channel"("p_type" "text", "p_android_notification_channel_version" integer) TO "service_role";
 
 
 
@@ -47219,10 +47401,24 @@ GRANT ALL ON FUNCTION "public"."record_ops_event"("p_level" "text", "p_source" "
 
 
 
+REVOKE ALL ON FUNCTION "public"."recurring_discount_bps_by_interval_is_valid"("p_interval_bps" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."recurring_discount_bps_by_interval_is_valid"("p_interval_bps" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."recurring_discount_bps_by_interval_is_valid"("p_interval_bps" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."recurring_discount_bps_by_interval_is_valid"("p_interval_bps" "jsonb") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."recurring_discount_bps_for_interval"("p_recurrence_interval" "text", "p_weekly_bps" integer, "p_monthly_bps" integer) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."recurring_discount_bps_for_interval"("p_recurrence_interval" "text", "p_weekly_bps" integer, "p_monthly_bps" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."recurring_discount_bps_for_interval"("p_recurrence_interval" "text", "p_weekly_bps" integer, "p_monthly_bps" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."recurring_discount_bps_for_interval"("p_recurrence_interval" "text", "p_weekly_bps" integer, "p_monthly_bps" integer) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."recurring_discount_bps_from_rule"("p_recurrence_interval" "text", "p_interval_bps" "jsonb", "p_weekly_bps" integer, "p_monthly_bps" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."recurring_discount_bps_from_rule"("p_recurrence_interval" "text", "p_interval_bps" "jsonb", "p_weekly_bps" integer, "p_monthly_bps" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."recurring_discount_bps_from_rule"("p_recurrence_interval" "text", "p_interval_bps" "jsonb", "p_weekly_bps" integer, "p_monthly_bps" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."recurring_discount_bps_from_rule"("p_recurrence_interval" "text", "p_interval_bps" "jsonb", "p_weekly_bps" integer, "p_monthly_bps" integer) TO "service_role";
 
 
 
@@ -47323,10 +47519,10 @@ GRANT ALL ON FUNCTION "public"."register_booking_job_photo"("p_booking_id" "uuid
 
 
 
-REVOKE ALL ON FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text", "p_android_notification_channel_version" integer, "p_app_version" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text", "p_android_notification_channel_version" integer, "p_app_version" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text", "p_android_notification_channel_version" integer, "p_app_version" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text", "p_android_notification_channel_version" integer, "p_app_version" "text") TO "service_role";
 
 
 
