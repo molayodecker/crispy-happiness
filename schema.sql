@@ -19243,12 +19243,24 @@ DECLARE
   v_has_sensitive_90d boolean := false;
   v_score integer := 0;
   v_stage text := NULL;
+  v_role text := coalesce(
+    auth.role(),
+    auth.jwt() ->> 'role',
+    current_setting('request.jwt.claim.role', true),
+    ''
+  );
 BEGIN
   IF p_customer_id IS NULL THEN
     RAISE EXCEPTION 'customer_id is required';
   END IF;
 
-  IF auth.uid() IS NULL OR auth.uid() <> p_customer_id THEN
+  -- Customers may only preview themselves. Service role (WhatsApp checkout)
+  -- may preview any customer_id after server-side phone authentication.
+  IF auth.uid() IS NOT NULL THEN
+    IF auth.uid() <> p_customer_id THEN
+      RAISE EXCEPTION 'forbidden';
+    END IF;
+  ELSIF v_role IS DISTINCT FROM 'service_role' THEN
     RAISE EXCEPTION 'forbidden';
   END IF;
 
@@ -19345,6 +19357,10 @@ $$;
 
 
 ALTER FUNCTION "public"."preview_customer_booking_verification_requirement"("p_customer_id" "uuid", "p_final_amount_minor" integer, "p_booking_for_self" boolean, "p_property_type" "text", "p_occupant_present" boolean, "p_requires_key_or_access_code" boolean, "p_is_same_day" boolean, "p_scheduled_at" timestamp with time zone) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."preview_customer_booking_verification_requirement"("p_customer_id" "uuid", "p_final_amount_minor" integer, "p_booking_for_self" boolean, "p_property_type" "text", "p_occupant_present" boolean, "p_requires_key_or_access_code" boolean, "p_is_same_day" boolean, "p_scheduled_at" timestamp with time zone) IS 'Prospective booking verification gate. Authenticated customers preview only themselves; service_role may preview after trusted server auth (e.g. WhatsApp).';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."process_direct_assignment_holds"() RETURNS "jsonb"
@@ -28764,6 +28780,68 @@ COMMENT ON COLUMN "public"."cleaner_verifications"."updated_at" IS 'Last row mod
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."cleaning_scan_rooms" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "scan_id" "uuid" NOT NULL,
+    "capture_id" "text" NOT NULL,
+    "room_type" "text" NOT NULL,
+    "duration_ms" integer,
+    "width_px" integer NOT NULL,
+    "height_px" integer NOT NULL,
+    "mime_type" "text" NOT NULL,
+    "file_size_bytes" bigint,
+    "storage_path" "text" NOT NULL,
+    "analysis" "jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "cleaning_scan_rooms_duration_ms_check" CHECK ((("duration_ms" IS NULL) OR (("duration_ms" >= 1) AND ("duration_ms" <= 60000)))),
+    CONSTRAINT "cleaning_scan_rooms_file_size_bytes_check" CHECK ((("file_size_bytes" IS NULL) OR (("file_size_bytes" >= 1) AND ("file_size_bytes" <= 52428800)))),
+    CONSTRAINT "cleaning_scan_rooms_height_px_check" CHECK ((("height_px" >= 1) AND ("height_px" <= 10000))),
+    CONSTRAINT "cleaning_scan_rooms_room_type_check" CHECK (("room_type" = ANY (ARRAY['living_room'::"text", 'kitchen'::"text", 'bathroom'::"text", 'bedroom'::"text", 'dining_room'::"text", 'hallway'::"text", 'other'::"text"]))),
+    CONSTRAINT "cleaning_scan_rooms_width_px_check" CHECK ((("width_px" >= 1) AND ("width_px" <= 10000)))
+);
+
+
+ALTER TABLE "public"."cleaning_scan_rooms" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."cleaning_scan_rooms" IS 'Room-level scan metadata and validated derived AI observations. Source videos live in private Storage temporarily.';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."cleaning_scans" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "request_id" "text" NOT NULL,
+    "status" "text" DEFAULT 'uploading'::"text" NOT NULL,
+    "analysis" "jsonb",
+    "model_provider" "text",
+    "model_name" "text",
+    "model_version" "text",
+    "failure_code" "text",
+    "analysis_attempt_id" "uuid",
+    "analysis_started_at" timestamp with time zone,
+    "analysis_completed_at" timestamp with time zone,
+    "media_expires_at" timestamp with time zone,
+    "media_deleted_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "cleaning_scans_request_id_length" CHECK ((("char_length"("request_id") >= 8) AND ("char_length"("request_id") <= 128))),
+    CONSTRAINT "cleaning_scans_status_check" CHECK (("status" = ANY (ARRAY['uploading'::"text", 'analyzing'::"text", 'completed'::"text", 'failed'::"text"])))
+);
+
+
+ALTER TABLE "public"."cleaning_scans" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."cleaning_scans" IS 'Customer-owned AI cleaning scan sessions. Stores derived analysis, not authoritative price.';
+
+
+
+COMMENT ON COLUMN "public"."cleaning_scans"."analysis" IS 'Validated derived workload response. Never treated as authoritative booking price.';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."co_cleaner_invitations" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "inviter_user_id" "uuid" NOT NULL,
@@ -29450,6 +29528,7 @@ CREATE TABLE IF NOT EXISTS "public"."kyc_profiles" (
     "last_event_type" "text",
     "last_event_created_at_ms" bigint,
     "last_webhook_payload" "jsonb",
+    "sumsub_linked_at" timestamp with time zone,
     CONSTRAINT "kyc_profiles_kyc_status_check" CHECK (("kyc_status" = ANY (ARRAY['not_started'::"text", 'started'::"text", 'submitted'::"text", 'completed'::"text", 'approved'::"text", 'rejected'::"text", 'failed'::"text"]))),
     CONSTRAINT "kyc_profiles_subject_type_check" CHECK (("subject_type" = ANY (ARRAY['customer'::"text", 'cleaner'::"text", 'user'::"text"])))
 );
@@ -29463,6 +29542,10 @@ COMMENT ON TABLE "public"."kyc_profiles" IS 'User-level identity verification (S
 
 
 COMMENT ON COLUMN "public"."kyc_profiles"."subject_type" IS 'Context label: customer or cleaner (legacy user alias). Not an identity boundary — Sumsub webhooks may keep customer while cleaner_application_id is set. Identity gates use user_id only.';
+
+
+
+COMMENT ON COLUMN "public"."kyc_profiles"."sumsub_linked_at" IS 'Set whenever sumsub_applicant_id is assigned or changed. Used for identity lookup recency alongside reviewed_at/completed_at/submitted_at so metadata updated_at bumps cannot resurrect a stale applicant.';
 
 
 
@@ -30978,6 +31061,31 @@ ALTER TABLE ONLY "public"."cleaner_verifications"
 
 
 
+ALTER TABLE ONLY "public"."cleaning_scan_rooms"
+    ADD CONSTRAINT "cleaning_scan_rooms_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."cleaning_scan_rooms"
+    ADD CONSTRAINT "cleaning_scan_rooms_scan_capture_unique" UNIQUE ("scan_id", "capture_id");
+
+
+
+ALTER TABLE ONLY "public"."cleaning_scan_rooms"
+    ADD CONSTRAINT "cleaning_scan_rooms_storage_path_key" UNIQUE ("storage_path");
+
+
+
+ALTER TABLE ONLY "public"."cleaning_scans"
+    ADD CONSTRAINT "cleaning_scans_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."cleaning_scans"
+    ADD CONSTRAINT "cleaning_scans_user_request_unique" UNIQUE ("user_id", "request_id");
+
+
+
 ALTER TABLE ONLY "public"."co_cleaner_invitations"
     ADD CONSTRAINT "co_cleaner_invitations_pkey" PRIMARY KEY ("id");
 
@@ -31781,6 +31889,22 @@ CREATE INDEX "cleaner_upload_links_lead_id_idx" ON "public"."cleaner_upload_link
 
 
 CREATE UNIQUE INDEX "cleaner_upload_links_short_code_uidx" ON "public"."cleaner_upload_links" USING "btree" ("short_code");
+
+
+
+CREATE INDEX "cleaning_scan_rooms_scan_idx" ON "public"."cleaning_scan_rooms" USING "btree" ("scan_id", "created_at");
+
+
+
+CREATE INDEX "cleaning_scans_media_expiry_idx" ON "public"."cleaning_scans" USING "btree" ("media_expires_at") WHERE ("media_deleted_at" IS NULL);
+
+
+
+CREATE INDEX "cleaning_scans_status_idx" ON "public"."cleaning_scans" USING "btree" ("status", "updated_at");
+
+
+
+CREATE INDEX "cleaning_scans_user_created_idx" ON "public"."cleaning_scans" USING "btree" ("user_id", "created_at" DESC);
 
 
 
@@ -33176,6 +33300,16 @@ ALTER TABLE ONLY "public"."cleaner_verifications"
 
 
 
+ALTER TABLE ONLY "public"."cleaning_scan_rooms"
+    ADD CONSTRAINT "cleaning_scan_rooms_scan_id_fkey" FOREIGN KEY ("scan_id") REFERENCES "public"."cleaning_scans"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."cleaning_scans"
+    ADD CONSTRAINT "cleaning_scans_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."co_cleaner_invitations"
     ADD CONSTRAINT "co_cleaner_invitations_accepted_user_id_fkey" FOREIGN KEY ("accepted_user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
@@ -34396,6 +34530,22 @@ CREATE POLICY "cleaners_select_own_withdrawals" ON "public"."withdrawal_requests
 
 
 CREATE POLICY "cleaners_update_own_cleaner_data" ON "public"."cleaner_data" FOR UPDATE TO "authenticated" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
+
+
+
+ALTER TABLE "public"."cleaning_scan_rooms" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "cleaning_scan_rooms_select_own" ON "public"."cleaning_scan_rooms" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."cleaning_scans" "scans"
+  WHERE (("scans"."id" = "cleaning_scan_rooms"."scan_id") AND ("scans"."user_id" = "auth"."uid"())))));
+
+
+
+ALTER TABLE "public"."cleaning_scans" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "cleaning_scans_select_own" ON "public"."cleaning_scans" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
 
 
 
@@ -47293,6 +47443,7 @@ GRANT ALL ON FUNCTION "public"."prevent_promotion_config_audit_mutation"() TO "s
 
 
 
+REVOKE ALL ON FUNCTION "public"."preview_customer_booking_verification_requirement"("p_customer_id" "uuid", "p_final_amount_minor" integer, "p_booking_for_self" boolean, "p_property_type" "text", "p_occupant_present" boolean, "p_requires_key_or_access_code" boolean, "p_is_same_day" boolean, "p_scheduled_at" timestamp with time zone) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."preview_customer_booking_verification_requirement"("p_customer_id" "uuid", "p_final_amount_minor" integer, "p_booking_for_self" boolean, "p_property_type" "text", "p_occupant_present" boolean, "p_requires_key_or_access_code" boolean, "p_is_same_day" boolean, "p_scheduled_at" timestamp with time zone) TO "anon";
 GRANT ALL ON FUNCTION "public"."preview_customer_booking_verification_requirement"("p_customer_id" "uuid", "p_final_amount_minor" integer, "p_booking_for_self" boolean, "p_property_type" "text", "p_occupant_present" boolean, "p_requires_key_or_access_code" boolean, "p_is_same_day" boolean, "p_scheduled_at" timestamp with time zone) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."preview_customer_booking_verification_requirement"("p_customer_id" "uuid", "p_final_amount_minor" integer, "p_booking_for_self" boolean, "p_property_type" "text", "p_occupant_present" boolean, "p_requires_key_or_access_code" boolean, "p_is_same_day" boolean, "p_scheduled_at" timestamp with time zone) TO "service_role";
@@ -52661,6 +52812,16 @@ GRANT SELECT("revoked_at") ON TABLE "public"."cleaner_upload_links" TO "authenti
 GRANT ALL ON TABLE "public"."cleaner_verifications" TO "anon";
 GRANT ALL ON TABLE "public"."cleaner_verifications" TO "authenticated";
 GRANT ALL ON TABLE "public"."cleaner_verifications" TO "service_role";
+
+
+
+GRANT SELECT,MAINTAIN ON TABLE "public"."cleaning_scan_rooms" TO "authenticated";
+GRANT ALL ON TABLE "public"."cleaning_scan_rooms" TO "service_role";
+
+
+
+GRANT SELECT,MAINTAIN ON TABLE "public"."cleaning_scans" TO "authenticated";
+GRANT ALL ON TABLE "public"."cleaning_scans" TO "service_role";
 
 
 

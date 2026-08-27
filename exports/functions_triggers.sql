@@ -34503,12 +34503,24 @@ DECLARE
   v_has_sensitive_90d boolean := false;
   v_score integer := 0;
   v_stage text := NULL;
+  v_role text := coalesce(
+    auth.role(),
+    auth.jwt() ->> 'role',
+    current_setting('request.jwt.claim.role', true),
+    ''
+  );
 BEGIN
   IF p_customer_id IS NULL THEN
     RAISE EXCEPTION 'customer_id is required';
   END IF;
 
-  IF auth.uid() IS NULL OR auth.uid() <> p_customer_id THEN
+  -- Customers may only preview themselves. Service role (WhatsApp checkout)
+  -- may preview any customer_id after server-side phone authentication.
+  IF auth.uid() IS NOT NULL THEN
+    IF auth.uid() <> p_customer_id THEN
+      RAISE EXCEPTION 'forbidden';
+    END IF;
+  ELSIF v_role IS DISTINCT FROM 'service_role' THEN
     RAISE EXCEPTION 'forbidden';
   END IF;
 
