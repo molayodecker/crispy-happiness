@@ -5008,6 +5008,145 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.add_customer_invited_household_worker(p_first_name text, p_last_name text DEFAULT NULL::text, p_phone text DEFAULT NULL::text, p_email text DEFAULT NULL::text, p_role text DEFAULT NULL::text, p_start_date date DEFAULT NULL::date, p_live_in boolean DEFAULT false)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_id uuid;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Not authenticated');
+  END IF;
+
+  IF p_first_name IS NULL OR btrim(p_first_name) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'First name is required');
+  END IF;
+
+  IF p_phone IS NULL OR btrim(p_phone) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Phone number is required');
+  END IF;
+
+  IF p_role IS NOT NULL AND p_role NOT IN (
+    'househelp', 'nanny', 'cleaner', 'elder_caregiver', 'cook', 'driver', 'gardener'
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Invalid helper role');
+  END IF;
+
+  INSERT INTO public.household_workers (
+    household_owner_id,
+    worker_user_id,
+    first_name,
+    last_name,
+    phone,
+    email,
+    source,
+    role,
+    start_date,
+    live_in,
+    status,
+    invitation_status
+  ) VALUES (
+    v_uid,
+    NULL,
+    btrim(p_first_name),
+    NULLIF(btrim(COALESCE(p_last_name, '')), ''),
+    btrim(p_phone),
+    NULLIF(btrim(COALESCE(p_email, '')), ''),
+    'customer_invited',
+    p_role,
+    p_start_date,
+    COALESCE(p_live_in, false),
+    'active',
+    'not_sent'
+  )
+  RETURNING id INTO v_id;
+
+  RETURN jsonb_build_object('success', true, 'household_worker_id', v_id);
+EXCEPTION
+  WHEN unique_violation THEN
+    RETURN jsonb_build_object('success', false, 'error', 'This helper is already in your home');
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.add_customer_invited_household_worker(p_household_owner_id uuid, p_first_name text, p_last_name text DEFAULT NULL::text, p_phone text DEFAULT NULL::text, p_email text DEFAULT NULL::text, p_role text DEFAULT NULL::text, p_start_date date DEFAULT NULL::date, p_live_in boolean DEFAULT false)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_id uuid;
+BEGIN
+  IF p_household_owner_id IS NULL OR NOT EXISTS (
+    SELECT 1 FROM public.users u WHERE u.id = p_household_owner_id
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Invalid household owner');
+  END IF;
+
+  IF p_first_name IS NULL OR btrim(p_first_name) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'First name is required');
+  END IF;
+
+  IF p_phone IS NULL OR btrim(p_phone) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Phone number is required');
+  END IF;
+
+  IF p_role IS NOT NULL AND p_role NOT IN (
+    'househelp', 'nanny', 'cleaner', 'elder_caregiver', 'cook', 'driver', 'gardener'
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Invalid helper role');
+  END IF;
+
+  INSERT INTO public.household_workers (
+    household_owner_id,
+    worker_user_id,
+    first_name,
+    last_name,
+    phone,
+    email,
+    source,
+    role,
+    start_date,
+    live_in,
+    status,
+    invitation_status
+  ) VALUES (
+    p_household_owner_id,
+    NULL,
+    btrim(p_first_name),
+    NULLIF(btrim(COALESCE(p_last_name, '')), ''),
+    btrim(p_phone),
+    NULLIF(btrim(COALESCE(p_email, '')), ''),
+    'customer_invited',
+    p_role,
+    p_start_date,
+    COALESCE(p_live_in, false),
+    'active',
+    'not_sent'
+  )
+  ON CONFLICT (household_owner_id, phone)
+    WHERE worker_user_id IS NULL
+  DO UPDATE SET
+    first_name = EXCLUDED.first_name,
+    last_name = EXCLUDED.last_name,
+    email = EXCLUDED.email,
+    role = EXCLUDED.role,
+    start_date = EXCLUDED.start_date,
+    live_in = EXCLUDED.live_in,
+    status = 'active',
+    updated_at = now()
+  RETURNING id INTO v_id;
+
+  RETURN jsonb_build_object('success', true, 'household_worker_id', v_id);
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.add_result(boolean, boolean, text, text, text)
  RETURNS integer
  LANGUAGE plpgsql
@@ -25002,6 +25141,27 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.guard_cleaner_data_admin_state()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+BEGIN
+  IF current_user = 'authenticated'
+     AND NOT public.has_role('admin'::text)
+     AND (
+       NEW.verified IS DISTINCT FROM OLD.verified
+       OR NEW.status IS DISTINCT FROM OLD.status
+     ) THEN
+    RAISE EXCEPTION 'cleaner verification and lifecycle status are admin-controlled'
+      USING ERRCODE = '42501';
+  END IF;
+
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.handle_job_completion()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -27334,6 +27494,180 @@ CREATE OR REPLACE FUNCTION public.hasnt_view(name, text)
  LANGUAGE sql
 AS $function$
     SELECT ok( NOT _rexists( 'v', $1 ), $2 );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.hire_placement_match(p_match_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_request_id uuid;
+  v_match public.placement_matches%ROWTYPE;
+  v_request public.placement_requests%ROWTYPE;
+  v_candidate_profile public.placement_candidate_profiles%ROWTYPE;
+  v_provider_verified boolean;
+  v_provider_status text;
+  v_first_name text;
+  v_last_name text;
+  v_phone text;
+  v_email text;
+  v_household_worker_id uuid;
+BEGIN
+  SELECT pm.placement_request_id
+  INTO v_request_id
+  FROM public.placement_matches pm
+  WHERE pm.id = p_match_id;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Placement match not found');
+  END IF;
+
+  SELECT pr.*
+  INTO v_request
+  FROM public.placement_requests pr
+  WHERE pr.id = v_request_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Placement match not found');
+  END IF;
+
+  SELECT pm.*
+  INTO v_match
+  FROM public.placement_matches pm
+  WHERE pm.id = p_match_id
+    AND pm.placement_request_id = v_request.id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Placement match not found');
+  END IF;
+
+  IF v_request.status IN ('placed', 'cancelled', 'expired') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Placement request is no longer hireable');
+  END IF;
+
+  IF v_match.status NOT IN ('suggested', 'selected') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Candidate is no longer available for this placement');
+  END IF;
+
+  SELECT pcp.*
+  INTO v_candidate_profile
+  FROM public.placement_candidate_profiles pcp
+  WHERE pcp.user_id = v_match.candidate_user_id
+  FOR UPDATE;
+
+  IF NOT FOUND
+     OR v_candidate_profile.placement_opt_in IS DISTINCT FROM true
+     OR v_candidate_profile.placement_status <> 'available'
+     OR NOT (v_request.role = ANY(COALESCE(v_candidate_profile.desired_roles, '{}'::text[]))) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Candidate is not currently available for this placement role');
+  END IF;
+
+  SELECT COALESCE(cd.verified, false), cd.status::text
+  INTO v_provider_verified, v_provider_status
+  FROM public.cleaner_data cd
+  WHERE cd.user_id = v_match.candidate_user_id
+  FOR UPDATE;
+
+  IF NOT FOUND OR v_provider_verified IS DISTINCT FROM true OR v_provider_status <> 'active' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Candidate is not currently an active verified provider');
+  END IF;
+
+  SELECT
+    COALESCE(
+      NULLIF(btrim(p.firstname), ''),
+      NULLIF(split_part(COALESCE(p.fullname, ''), ' ', 1), ''),
+      'Helper'
+    ),
+    NULLIF(btrim(p.lastname), ''),
+    u.phone,
+    u.email
+  INTO v_first_name, v_last_name, v_phone, v_email
+  FROM public.users u
+  LEFT JOIN public.profiles p ON p.id = u.id
+  WHERE u.id = v_match.candidate_user_id;
+
+  IF v_phone IS NULL OR btrim(v_phone) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Candidate needs a phone number before placement');
+  END IF;
+
+  INSERT INTO public.household_workers (
+    household_owner_id,
+    worker_user_id,
+    first_name,
+    last_name,
+    phone,
+    email,
+    source,
+    placement_request_id,
+    placement_match_id,
+    role,
+    start_date,
+    salary_frequency,
+    live_in,
+    status,
+    invitation_status
+  ) VALUES (
+    v_request.customer_id,
+    v_match.candidate_user_id,
+    v_first_name,
+    v_last_name,
+    v_phone,
+    v_email,
+    'instaclean_placement',
+    v_request.id,
+    v_match.id,
+    v_request.role,
+    v_request.desired_start_date,
+    v_request.salary_frequency,
+    v_request.living_arrangement = 'live_in',
+    'active',
+    'accepted'
+  )
+  ON CONFLICT (household_owner_id, worker_user_id)
+    WHERE worker_user_id IS NOT NULL
+  DO UPDATE SET
+    first_name = EXCLUDED.first_name,
+    last_name = EXCLUDED.last_name,
+    phone = EXCLUDED.phone,
+    email = EXCLUDED.email,
+    source = 'instaclean_placement',
+    placement_request_id = EXCLUDED.placement_request_id,
+    placement_match_id = EXCLUDED.placement_match_id,
+    role = EXCLUDED.role,
+    start_date = EXCLUDED.start_date,
+    salary_frequency = EXCLUDED.salary_frequency,
+    live_in = EXCLUDED.live_in,
+    status = 'active',
+    invitation_status = 'accepted',
+    updated_at = now()
+  RETURNING id INTO v_household_worker_id;
+
+  UPDATE public.placement_matches
+  SET status = 'hired'
+  WHERE id = v_match.id;
+
+  UPDATE public.placement_matches
+  SET status = 'cancelled'
+  WHERE placement_request_id = v_request.id
+    AND id <> v_match.id
+    AND status IN ('suggested', 'selected');
+
+  UPDATE public.placement_requests
+  SET status = 'placed'
+  WHERE id = v_request.id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'household_worker_id', v_household_worker_id,
+    'placement_request_id', v_request.id,
+    'candidate_user_id', v_match.candidate_user_id
+  );
+END;
 $function$
 
 
@@ -48671,11 +49005,15 @@ CREATE TRIGGER trg_normalize_cleaner_application_email BEFORE INSERT OR UPDATE O
 
 CREATE TRIGGER trigger_update_cleaner_availability_exceptions_updated_at BEFORE UPDATE ON cleaner_availability_exceptions FOR EACH ROW EXECUTE FUNCTION update_cleaner_availability_exceptions_updated_at();
 
+CREATE TRIGGER cleaner_data_admin_state_guard BEFORE UPDATE OF verified, status ON cleaner_data FOR EACH ROW EXECUTE FUNCTION guard_cleaner_data_admin_state();
+
 CREATE TRIGGER tr_on_cleaner_created AFTER INSERT ON cleaner_data FOR EACH ROW EXECUTE FUNCTION fn_create_wallet_for_new_cleaner();
 
 CREATE TRIGGER cleaner_teams_set_normalized_trg BEFORE INSERT OR UPDATE OF company_name ON cleaner_teams FOR EACH ROW EXECUTE FUNCTION cleaner_teams_set_normalized();
 
 CREATE TRIGGER geo_reverse_cache_set_updated_at BEFORE UPDATE ON geo_reverse_cache FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TRIGGER household_workers_set_updated_at BEFORE UPDATE ON household_workers FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TRIGGER customer_trust_sync_from_kyc_profiles AFTER INSERT OR UPDATE OF kyc_status ON kyc_profiles FOR EACH ROW EXECUTE FUNCTION sync_customer_trust_from_kyc_profiles();
 
@@ -48692,6 +49030,12 @@ CREATE TRIGGER trigger_notify_inbox_notification_push AFTER INSERT ON notificati
 CREATE TRIGGER payout_methods_acquire_user_lock BEFORE INSERT OR DELETE OR UPDATE ON payout_methods FOR EACH ROW EXECUTE FUNCTION _payout_methods_acquire_user_lock_trigger();
 
 CREATE TRIGGER payout_methods_touch_updated_at BEFORE UPDATE ON payout_methods FOR EACH ROW EXECUTE FUNCTION touch_payout_methods_updated_at();
+
+CREATE TRIGGER placement_candidate_profiles_set_updated_at BEFORE UPDATE ON placement_candidate_profiles FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TRIGGER placement_matches_set_updated_at BEFORE UPDATE ON placement_matches FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TRIGGER placement_requests_set_updated_at BEFORE UPDATE ON placement_requests FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TRIGGER platform_config_set_updated_at BEFORE UPDATE ON platform_config FOR EACH ROW EXECUTE FUNCTION set_platform_config_updated_at();
 

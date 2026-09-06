@@ -1538,6 +1538,155 @@ COMMENT ON FUNCTION "public"."add_cleaner_record"("p_user_id" "uuid", "p_name" "
 
 
 
+CREATE OR REPLACE FUNCTION "public"."add_customer_invited_household_worker"("p_first_name" "text", "p_last_name" "text" DEFAULT NULL::"text", "p_phone" "text" DEFAULT NULL::"text", "p_email" "text" DEFAULT NULL::"text", "p_role" "text" DEFAULT NULL::"text", "p_start_date" "date" DEFAULT NULL::"date", "p_live_in" boolean DEFAULT false) RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_id uuid;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Not authenticated');
+  END IF;
+
+  IF p_first_name IS NULL OR btrim(p_first_name) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'First name is required');
+  END IF;
+
+  IF p_phone IS NULL OR btrim(p_phone) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Phone number is required');
+  END IF;
+
+  IF p_role IS NOT NULL AND p_role NOT IN (
+    'househelp', 'nanny', 'cleaner', 'elder_caregiver', 'cook', 'driver', 'gardener'
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Invalid helper role');
+  END IF;
+
+  INSERT INTO public.household_workers (
+    household_owner_id,
+    worker_user_id,
+    first_name,
+    last_name,
+    phone,
+    email,
+    source,
+    role,
+    start_date,
+    live_in,
+    status,
+    invitation_status
+  ) VALUES (
+    v_uid,
+    NULL,
+    btrim(p_first_name),
+    NULLIF(btrim(COALESCE(p_last_name, '')), ''),
+    btrim(p_phone),
+    NULLIF(btrim(COALESCE(p_email, '')), ''),
+    'customer_invited',
+    p_role,
+    p_start_date,
+    COALESCE(p_live_in, false),
+    'active',
+    'not_sent'
+  )
+  RETURNING id INTO v_id;
+
+  RETURN jsonb_build_object('success', true, 'household_worker_id', v_id);
+EXCEPTION
+  WHEN unique_violation THEN
+    RETURN jsonb_build_object('success', false, 'error', 'This helper is already in your home');
+END;
+$$;
+
+
+ALTER FUNCTION "public"."add_customer_invited_household_worker"("p_first_name" "text", "p_last_name" "text", "p_phone" "text", "p_email" "text", "p_role" "text", "p_start_date" "date", "p_live_in" boolean) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."add_customer_invited_household_worker"("p_first_name" "text", "p_last_name" "text", "p_phone" "text", "p_email" "text", "p_role" "text", "p_start_date" "date", "p_live_in" boolean) IS 'Compatibility-only. Instaclean Direct helper creation is owned by Mithril and must not be called by authenticated clients.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."add_customer_invited_household_worker"("p_household_owner_id" "uuid", "p_first_name" "text", "p_last_name" "text" DEFAULT NULL::"text", "p_phone" "text" DEFAULT NULL::"text", "p_email" "text" DEFAULT NULL::"text", "p_role" "text" DEFAULT NULL::"text", "p_start_date" "date" DEFAULT NULL::"date", "p_live_in" boolean DEFAULT false) RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_id uuid;
+BEGIN
+  IF p_household_owner_id IS NULL OR NOT EXISTS (
+    SELECT 1 FROM public.users u WHERE u.id = p_household_owner_id
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Invalid household owner');
+  END IF;
+
+  IF p_first_name IS NULL OR btrim(p_first_name) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'First name is required');
+  END IF;
+
+  IF p_phone IS NULL OR btrim(p_phone) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Phone number is required');
+  END IF;
+
+  IF p_role IS NOT NULL AND p_role NOT IN (
+    'househelp', 'nanny', 'cleaner', 'elder_caregiver', 'cook', 'driver', 'gardener'
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Invalid helper role');
+  END IF;
+
+  INSERT INTO public.household_workers (
+    household_owner_id,
+    worker_user_id,
+    first_name,
+    last_name,
+    phone,
+    email,
+    source,
+    role,
+    start_date,
+    live_in,
+    status,
+    invitation_status
+  ) VALUES (
+    p_household_owner_id,
+    NULL,
+    btrim(p_first_name),
+    NULLIF(btrim(COALESCE(p_last_name, '')), ''),
+    btrim(p_phone),
+    NULLIF(btrim(COALESCE(p_email, '')), ''),
+    'customer_invited',
+    p_role,
+    p_start_date,
+    COALESCE(p_live_in, false),
+    'active',
+    'not_sent'
+  )
+  ON CONFLICT (household_owner_id, phone)
+    WHERE worker_user_id IS NULL
+  DO UPDATE SET
+    first_name = EXCLUDED.first_name,
+    last_name = EXCLUDED.last_name,
+    email = EXCLUDED.email,
+    role = EXCLUDED.role,
+    start_date = EXCLUDED.start_date,
+    live_in = EXCLUDED.live_in,
+    status = 'active',
+    updated_at = now()
+  RETURNING id INTO v_id;
+
+  RETURN jsonb_build_object('success', true, 'household_worker_id', v_id);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."add_customer_invited_household_worker"("p_household_owner_id" "uuid", "p_first_name" "text", "p_last_name" "text", "p_phone" "text", "p_email" "text", "p_role" "text", "p_start_date" "date", "p_live_in" boolean) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."add_customer_invited_household_worker"("p_household_owner_id" "uuid", "p_first_name" "text", "p_last_name" "text", "p_phone" "text", "p_email" "text", "p_role" "text", "p_start_date" "date", "p_live_in" boolean) IS 'Compatibility-only service-role recovery path with explicit household owner. Instaclean Direct helper creation is owned by Mithril.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."admin_cash_payout_recorder_is_allowed"("p_user_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public', 'pg_temp'
@@ -16225,6 +16374,29 @@ $$;
 ALTER FUNCTION "public"."guard_booking_uber_transportation_snapshot"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."guard_cleaner_data_admin_state"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+BEGIN
+  IF current_user = 'authenticated'
+     AND NOT public.has_role('admin'::text)
+     AND (
+       NEW.verified IS DISTINCT FROM OLD.verified
+       OR NEW.status IS DISTINCT FROM OLD.status
+     ) THEN
+    RAISE EXCEPTION 'cleaner verification and lifecycle status are admin-controlled'
+      USING ERRCODE = '42501';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."guard_cleaner_data_admin_state"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."handle_job_completion"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -16381,6 +16553,185 @@ $$;
 
 
 ALTER FUNCTION "public"."has_role"("_role" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."hire_placement_match"("p_match_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_request_id uuid;
+  v_match public.placement_matches%ROWTYPE;
+  v_request public.placement_requests%ROWTYPE;
+  v_candidate_profile public.placement_candidate_profiles%ROWTYPE;
+  v_provider_verified boolean;
+  v_provider_status text;
+  v_first_name text;
+  v_last_name text;
+  v_phone text;
+  v_email text;
+  v_household_worker_id uuid;
+BEGIN
+  SELECT pm.placement_request_id
+  INTO v_request_id
+  FROM public.placement_matches pm
+  WHERE pm.id = p_match_id;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Placement match not found');
+  END IF;
+
+  SELECT pr.*
+  INTO v_request
+  FROM public.placement_requests pr
+  WHERE pr.id = v_request_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Placement match not found');
+  END IF;
+
+  SELECT pm.*
+  INTO v_match
+  FROM public.placement_matches pm
+  WHERE pm.id = p_match_id
+    AND pm.placement_request_id = v_request.id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Placement match not found');
+  END IF;
+
+  IF v_request.status IN ('placed', 'cancelled', 'expired') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Placement request is no longer hireable');
+  END IF;
+
+  IF v_match.status NOT IN ('suggested', 'selected') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Candidate is no longer available for this placement');
+  END IF;
+
+  SELECT pcp.*
+  INTO v_candidate_profile
+  FROM public.placement_candidate_profiles pcp
+  WHERE pcp.user_id = v_match.candidate_user_id
+  FOR UPDATE;
+
+  IF NOT FOUND
+     OR v_candidate_profile.placement_opt_in IS DISTINCT FROM true
+     OR v_candidate_profile.placement_status <> 'available'
+     OR NOT (v_request.role = ANY(COALESCE(v_candidate_profile.desired_roles, '{}'::text[]))) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Candidate is not currently available for this placement role');
+  END IF;
+
+  SELECT COALESCE(cd.verified, false), cd.status::text
+  INTO v_provider_verified, v_provider_status
+  FROM public.cleaner_data cd
+  WHERE cd.user_id = v_match.candidate_user_id
+  FOR UPDATE;
+
+  IF NOT FOUND OR v_provider_verified IS DISTINCT FROM true OR v_provider_status <> 'active' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Candidate is not currently an active verified provider');
+  END IF;
+
+  SELECT
+    COALESCE(
+      NULLIF(btrim(p.firstname), ''),
+      NULLIF(split_part(COALESCE(p.fullname, ''), ' ', 1), ''),
+      'Helper'
+    ),
+    NULLIF(btrim(p.lastname), ''),
+    u.phone,
+    u.email
+  INTO v_first_name, v_last_name, v_phone, v_email
+  FROM public.users u
+  LEFT JOIN public.profiles p ON p.id = u.id
+  WHERE u.id = v_match.candidate_user_id;
+
+  IF v_phone IS NULL OR btrim(v_phone) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Candidate needs a phone number before placement');
+  END IF;
+
+  INSERT INTO public.household_workers (
+    household_owner_id,
+    worker_user_id,
+    first_name,
+    last_name,
+    phone,
+    email,
+    source,
+    placement_request_id,
+    placement_match_id,
+    role,
+    start_date,
+    salary_frequency,
+    live_in,
+    status,
+    invitation_status
+  ) VALUES (
+    v_request.customer_id,
+    v_match.candidate_user_id,
+    v_first_name,
+    v_last_name,
+    v_phone,
+    v_email,
+    'instaclean_placement',
+    v_request.id,
+    v_match.id,
+    v_request.role,
+    v_request.desired_start_date,
+    v_request.salary_frequency,
+    v_request.living_arrangement = 'live_in',
+    'active',
+    'accepted'
+  )
+  ON CONFLICT (household_owner_id, worker_user_id)
+    WHERE worker_user_id IS NOT NULL
+  DO UPDATE SET
+    first_name = EXCLUDED.first_name,
+    last_name = EXCLUDED.last_name,
+    phone = EXCLUDED.phone,
+    email = EXCLUDED.email,
+    source = 'instaclean_placement',
+    placement_request_id = EXCLUDED.placement_request_id,
+    placement_match_id = EXCLUDED.placement_match_id,
+    role = EXCLUDED.role,
+    start_date = EXCLUDED.start_date,
+    salary_frequency = EXCLUDED.salary_frequency,
+    live_in = EXCLUDED.live_in,
+    status = 'active',
+    invitation_status = 'accepted',
+    updated_at = now()
+  RETURNING id INTO v_household_worker_id;
+
+  UPDATE public.placement_matches
+  SET status = 'hired'
+  WHERE id = v_match.id;
+
+  UPDATE public.placement_matches
+  SET status = 'cancelled'
+  WHERE placement_request_id = v_request.id
+    AND id <> v_match.id
+    AND status IN ('suggested', 'selected');
+
+  UPDATE public.placement_requests
+  SET status = 'placed'
+  WHERE id = v_request.id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'household_worker_id', v_household_worker_id,
+    'placement_request_id', v_request.id,
+    'candidate_user_id', v_match.candidate_user_id
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."hire_placement_match"("p_match_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."hire_placement_match"("p_match_id" "uuid") IS 'Compatibility-only service-role recovery path. Instaclean Direct hiring is owned by Mithril.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."inbox_notification_android_channel"("p_type" "text", "p_android_notification_channel_version" integer DEFAULT NULL::integer) RETURNS "text"
@@ -29838,6 +30189,41 @@ CREATE TABLE IF NOT EXISTS "public"."home_size_durations" (
 ALTER TABLE "public"."home_size_durations" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."household_workers" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "household_owner_id" "uuid" NOT NULL,
+    "worker_user_id" "uuid",
+    "first_name" "text" NOT NULL,
+    "last_name" "text",
+    "phone" "text" NOT NULL,
+    "email" "text",
+    "source" "text" NOT NULL,
+    "placement_request_id" "uuid",
+    "placement_match_id" "uuid",
+    "role" "text",
+    "start_date" "date",
+    "salary_amount_pesewas" integer,
+    "salary_frequency" "text",
+    "live_in" boolean DEFAULT false NOT NULL,
+    "status" "text" DEFAULT 'active'::"text" NOT NULL,
+    "invitation_status" "text" DEFAULT 'not_sent'::"text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "household_workers_first_name_check" CHECK (("btrim"("first_name") <> ''::"text")),
+    CONSTRAINT "household_workers_invitation_status_check" CHECK (("invitation_status" = ANY (ARRAY['not_sent'::"text", 'pending'::"text", 'accepted'::"text", 'expired'::"text", 'revoked'::"text"]))),
+    CONSTRAINT "household_workers_phone_check" CHECK (("btrim"("phone") <> ''::"text")),
+    CONSTRAINT "household_workers_role_check" CHECK ((("role" IS NULL) OR ("role" = ANY (ARRAY['househelp'::"text", 'nanny'::"text", 'cleaner'::"text", 'elder_caregiver'::"text", 'cook'::"text", 'driver'::"text", 'gardener'::"text"])))),
+    CONSTRAINT "household_workers_salary_amount_pesewas_check" CHECK ((("salary_amount_pesewas" IS NULL) OR ("salary_amount_pesewas" >= 0))),
+    CONSTRAINT "household_workers_salary_frequency_check" CHECK ((("salary_frequency" IS NULL) OR ("salary_frequency" = ANY (ARRAY['hourly'::"text", 'daily'::"text", 'weekly'::"text", 'monthly'::"text"])))),
+    CONSTRAINT "household_workers_source_check" CHECK (("source" = ANY (ARRAY['instaclean_placement'::"text", 'customer_invited'::"text"]))),
+    CONSTRAINT "household_workers_source_links_check" CHECK ((("source" = 'instaclean_placement'::"text") OR (("source" = 'customer_invited'::"text") AND ("placement_request_id" IS NULL) AND ("placement_match_id" IS NULL)))),
+    CONSTRAINT "household_workers_status_check" CHECK (("status" = ANY (ARRAY['active'::"text", 'inactive'::"text", 'terminated'::"text"])))
+);
+
+
+ALTER TABLE "public"."household_workers" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."inbound_messages" (
     "id" bigint NOT NULL,
     "from" "text",
@@ -30313,6 +30699,91 @@ CREATE TABLE IF NOT EXISTS "public"."payout_recipient_audit" (
 
 
 ALTER TABLE "public"."payout_recipient_audit" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."placement_candidate_profiles" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "placement_opt_in" boolean DEFAULT false NOT NULL,
+    "placement_status" "text" DEFAULT 'inactive'::"text" NOT NULL,
+    "desired_roles" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
+    "living_arrangements" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
+    "employment_types" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
+    "expected_salary_min_pesewas" integer,
+    "expected_salary_max_pesewas" integer,
+    "salary_frequency" "text",
+    "preferred_languages" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
+    "years_experience" integer,
+    "available_from" "date",
+    "bio" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "placement_candidate_profiles_desired_roles_check" CHECK (("desired_roles" <@ ARRAY['househelp'::"text", 'nanny'::"text", 'cleaner'::"text", 'elder_caregiver'::"text", 'cook'::"text", 'driver'::"text", 'gardener'::"text"])),
+    CONSTRAINT "placement_candidate_profiles_employment_types_check" CHECK (("employment_types" <@ ARRAY['full_time'::"text", 'part_time'::"text", 'flexible'::"text"])),
+    CONSTRAINT "placement_candidate_profiles_expected_salary_max_pesewas_check" CHECK ((("expected_salary_max_pesewas" IS NULL) OR ("expected_salary_max_pesewas" >= 0))),
+    CONSTRAINT "placement_candidate_profiles_expected_salary_min_pesewas_check" CHECK ((("expected_salary_min_pesewas" IS NULL) OR ("expected_salary_min_pesewas" >= 0))),
+    CONSTRAINT "placement_candidate_profiles_living_arrangements_check" CHECK (("living_arrangements" <@ ARRAY['live_in'::"text", 'live_out'::"text", 'flexible'::"text"])),
+    CONSTRAINT "placement_candidate_profiles_placement_status_check" CHECK (("placement_status" = ANY (ARRAY['inactive'::"text", 'available'::"text", 'paused'::"text"]))),
+    CONSTRAINT "placement_candidate_profiles_salary_frequency_check" CHECK ((("salary_frequency" IS NULL) OR ("salary_frequency" = ANY (ARRAY['hourly'::"text", 'daily'::"text", 'weekly'::"text", 'monthly'::"text"])))),
+    CONSTRAINT "placement_candidate_profiles_salary_range_check" CHECK ((("expected_salary_min_pesewas" IS NULL) OR ("expected_salary_max_pesewas" IS NULL) OR ("expected_salary_min_pesewas" <= "expected_salary_max_pesewas"))),
+    CONSTRAINT "placement_candidate_profiles_years_experience_check" CHECK ((("years_experience" IS NULL) OR (("years_experience" >= 0) AND ("years_experience" <= 80))))
+);
+
+
+ALTER TABLE "public"."placement_candidate_profiles" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."placement_matches" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "placement_request_id" "uuid" NOT NULL,
+    "candidate_user_id" "uuid" NOT NULL,
+    "status" "text" DEFAULT 'suggested'::"text" NOT NULL,
+    "match_score" integer,
+    "admin_notes" "text",
+    "customer_visible_note" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "placement_matches_match_score_check" CHECK ((("match_score" IS NULL) OR (("match_score" >= 0) AND ("match_score" <= 100)))),
+    CONSTRAINT "placement_matches_status_check" CHECK (("status" = ANY (ARRAY['suggested'::"text", 'selected'::"text", 'rejected'::"text", 'cancelled'::"text", 'hired'::"text"])))
+);
+
+
+ALTER TABLE "public"."placement_matches" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."placement_requests" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "customer_id" "uuid" NOT NULL,
+    "status" "text" DEFAULT 'submitted'::"text" NOT NULL,
+    "role" "text" NOT NULL,
+    "living_arrangement" "text" DEFAULT 'flexible'::"text" NOT NULL,
+    "employment_type" "text" DEFAULT 'flexible'::"text" NOT NULL,
+    "desired_start_date" "date",
+    "salary_min_pesewas" integer,
+    "salary_max_pesewas" integer,
+    "salary_frequency" "text",
+    "household_address_snapshot" "text" NOT NULL,
+    "latitude" double precision,
+    "longitude" double precision,
+    "requirements" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "notes" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "placement_requests_employment_type_check" CHECK (("employment_type" = ANY (ARRAY['full_time'::"text", 'part_time'::"text", 'flexible'::"text"]))),
+    CONSTRAINT "placement_requests_latitude_check" CHECK ((("latitude" IS NULL) OR (("latitude" >= ('-90'::integer)::double precision) AND ("latitude" <= (90)::double precision)))),
+    CONSTRAINT "placement_requests_living_arrangement_check" CHECK (("living_arrangement" = ANY (ARRAY['live_in'::"text", 'live_out'::"text", 'flexible'::"text"]))),
+    CONSTRAINT "placement_requests_longitude_check" CHECK ((("longitude" IS NULL) OR (("longitude" >= ('-180'::integer)::double precision) AND ("longitude" <= (180)::double precision)))),
+    CONSTRAINT "placement_requests_requirements_check" CHECK (("jsonb_typeof"("requirements") = 'object'::"text")),
+    CONSTRAINT "placement_requests_role_check" CHECK (("role" = ANY (ARRAY['househelp'::"text", 'nanny'::"text", 'cleaner'::"text", 'elder_caregiver'::"text", 'cook'::"text", 'driver'::"text", 'gardener'::"text"]))),
+    CONSTRAINT "placement_requests_salary_frequency_check" CHECK ((("salary_frequency" IS NULL) OR ("salary_frequency" = ANY (ARRAY['hourly'::"text", 'daily'::"text", 'weekly'::"text", 'monthly'::"text"])))),
+    CONSTRAINT "placement_requests_salary_max_pesewas_check" CHECK ((("salary_max_pesewas" IS NULL) OR ("salary_max_pesewas" >= 0))),
+    CONSTRAINT "placement_requests_salary_min_pesewas_check" CHECK ((("salary_min_pesewas" IS NULL) OR ("salary_min_pesewas" >= 0))),
+    CONSTRAINT "placement_requests_salary_range_check" CHECK ((("salary_min_pesewas" IS NULL) OR ("salary_max_pesewas" IS NULL) OR ("salary_min_pesewas" <= "salary_max_pesewas"))),
+    CONSTRAINT "placement_requests_status_check" CHECK (("status" = ANY (ARRAY['submitted'::"text", 'matching'::"text", 'shortlisted'::"text", 'placed'::"text", 'cancelled'::"text", 'expired'::"text"])))
+);
+
+
+ALTER TABLE "public"."placement_requests" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."platform_config" (
@@ -31640,6 +32111,11 @@ ALTER TABLE ONLY "public"."home_size_durations"
 
 
 
+ALTER TABLE ONLY "public"."household_workers"
+    ADD CONSTRAINT "household_workers_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."inbound_messages"
     ADD CONSTRAINT "inbound_messages_message_sid_key" UNIQUE ("message_sid");
 
@@ -31777,6 +32253,31 @@ ALTER TABLE ONLY "public"."payout_methods"
 
 ALTER TABLE ONLY "public"."payout_recipient_audit"
     ADD CONSTRAINT "payout_recipient_audit_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."placement_candidate_profiles"
+    ADD CONSTRAINT "placement_candidate_profiles_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."placement_candidate_profiles"
+    ADD CONSTRAINT "placement_candidate_profiles_user_id_key" UNIQUE ("user_id");
+
+
+
+ALTER TABLE ONLY "public"."placement_matches"
+    ADD CONSTRAINT "placement_matches_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."placement_matches"
+    ADD CONSTRAINT "placement_matches_placement_request_id_candidate_user_id_key" UNIQUE ("placement_request_id", "candidate_user_id");
+
+
+
+ALTER TABLE ONLY "public"."placement_requests"
+    ADD CONSTRAINT "placement_requests_pkey" PRIMARY KEY ("id");
 
 
 
@@ -32412,6 +32913,22 @@ CREATE INDEX "geo_reverse_cache_created_at_idx" ON "public"."geo_reverse_cache" 
 
 
 CREATE INDEX "gha_staging_geom_idx" ON "public"."gha_staging" USING "gist" ("geom");
+
+
+
+CREATE UNIQUE INDEX "household_workers_owner_linked_user_uniq" ON "public"."household_workers" USING "btree" ("household_owner_id", "worker_user_id") WHERE ("worker_user_id" IS NOT NULL);
+
+
+
+CREATE INDEX "household_workers_owner_status_idx" ON "public"."household_workers" USING "btree" ("household_owner_id", "status", "created_at" DESC);
+
+
+
+CREATE UNIQUE INDEX "household_workers_owner_unlinked_phone_uniq" ON "public"."household_workers" USING "btree" ("household_owner_id", "phone") WHERE ("worker_user_id" IS NULL);
+
+
+
+CREATE INDEX "household_workers_worker_idx" ON "public"."household_workers" USING "btree" ("worker_user_id") WHERE ("worker_user_id" IS NOT NULL);
 
 
 
@@ -33111,6 +33628,30 @@ CREATE INDEX "payout_recipient_audit_user_id_created_at_idx" ON "public"."payout
 
 
 
+CREATE INDEX "placement_candidate_profiles_opt_in_status_idx" ON "public"."placement_candidate_profiles" USING "btree" ("placement_opt_in", "placement_status");
+
+
+
+CREATE INDEX "placement_candidate_profiles_roles_gin_idx" ON "public"."placement_candidate_profiles" USING "gin" ("desired_roles");
+
+
+
+CREATE INDEX "placement_matches_candidate_idx" ON "public"."placement_matches" USING "btree" ("candidate_user_id");
+
+
+
+CREATE INDEX "placement_matches_request_status_idx" ON "public"."placement_matches" USING "btree" ("placement_request_id", "status");
+
+
+
+CREATE INDEX "placement_requests_customer_status_idx" ON "public"."placement_requests" USING "btree" ("customer_id", "status", "created_at" DESC);
+
+
+
+CREATE INDEX "placement_requests_status_updated_idx" ON "public"."placement_requests" USING "btree" ("status", "updated_at" DESC);
+
+
+
 CREATE UNIQUE INDEX "profiles_user_id_key" ON "public"."profiles" USING "btree" ("user_id");
 
 
@@ -33291,6 +33832,10 @@ CREATE OR REPLACE TRIGGER "bookings_validate_turnover_fields" BEFORE INSERT OR U
 
 
 
+CREATE OR REPLACE TRIGGER "cleaner_data_admin_state_guard" BEFORE UPDATE OF "verified", "status" ON "public"."cleaner_data" FOR EACH ROW EXECUTE FUNCTION "public"."guard_cleaner_data_admin_state"();
+
+
+
 CREATE OR REPLACE TRIGGER "cleaner_teams_set_normalized_trg" BEFORE INSERT OR UPDATE OF "company_name" ON "public"."cleaner_teams" FOR EACH ROW EXECUTE FUNCTION "public"."cleaner_teams_set_normalized"();
 
 
@@ -33307,6 +33852,10 @@ CREATE OR REPLACE TRIGGER "geo_reverse_cache_set_updated_at" BEFORE UPDATE ON "p
 
 
 
+CREATE OR REPLACE TRIGGER "household_workers_set_updated_at" BEFORE UPDATE ON "public"."household_workers" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
 CREATE OR REPLACE TRIGGER "payout_methods_acquire_user_lock" BEFORE INSERT OR DELETE OR UPDATE ON "public"."payout_methods" FOR EACH ROW EXECUTE FUNCTION "public"."_payout_methods_acquire_user_lock_trigger"();
 
 
@@ -33316,6 +33865,18 @@ COMMENT ON TRIGGER "payout_methods_acquire_user_lock" ON "public"."payout_method
 
 
 CREATE OR REPLACE TRIGGER "payout_methods_touch_updated_at" BEFORE UPDATE ON "public"."payout_methods" FOR EACH ROW EXECUTE FUNCTION "public"."touch_payout_methods_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "placement_candidate_profiles_set_updated_at" BEFORE UPDATE ON "public"."placement_candidate_profiles" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "placement_matches_set_updated_at" BEFORE UPDATE ON "public"."placement_matches" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "placement_requests_set_updated_at" BEFORE UPDATE ON "public"."placement_requests" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
 
 
 
@@ -33882,6 +34443,26 @@ ALTER TABLE ONLY "public"."feedback"
 
 
 
+ALTER TABLE ONLY "public"."household_workers"
+    ADD CONSTRAINT "household_workers_household_owner_id_fkey" FOREIGN KEY ("household_owner_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."household_workers"
+    ADD CONSTRAINT "household_workers_placement_match_id_fkey" FOREIGN KEY ("placement_match_id") REFERENCES "public"."placement_matches"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."household_workers"
+    ADD CONSTRAINT "household_workers_placement_request_id_fkey" FOREIGN KEY ("placement_request_id") REFERENCES "public"."placement_requests"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."household_workers"
+    ADD CONSTRAINT "household_workers_worker_user_id_fkey" FOREIGN KEY ("worker_user_id") REFERENCES "public"."users"("id") ON DELETE SET NULL;
+
+
+
 ALTER TABLE ONLY "public"."job_offers"
     ADD CONSTRAINT "job_offers_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
@@ -33979,6 +34560,26 @@ ALTER TABLE ONLY "public"."payout_methods"
 
 ALTER TABLE ONLY "public"."payout_recipient_audit"
     ADD CONSTRAINT "payout_recipient_audit_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."placement_candidate_profiles"
+    ADD CONSTRAINT "placement_candidate_profiles_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."placement_matches"
+    ADD CONSTRAINT "placement_matches_candidate_user_id_fkey" FOREIGN KEY ("candidate_user_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."placement_matches"
+    ADD CONSTRAINT "placement_matches_placement_request_id_fkey" FOREIGN KEY ("placement_request_id") REFERENCES "public"."placement_requests"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."placement_requests"
+    ADD CONSTRAINT "placement_requests_customer_id_fkey" FOREIGN KEY ("customer_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -35078,6 +35679,17 @@ ALTER TABLE "public"."gha_staging" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."home_size_durations" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."household_workers" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "household_workers_admin_all" ON "public"."household_workers" TO "authenticated" USING ("public"."has_role"('admin'::"text")) WITH CHECK ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "household_workers_customer_select_own" ON "public"."household_workers" FOR SELECT TO "authenticated" USING (("household_owner_id" = "auth"."uid"()));
+
+
+
 ALTER TABLE "public"."inbound_messages" ENABLE ROW LEVEL SECURITY;
 
 
@@ -35212,6 +35824,51 @@ CREATE POLICY "payout_methods_owner_update" ON "public"."payout_methods" FOR UPD
 
 
 ALTER TABLE "public"."payout_recipient_audit" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."placement_candidate_profiles" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "placement_candidate_profiles_admin_all" ON "public"."placement_candidate_profiles" TO "authenticated" USING ("public"."has_role"('admin'::"text")) WITH CHECK ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "placement_candidate_profiles_owner_insert" ON "public"."placement_candidate_profiles" FOR INSERT TO "authenticated" WITH CHECK ((("user_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."cleaner_data" "cd"
+  WHERE (("cd"."user_id" = "auth"."uid"()) AND ("cd"."verified" = true))))));
+
+
+
+CREATE POLICY "placement_candidate_profiles_owner_select" ON "public"."placement_candidate_profiles" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "placement_candidate_profiles_owner_update" ON "public"."placement_candidate_profiles" FOR UPDATE TO "authenticated" USING (("user_id" = "auth"."uid"())) WITH CHECK ((("user_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."cleaner_data" "cd"
+  WHERE (("cd"."user_id" = "auth"."uid"()) AND ("cd"."verified" = true))))));
+
+
+
+ALTER TABLE "public"."placement_matches" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "placement_matches_admin_all" ON "public"."placement_matches" TO "authenticated" USING ("public"."has_role"('admin'::"text")) WITH CHECK ("public"."has_role"('admin'::"text"));
+
+
+
+ALTER TABLE "public"."placement_requests" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "placement_requests_admin_all" ON "public"."placement_requests" TO "authenticated" USING ("public"."has_role"('admin'::"text")) WITH CHECK ("public"."has_role"('admin'::"text"));
+
+
+
+CREATE POLICY "placement_requests_customer_insert_submitted" ON "public"."placement_requests" FOR INSERT TO "authenticated" WITH CHECK ((("customer_id" = "auth"."uid"()) AND ("status" = 'submitted'::"text")));
+
+
+
+CREATE POLICY "placement_requests_customer_select_own" ON "public"."placement_requests" FOR SELECT TO "authenticated" USING (("customer_id" = "auth"."uid"()));
+
 
 
 ALTER TABLE "public"."platform_config" ENABLE ROW LEVEL SECURITY;
@@ -38154,6 +38811,16 @@ GRANT ALL ON FUNCTION "public"."accept_preferred_cleaner_invite"("p_token" "uuid
 
 REVOKE ALL ON FUNCTION "public"."add_cleaner_record"("p_user_id" "uuid", "p_name" "text", "p_bio" "text", "p_avatar_url" "text", "p_status" "text", "p_verified" boolean) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."add_cleaner_record"("p_user_id" "uuid", "p_name" "text", "p_bio" "text", "p_avatar_url" "text", "p_status" "text", "p_verified" boolean) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."add_customer_invited_household_worker"("p_first_name" "text", "p_last_name" "text", "p_phone" "text", "p_email" "text", "p_role" "text", "p_start_date" "date", "p_live_in" boolean) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."add_customer_invited_household_worker"("p_first_name" "text", "p_last_name" "text", "p_phone" "text", "p_email" "text", "p_role" "text", "p_start_date" "date", "p_live_in" boolean) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."add_customer_invited_household_worker"("p_household_owner_id" "uuid", "p_first_name" "text", "p_last_name" "text", "p_phone" "text", "p_email" "text", "p_role" "text", "p_start_date" "date", "p_live_in" boolean) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."add_customer_invited_household_worker"("p_household_owner_id" "uuid", "p_first_name" "text", "p_last_name" "text", "p_phone" "text", "p_email" "text", "p_role" "text", "p_start_date" "date", "p_live_in" boolean) TO "service_role";
 
 
 
@@ -43412,6 +44079,12 @@ GRANT ALL ON FUNCTION "public"."guard_booking_uber_transportation_snapshot"() TO
 
 
 
+GRANT ALL ON FUNCTION "public"."guard_cleaner_data_admin_state"() TO "anon";
+GRANT ALL ON FUNCTION "public"."guard_cleaner_data_admin_state"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."guard_cleaner_data_admin_state"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."handle_job_completion"() TO "anon";
 GRANT ALL ON FUNCTION "public"."handle_job_completion"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."handle_job_completion"() TO "service_role";
@@ -45113,6 +45786,11 @@ GRANT ALL ON FUNCTION "public"."hasnt_view"("name", "name", "text") TO "postgres
 GRANT ALL ON FUNCTION "public"."hasnt_view"("name", "name", "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."hasnt_view"("name", "name", "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."hasnt_view"("name", "name", "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."hire_placement_match"("p_match_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."hire_placement_match"("p_match_id" "uuid") TO "service_role";
 
 
 
@@ -53453,6 +54131,10 @@ GRANT ALL ON TABLE "public"."home_size_durations" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."household_workers" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."inbound_messages" TO "anon";
 GRANT ALL ON TABLE "public"."inbound_messages" TO "authenticated";
 GRANT ALL ON TABLE "public"."inbound_messages" TO "service_role";
@@ -53560,6 +54242,18 @@ GRANT ALL ON TABLE "public"."payout_methods" TO "service_role";
 GRANT ALL ON TABLE "public"."payout_recipient_audit" TO "anon";
 GRANT ALL ON TABLE "public"."payout_recipient_audit" TO "authenticated";
 GRANT ALL ON TABLE "public"."payout_recipient_audit" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."placement_candidate_profiles" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."placement_matches" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."placement_requests" TO "service_role";
 
 
 
