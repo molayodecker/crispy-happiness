@@ -177,7 +177,9 @@ CREATE TYPE "public"."service_category" AS ENUM (
     'airbnb',
     'quick_tasks',
     'caregiving',
-    'pet_care'
+    'pet_care',
+    'cooks',
+    'drivers'
 );
 
 
@@ -4290,6 +4292,45 @@ COMMENT ON FUNCTION "public"."assert_care_pet_service_bookable"("p_service_id" i
 
 
 
+CREATE OR REPLACE FUNCTION "public"."assert_cooks_drivers_service_bookable"("p_service_id" integer) RETURNS "void"
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_category public.service_category;
+BEGIN
+  IF p_service_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT st.category
+  INTO v_category
+  FROM public.service_types st
+  WHERE st.id = p_service_id;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF v_category IN (
+    'cooks'::public.service_category,
+    'drivers'::public.service_category
+  )
+  AND NOT public.is_cooks_drivers_booking_enabled() THEN
+    RAISE EXCEPTION 'This service is not available yet'
+      USING ERRCODE = 'P0001';
+  END IF;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."assert_cooks_drivers_service_bookable"("p_service_id" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."assert_cooks_drivers_service_bookable"("p_service_id" integer) IS 'Rejects cooks/drivers service IDs while COOKS_DRIVERS_BOOKING is off.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") RETURNS "void"
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -6030,6 +6071,30 @@ $$;
 
 
 ALTER FUNCTION "public"."capture_booking_payment_split_snapshot"("p_booking_id" "uuid", "p_amount_minor" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."care_request_allows_interview_chat"("p_care_request_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.care_requests r
+    INNER JOIN public.care_request_matches m
+      ON m.care_request_id = r.id
+     AND m.cleaner_id = p_cleaner_id
+    WHERE r.id = p_care_request_id
+      AND r.customer_id = p_customer_id
+      AND r.status IN ('submitted', 'matching', 'interviewing')
+  );
+$$;
+
+
+ALTER FUNCTION "public"."care_request_allows_interview_chat"("p_care_request_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."care_request_allows_interview_chat"("p_care_request_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") IS 'True when this customer/caregiver pair may interview on a live care_request.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."cascade_cancel_pending_subscription_after_booking_cancel"() RETURNS "trigger"
@@ -8946,6 +9011,7 @@ BEGIN
 
   PERFORM public.assert_care_pet_service_bookable(p_service_id);
   PERFORM public.assert_airbnb_quick_tasks_service_bookable(p_service_id);
+  PERFORM public.assert_cooks_drivers_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -9269,6 +9335,7 @@ BEGIN
 
   PERFORM public.assert_care_pet_service_bookable(p_service_id);
   PERFORM public.assert_airbnb_quick_tasks_service_bookable(p_service_id);
+  PERFORM public.assert_cooks_drivers_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -9611,6 +9678,7 @@ BEGIN
 
   PERFORM public.assert_care_pet_service_bookable(p_service_id);
   PERFORM public.assert_airbnb_quick_tasks_service_bookable(p_service_id);
+  PERFORM public.assert_cooks_drivers_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -11346,7 +11414,8 @@ CREATE TABLE IF NOT EXISTS "public"."conversations" (
     "last_message_at" timestamp with time zone DEFAULT "now"(),
     "metadata" "jsonb" DEFAULT '{}'::"jsonb",
     "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "care_request_id" "uuid"
 );
 
 
@@ -11361,6 +11430,7 @@ CREATE OR REPLACE FUNCTION "public"."conversation_row_public_json"("p_row" "publ
     'customer_id', p_row.customer_id,
     'cleaner_id', p_row.cleaner_id,
     'booking_id', p_row.booking_id,
+    'care_request_id', p_row.care_request_id,
     'last_message_at', p_row.last_message_at,
     'created_at', p_row.created_at,
     'updated_at', p_row.updated_at
@@ -11470,6 +11540,108 @@ $$;
 
 
 ALTER FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."create_direct_request"("p_category" "text", "p_service_slug" "text", "p_frequency" "text", "p_budget_amount_major" numeric, "p_budget_unit" "text", "p_budget_negotiable" boolean, "p_location_label" "text", "p_latitude" double precision, "p_longitude" double precision, "p_timezone_name" "text", "p_notes" "text", "p_details" "jsonb") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_id uuid;
+  v_category text := lower(btrim(coalesce(p_category, '')));
+  v_slug text := lower(btrim(coalesce(p_service_slug, '')));
+  v_frequency text := lower(btrim(coalesce(p_frequency, '')));
+  v_unit text := lower(btrim(coalesce(p_budget_unit, '')));
+  v_location text := btrim(coalesce(p_location_label, ''));
+  v_notes text := nullif(btrim(coalesce(p_notes, '')), '');
+  v_amount_minor integer;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF v_category NOT IN ('family_care', 'pet_care', 'driver') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_category');
+  END IF;
+
+  IF v_slug NOT IN (
+    'child_care', 'senior_care', 'pet_sitting', 'dog_walking', 'feeding_checkins',
+    'personal_driver', 'school_run', 'errands_pickup', 'event_driver', 'full_day_driver'
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_service');
+  END IF;
+
+  IF v_frequency NOT IN ('one_time', 'daily', 'weekly', 'monthly', 'custom') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_frequency');
+  END IF;
+
+  IF v_unit NOT IN ('per_job', 'per_visit', 'per_day', 'per_week', 'per_month') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_budget_unit');
+  END IF;
+
+  IF p_budget_amount_major IS NULL OR p_budget_amount_major < 1 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_budget');
+  END IF;
+
+  IF v_location = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_location');
+  END IF;
+
+  v_amount_minor := round(p_budget_amount_major * 100)::integer;
+
+  INSERT INTO public.care_requests (
+    customer_id,
+    care_kind,
+    specialty_slug,
+    category,
+    frequency,
+    recurrence,
+    location_label,
+    latitude,
+    longitude,
+    timezone_name,
+    notes,
+    details,
+    budget_amount_minor,
+    budget_unit,
+    budget_negotiable,
+    live_in_preference,
+    ages_label,
+    recipient_count,
+    duration_hours,
+    status
+  )
+  VALUES (
+    v_uid,
+    v_slug,
+    v_slug,
+    v_category,
+    v_frequency,
+    CASE WHEN v_frequency = 'one_time' THEN 'one_time' ELSE 'recurring' END,
+    v_location,
+    p_latitude,
+    p_longitude,
+    nullif(btrim(coalesce(p_timezone_name, '')), ''),
+    v_notes,
+    coalesce(p_details, '{}'::jsonb),
+    v_amount_minor,
+    v_unit,
+    coalesce(p_budget_negotiable, true),
+    'not_sure',
+    '',
+    1,
+    2,
+    'submitted'
+  )
+  RETURNING id INTO v_id;
+
+  RETURN jsonb_build_object('success', true, 'care_request_id', v_id);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."create_direct_request"("p_category" "text", "p_service_slug" "text", "p_frequency" "text", "p_budget_amount_major" numeric, "p_budget_unit" "text", "p_budget_negotiable" boolean, "p_location_label" "text", "p_latitude" double precision, "p_longitude" double precision, "p_timezone_name" "text", "p_notes" "text", "p_details" "jsonb") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_email" "text" DEFAULT NULL::"text", "p_invitee_phone_e164" "text" DEFAULT NULL::"text") RETURNS "jsonb"
@@ -12482,6 +12654,7 @@ CREATE OR REPLACE FUNCTION "public"."enforce_care_pet_booking_gate"() RETURNS "t
 BEGIN
   PERFORM public.assert_care_pet_service_bookable(NEW.service_id);
   PERFORM public.assert_airbnb_quick_tasks_service_bookable(NEW.service_id);
+  PERFORM public.assert_cooks_drivers_service_bookable(NEW.service_id);
   RETURN NEW;
 END;
 $$;
@@ -12490,7 +12663,7 @@ $$;
 ALTER FUNCTION "public"."enforce_care_pet_booking_gate"() OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."enforce_care_pet_booking_gate"() IS 'Blocks caregiving/pet_care (CARE_PET_BOOKING) and airbnb/quick_tasks (BOOK_NOW) bookings when gated off.';
+COMMENT ON FUNCTION "public"."enforce_care_pet_booking_gate"() IS 'Blocks caregiving/pet_care, airbnb/quick_tasks, and cooks/drivers bookings when gated off.';
 
 
 
@@ -16044,6 +16217,62 @@ $$;
 ALTER FUNCTION "public"."get_customer_booking_verification_requirement"("p_customer_id" "uuid", "p_booking_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."get_direct_request"("p_care_request_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.care_requests%ROWTYPE;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  SELECT *
+  INTO v_row
+  FROM public.care_requests
+  WHERE id = p_care_request_id;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF v_row.customer_id IS DISTINCT FROM v_uid
+     AND NOT EXISTS (
+       SELECT 1
+       FROM public.care_request_matches m
+       WHERE m.care_request_id = v_row.id
+         AND m.cleaner_id = v_uid
+     ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'request', jsonb_build_object(
+      'id', v_row.id,
+      'customer_id', v_row.customer_id,
+      'category', v_row.category,
+      'specialty_slug', v_row.specialty_slug,
+      'frequency', v_row.frequency,
+      'location_label', v_row.location_label,
+      'notes', v_row.notes,
+      'details', v_row.details,
+      'budget_amount_minor', v_row.budget_amount_minor,
+      'budget_unit', v_row.budget_unit,
+      'budget_negotiable', v_row.budget_negotiable,
+      'status', v_row.status,
+      'created_at', v_row.created_at
+    )
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_direct_request"("p_care_request_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."get_latest_paystack_reference_for_booking"("p_booking_id" "uuid") RETURNS "text"
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -16541,6 +16770,103 @@ ALTER FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uui
 
 COMMENT ON FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uuid") IS 'Atomically validates active booking contact and returns or creates the booked conversation for the current cleaner assignment.';
 
+
+
+CREATE OR REPLACE FUNCTION "public"."get_or_create_care_request_conversation"("p_care_request_id" "uuid", "p_cleaner_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.care_requests%ROWTYPE;
+  v_conv public.conversations%ROWTYPE;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_care_request_id IS NULL OR p_cleaner_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_ids');
+  END IF;
+
+  SELECT *
+  INTO v_row
+  FROM public.care_requests
+  WHERE id = p_care_request_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF v_uid IS DISTINCT FROM v_row.customer_id
+     AND v_uid IS DISTINCT FROM p_cleaner_id THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+  END IF;
+
+  IF NOT public.care_request_allows_interview_chat(
+    v_row.id,
+    v_row.customer_id,
+    p_cleaner_id
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_matched');
+  END IF;
+
+  SELECT *
+  INTO v_conv
+  FROM public.conversations
+  WHERE care_request_id = v_row.id
+    AND customer_id = v_row.customer_id
+    AND cleaner_id = p_cleaner_id
+  ORDER BY created_at ASC
+  LIMIT 1;
+
+  IF FOUND THEN
+    UPDATE public.care_requests
+    SET status = 'interviewing'
+    WHERE id = v_row.id
+      AND status IN ('submitted', 'matching');
+
+    RETURN jsonb_build_object(
+      'success', true,
+      'conversation', public.conversation_row_public_json(v_conv)
+    );
+  END IF;
+
+  BEGIN
+    INSERT INTO public.conversations (customer_id, cleaner_id, booking_id, care_request_id)
+    VALUES (v_row.customer_id, p_cleaner_id, NULL, v_row.id)
+    RETURNING * INTO v_conv;
+  EXCEPTION
+    WHEN unique_violation THEN
+      SELECT *
+      INTO v_conv
+      FROM public.conversations
+      WHERE care_request_id = v_row.id
+        AND customer_id = v_row.customer_id
+        AND cleaner_id = p_cleaner_id
+      ORDER BY created_at ASC
+      LIMIT 1;
+
+      IF NOT FOUND THEN
+        RETURN jsonb_build_object('success', false, 'error', 'unavailable');
+      END IF;
+  END;
+
+  UPDATE public.care_requests
+  SET status = 'interviewing'
+  WHERE id = v_row.id
+    AND status IN ('submitted', 'matching');
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'conversation', public.conversation_row_public_json(v_conv)
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_or_create_care_request_conversation"("p_care_request_id" "uuid", "p_cleaner_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_own_booking_voucher_identity"("p_booking_id" "uuid") RETURNS "jsonb"
@@ -17047,6 +17373,8 @@ BEGIN
         WHEN 'pet_care' THEN public.is_care_pet_catalog_visible()
         WHEN 'airbnb' THEN public.is_airbnb_catalog_visible()
         WHEN 'quick_tasks' THEN public.is_quick_tasks_catalog_visible()
+        WHEN 'cooks' THEN public.is_cooks_drivers_catalog_visible()
+        WHEN 'drivers' THEN public.is_cooks_drivers_catalog_visible()
         ELSE true
       END
     )
@@ -17292,9 +17620,10 @@ CREATE OR REPLACE FUNCTION "public"."get_verification_service_catalog"() RETURNS
     SET "search_path" TO 'public'
     AS $$
 DECLARE
-  -- Launch flags are global: always read the production channel row.
   v_pet_care_specialization boolean :=
     public.is_app_feature_enabled('PET_CARE_SPECIALIZATION', 'production');
+  v_cooks_drivers_specialization boolean :=
+    public.is_app_feature_enabled('COOKS_DRIVERS_SPECIALIZATION', 'production');
 BEGIN
   RETURN QUERY
   SELECT
@@ -17316,23 +17645,32 @@ BEGIN
    AND COALESCE(st.active, false) = true
    AND COALESCE(NULLIF(btrim(st.specialty_slug), ''), NULL) IS NOT NULL
   WHERE
-    -- Non-care / non-pet categories (cleaning, etc.)
     (
-      COALESCE(sc.slug, '') NOT IN ('caregiving', 'pet_care')
+      COALESCE(sc.slug, '') NOT IN ('caregiving', 'pet_care', 'cooks', 'drivers')
       AND st.category IS DISTINCT FROM 'caregiving'::public.service_category
       AND st.category IS DISTINCT FROM 'pet_care'::public.service_category
+      AND st.category IS DISTINCT FROM 'cooks'::public.service_category
+      AND st.category IS DISTINCT FROM 'drivers'::public.service_category
     )
-    -- Caregiving is always available to providers (matches mobile verification UI).
     OR (
       COALESCE(sc.slug, '') = 'caregiving'
       OR st.category = 'caregiving'::public.service_category
     )
-    -- Pet Care follows PET_CARE_SPECIALIZATION (production channel).
     OR (
       v_pet_care_specialization
       AND (
         COALESCE(sc.slug, '') = 'pet_care'
         OR st.category = 'pet_care'::public.service_category
+      )
+    )
+    OR (
+      v_cooks_drivers_specialization
+      AND (
+        COALESCE(sc.slug, '') IN ('cooks', 'drivers')
+        OR st.category IN (
+          'cooks'::public.service_category,
+          'drivers'::public.service_category
+        )
       )
     )
   ORDER BY sc.id, st.id;
@@ -17343,7 +17681,7 @@ $$;
 ALTER FUNCTION "public"."get_verification_service_catalog"() OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."get_verification_service_catalog"() IS 'Verification services catalog. Caregiving is always included; Pet Care follows PET_CARE_SPECIALIZATION (production). Independent of CARE_PET_BOOK_NOW.';
+COMMENT ON FUNCTION "public"."get_verification_service_catalog"() IS 'Verification services catalog. Caregiving is always included; Pet Care follows PET_CARE_SPECIALIZATION; Cooks/Drivers follow COOKS_DRIVERS_SPECIALIZATION. Independent of Book Now flags.';
 
 
 
@@ -18309,6 +18647,36 @@ $$;
 ALTER FUNCTION "public"."is_co_cleaner_team_member"("p_user_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."is_cooks_drivers_booking_enabled"() RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT public.is_app_feature_enabled('COOKS_DRIVERS_BOOKING', 'production');
+$$;
+
+
+ALTER FUNCTION "public"."is_cooks_drivers_booking_enabled"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."is_cooks_drivers_booking_enabled"() IS 'True when COOKS_DRIVERS_BOOKING is enabled on production (pricing/booking lock).';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."is_cooks_drivers_catalog_visible"() RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT public.is_app_feature_enabled('COOKS_DRIVERS_BOOK_NOW', 'production');
+$$;
+
+
+ALTER FUNCTION "public"."is_cooks_drivers_catalog_visible"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."is_cooks_drivers_catalog_visible"() IS 'True when COOKS_DRIVERS_BOOK_NOW is enabled on production.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."is_location_in_active_service_area"("p_lat" double precision, "p_lng" double precision) RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public', 'pg_temp'
@@ -18701,6 +19069,38 @@ $$;
 
 
 ALTER FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."list_direct_requests_for_worker"() RETURNS "jsonb"
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT jsonb_build_object(
+    'success', true,
+    'requests', coalesce((
+      SELECT jsonb_agg(jsonb_build_object(
+        'id', r.id,
+        'specialty_slug', r.specialty_slug,
+        'category', r.category,
+        'frequency', r.frequency,
+        'location_label', r.location_label,
+        'budget_amount_minor', r.budget_amount_minor,
+        'budget_unit', r.budget_unit,
+        'budget_negotiable', r.budget_negotiable,
+        'status', r.status,
+        'created_at', r.created_at
+      ) ORDER BY r.created_at DESC)
+      FROM public.care_requests r
+      INNER JOIN public.care_request_matches m
+        ON m.care_request_id = r.id
+       AND m.cleaner_id = auth.uid()
+      WHERE r.status IN ('submitted', 'matching', 'interviewing')
+    ), '[]'::jsonb)
+  );
+$$;
+
+
+ALTER FUNCTION "public"."list_direct_requests_for_worker"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."list_orphaned_quick_task_uploads"("p_older_than" interval DEFAULT '24:00:00'::interval, "p_limit" integer DEFAULT 200) RETURNS "jsonb"
@@ -23652,6 +24052,99 @@ $$;
 ALTER FUNCTION "public"."resolve_cleaner_payout_subunit_from_booking"("p_cleaner_earnings_minor" integer, "p_final_amount_minor" integer, "p_total_price" numeric, "p_platform_fee" numeric, "p_booking_cover" boolean, "p_booking_cover_amount" numeric, "p_core_amount_minor" integer) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."respond_to_care_request"("p_care_request_id" "uuid", "p_offer_kind" "text", "p_amount_major" numeric, "p_note" "text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_kind text := lower(btrim(coalesce(p_offer_kind, '')));
+  v_row public.care_requests%ROWTYPE;
+  v_amount_minor integer;
+  v_unit text;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF v_kind NOT IN ('accept', 'counter') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_offer_kind');
+  END IF;
+
+  SELECT *
+  INTO v_row
+  FROM public.care_requests
+  WHERE id = p_care_request_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.care_request_matches m
+    WHERE m.care_request_id = v_row.id
+      AND m.cleaner_id = v_uid
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_matched');
+  END IF;
+
+  IF v_row.status NOT IN ('submitted', 'matching', 'interviewing') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_open');
+  END IF;
+
+  v_unit := coalesce(v_row.budget_unit, 'per_job');
+
+  IF v_kind = 'accept' THEN
+    v_amount_minor := coalesce(v_row.budget_amount_minor, 0);
+    IF v_amount_minor <= 0 THEN
+      RETURN jsonb_build_object('success', false, 'error', 'missing_budget');
+    END IF;
+  ELSE
+    IF p_amount_major IS NULL OR p_amount_major < 1 THEN
+      RETURN jsonb_build_object('success', false, 'error', 'invalid_budget');
+    END IF;
+    v_amount_minor := round(p_amount_major * 100)::integer;
+  END IF;
+
+  INSERT INTO public.care_request_offers (
+    care_request_id,
+    cleaner_id,
+    offer_kind,
+    amount_minor,
+    budget_unit,
+    note
+  )
+  VALUES (
+    v_row.id,
+    v_uid,
+    v_kind,
+    v_amount_minor,
+    v_unit,
+    nullif(btrim(coalesce(p_note, '')), '')
+  )
+  ON CONFLICT (care_request_id, cleaner_id) DO UPDATE
+  SET
+    offer_kind = EXCLUDED.offer_kind,
+    amount_minor = EXCLUDED.amount_minor,
+    budget_unit = EXCLUDED.budget_unit,
+    note = EXCLUDED.note,
+    created_at = timezone('utc', now());
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'offer_kind', v_kind,
+    'amount_minor', v_amount_minor,
+    'budget_unit', v_unit
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."respond_to_care_request"("p_care_request_id" "uuid", "p_offer_kind" "text", "p_amount_major" numeric, "p_note" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."retry_dispatch_gated_direct_assignments"() RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -23928,6 +24421,61 @@ $$;
 
 
 ALTER FUNCTION "public"."sanitize_cleaner_search_query"("p_search_query" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."save_care_request_matches"("p_care_request_id" "uuid", "p_cleaner_ids" "uuid"[]) RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_ids uuid[] := coalesce(p_cleaner_ids, ARRAY[]::uuid[]);
+  v_cleaner uuid;
+  v_rank integer := 0;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.care_requests r
+    WHERE r.id = p_care_request_id
+      AND r.customer_id = v_uid
+      AND r.status IN ('submitted', 'matching', 'interviewing')
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  DELETE FROM public.care_request_matches
+  WHERE care_request_id = p_care_request_id;
+
+  FOREACH v_cleaner IN ARRAY v_ids
+  LOOP
+    IF v_cleaner IS NULL THEN
+      CONTINUE;
+    END IF;
+    v_rank := v_rank + 1;
+    INSERT INTO public.care_request_matches (care_request_id, cleaner_id, rank)
+    VALUES (p_care_request_id, v_cleaner, v_rank)
+    ON CONFLICT (care_request_id, cleaner_id) DO UPDATE
+    SET rank = EXCLUDED.rank;
+  END LOOP;
+
+  UPDATE public.care_requests
+  SET status = CASE
+    WHEN cardinality(v_ids) > 0 THEN 'matching'
+    ELSE status
+  END
+  WHERE id = p_care_request_id
+    AND customer_id = v_uid;
+
+  RETURN jsonb_build_object('success', true, 'match_count', v_rank);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."save_care_request_matches"("p_care_request_id" "uuid", "p_cleaner_ids" "uuid"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."save_property_information"("p_property_id" "uuid", "p_trash_notes" "text" DEFAULT NULL::"text", "p_supplies_notes" "text" DEFAULT NULL::"text", "p_other_notes" "text" DEFAULT NULL::"text", "p_access_notes" "text" DEFAULT NULL::"text", "p_wifi_network" "text" DEFAULT NULL::"text", "p_wifi_password" "text" DEFAULT NULL::"text", "p_parking_notes" "text" DEFAULT NULL::"text") RETURNS "jsonb"
@@ -24305,6 +24853,20 @@ $$;
 
 
 ALTER FUNCTION "public"."set_booking_timezone"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."set_care_requests_updated_at"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  NEW.updated_at := timezone('utc', now());
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."set_care_requests_updated_at"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."set_cleaner_assigned_at_for_hold"() RETURNS "trigger"
@@ -29335,6 +29897,84 @@ COMMENT ON CONSTRAINT "bookings_smart_scan_one_time_only_check" ON "public"."boo
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."care_request_matches" (
+    "care_request_id" "uuid" NOT NULL,
+    "cleaner_id" "uuid" NOT NULL,
+    "rank" integer,
+    "created_at" timestamp with time zone DEFAULT "timezone"('utc'::"text", "now"()) NOT NULL
+);
+
+
+ALTER TABLE "public"."care_request_matches" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."care_request_matches" IS 'Platform-ranked caregivers for a care_request. Interview chat is limited to this set.';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."care_request_offers" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "care_request_id" "uuid" NOT NULL,
+    "cleaner_id" "uuid" NOT NULL,
+    "offer_kind" "text" NOT NULL,
+    "amount_minor" integer NOT NULL,
+    "budget_unit" "text" NOT NULL,
+    "note" "text",
+    "created_at" timestamp with time zone DEFAULT "timezone"('utc'::"text", "now"()) NOT NULL,
+    CONSTRAINT "care_request_offers_amount_minor_check" CHECK (("amount_minor" > 0)),
+    CONSTRAINT "care_request_offers_budget_unit_check" CHECK (("budget_unit" = ANY (ARRAY['per_job'::"text", 'per_visit'::"text", 'per_day'::"text", 'per_week'::"text", 'per_month'::"text"]))),
+    CONSTRAINT "care_request_offers_offer_kind_check" CHECK (("offer_kind" = ANY (ARRAY['accept'::"text", 'counter'::"text"])))
+);
+
+
+ALTER TABLE "public"."care_request_offers" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."care_requests" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "customer_id" "uuid" NOT NULL,
+    "care_kind" "text" NOT NULL,
+    "specialty_slug" "text" NOT NULL,
+    "recurrence" "text" NOT NULL,
+    "scheduled_date" "date",
+    "start_time" time without time zone,
+    "duration_hours" numeric,
+    "location_label" "text" NOT NULL,
+    "latitude" double precision,
+    "longitude" double precision,
+    "timezone_name" "text",
+    "recipient_count" integer,
+    "ages_label" "text",
+    "live_in_preference" "text",
+    "help_types" "text"[] DEFAULT ARRAY[]::"text"[] NOT NULL,
+    "other_help" "text",
+    "notes" "text",
+    "status" "text" DEFAULT 'submitted'::"text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "timezone"('utc'::"text", "now"()) NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "timezone"('utc'::"text", "now"()) NOT NULL,
+    "category" "text" NOT NULL,
+    "frequency" "text" NOT NULL,
+    "budget_amount_minor" integer,
+    "budget_unit" "text",
+    "budget_negotiable" boolean DEFAULT true NOT NULL,
+    "details" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    CONSTRAINT "care_requests_budget_amount_check" CHECK ((("budget_amount_minor" IS NULL) OR ("budget_amount_minor" > 0))),
+    CONSTRAINT "care_requests_budget_unit_check" CHECK ((("budget_unit" IS NULL) OR ("budget_unit" = ANY (ARRAY['per_job'::"text", 'per_visit'::"text", 'per_day'::"text", 'per_week'::"text", 'per_month'::"text"])))),
+    CONSTRAINT "care_requests_category_check" CHECK (("category" = ANY (ARRAY['family_care'::"text", 'pet_care'::"text", 'driver'::"text"]))),
+    CONSTRAINT "care_requests_frequency_check" CHECK (("frequency" = ANY (ARRAY['one_time'::"text", 'daily'::"text", 'weekly'::"text", 'monthly'::"text", 'custom'::"text"]))),
+    CONSTRAINT "care_requests_kind_matches_slug" CHECK (("care_kind" = "specialty_slug")),
+    CONSTRAINT "care_requests_service_slug_check" CHECK (("specialty_slug" = ANY (ARRAY['child_care'::"text", 'senior_care'::"text", 'pet_sitting'::"text", 'dog_walking'::"text", 'feeding_checkins'::"text", 'personal_driver'::"text", 'school_run'::"text", 'errands_pickup'::"text", 'event_driver'::"text", 'full_day_driver'::"text"]))),
+    CONSTRAINT "care_requests_status_check" CHECK (("status" = ANY (ARRAY['submitted'::"text", 'matching'::"text", 'interviewing'::"text", 'booked'::"text", 'cancelled'::"text"])))
+);
+
+
+ALTER TABLE "public"."care_requests" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."care_requests" IS 'Instaclean Direct structured requests (Family Care, Pet Care, Driver). Workers accept or counter the customer budget before booking.';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."cleaner_application_drafts" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid" NOT NULL,
@@ -31983,6 +32623,26 @@ ALTER TABLE "public"."bookings"
 
 
 
+ALTER TABLE ONLY "public"."care_request_matches"
+    ADD CONSTRAINT "care_request_matches_pkey" PRIMARY KEY ("care_request_id", "cleaner_id");
+
+
+
+ALTER TABLE ONLY "public"."care_request_offers"
+    ADD CONSTRAINT "care_request_offers_care_request_id_cleaner_id_key" UNIQUE ("care_request_id", "cleaner_id");
+
+
+
+ALTER TABLE ONLY "public"."care_request_offers"
+    ADD CONSTRAINT "care_request_offers_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."care_requests"
+    ADD CONSTRAINT "care_requests_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."cleaner_application_drafts"
     ADD CONSTRAINT "cleaner_application_drafts_pkey" PRIMARY KEY ("id");
 
@@ -32876,6 +33536,10 @@ CREATE INDEX "bookings_schedule_group_id_idx" ON "public"."bookings" USING "btre
 
 
 
+CREATE INDEX "care_requests_customer_id_idx" ON "public"."care_requests" USING "btree" ("customer_id", "created_at" DESC);
+
+
+
 CREATE UNIQUE INDEX "cleaner_application_drafts_user_id_key" ON "public"."cleaner_application_drafts" USING "btree" ("user_id");
 
 
@@ -32969,6 +33633,10 @@ CREATE UNIQUE INDEX "co_cleaner_relationships_one_team_per_co_cleaner" ON "publi
 
 
 CREATE UNIQUE INDEX "conversations_booking_customer_cleaner_uniq" ON "public"."conversations" USING "btree" ("booking_id", "customer_id", "cleaner_id") WHERE ("booking_id" IS NOT NULL);
+
+
+
+CREATE UNIQUE INDEX "conversations_care_request_customer_cleaner_uniq" ON "public"."conversations" USING "btree" ("care_request_id", "customer_id", "cleaner_id") WHERE ("care_request_id" IS NOT NULL);
 
 
 
@@ -33944,6 +34612,10 @@ CREATE OR REPLACE TRIGGER "bookings_validate_turnover_fields" BEFORE INSERT OR U
 
 
 
+CREATE OR REPLACE TRIGGER "care_requests_set_updated_at" BEFORE UPDATE ON "public"."care_requests" FOR EACH ROW EXECUTE FUNCTION "public"."set_care_requests_updated_at"();
+
+
+
 CREATE OR REPLACE TRIGGER "cleaner_data_admin_state_guard" BEFORE UPDATE OF "verified", "status" ON "public"."cleaner_data" FOR EACH ROW EXECUTE FUNCTION "public"."guard_cleaner_data_admin_state"();
 
 
@@ -34335,6 +35007,31 @@ ALTER TABLE ONLY "public"."bookings"
 
 
 
+ALTER TABLE ONLY "public"."care_request_matches"
+    ADD CONSTRAINT "care_request_matches_care_request_id_fkey" FOREIGN KEY ("care_request_id") REFERENCES "public"."care_requests"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."care_request_matches"
+    ADD CONSTRAINT "care_request_matches_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "public"."cleaner_data"("user_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."care_request_offers"
+    ADD CONSTRAINT "care_request_offers_care_request_id_fkey" FOREIGN KEY ("care_request_id") REFERENCES "public"."care_requests"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."care_request_offers"
+    ADD CONSTRAINT "care_request_offers_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "public"."cleaner_data"("user_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."care_requests"
+    ADD CONSTRAINT "care_requests_customer_id_fkey" FOREIGN KEY ("customer_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."cleaner_application_drafts"
     ADD CONSTRAINT "cleaner_application_drafts_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
@@ -34457,6 +35154,11 @@ ALTER TABLE ONLY "public"."co_cleaner_relationships"
 
 ALTER TABLE ONLY "public"."conversations"
     ADD CONSTRAINT "conversations_booking_id_fkey" FOREIGN KEY ("booking_id") REFERENCES "public"."bookings"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."conversations"
+    ADD CONSTRAINT "conversations_care_request_id_fkey" FOREIGN KEY ("care_request_id") REFERENCES "public"."care_requests"("id");
 
 
 
@@ -35121,7 +35823,7 @@ CREATE POLICY "Everyone can view testimonials" ON "public"."testimonials" FOR SE
 
 
 
-CREATE POLICY "Insert_Own_Conversations" ON "public"."conversations" FOR INSERT TO "authenticated" WITH CHECK (((("auth"."uid"() = "customer_id") OR ("auth"."uid"() = "cleaner_id")) AND ("booking_id" IS NOT NULL) AND "public"."booking_allows_participant_contact"("booking_id", "customer_id", "cleaner_id")));
+CREATE POLICY "Insert_Own_Conversations" ON "public"."conversations" FOR INSERT TO "authenticated" WITH CHECK (((("auth"."uid"() = "customer_id") OR ("auth"."uid"() = "cleaner_id")) AND ("booking_id" IS NOT NULL) AND ("care_request_id" IS NULL) AND "public"."booking_allows_participant_contact"("booking_id", "customer_id", "cleaner_id")));
 
 
 
@@ -35143,7 +35845,7 @@ CREATE POLICY "Public read pricing_rules" ON "public"."pricing_rules" FOR SELECT
 
 CREATE POLICY "Send_Messages_In_Joined_Convos" ON "public"."messages" FOR INSERT TO "authenticated" WITH CHECK ((("sender_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
    FROM "public"."conversations" "c"
-  WHERE (("c"."id" = "messages"."conversation_id") AND (("c"."customer_id" = "auth"."uid"()) OR ("c"."cleaner_id" = "auth"."uid"())) AND ("c"."booking_id" IS NOT NULL) AND "public"."booking_allows_participant_contact"("c"."booking_id", "c"."customer_id", "c"."cleaner_id"))))));
+  WHERE (("c"."id" = "messages"."conversation_id") AND (("c"."customer_id" = "auth"."uid"()) OR ("c"."cleaner_id" = "auth"."uid"())) AND ((("c"."booking_id" IS NOT NULL) AND "public"."booking_allows_participant_contact"("c"."booking_id", "c"."customer_id", "c"."cleaner_id")) OR (("c"."care_request_id" IS NOT NULL) AND ("c"."booking_id" IS NULL) AND "public"."care_request_allows_interview_chat"("c"."care_request_id", "c"."customer_id", "c"."cleaner_id"))))))));
 
 
 
@@ -35413,6 +36115,8 @@ CASE COALESCE("slug", ''::"text")
     WHEN 'pet_care'::"text" THEN "public"."is_care_pet_catalog_visible"()
     WHEN 'airbnb'::"text" THEN "public"."is_airbnb_catalog_visible"()
     WHEN 'quick_tasks'::"text" THEN "public"."is_quick_tasks_catalog_visible"()
+    WHEN 'cooks'::"text" THEN "public"."is_cooks_drivers_catalog_visible"()
+    WHEN 'drivers'::"text" THEN "public"."is_cooks_drivers_catalog_visible"()
     ELSE true
 END);
 
@@ -35424,6 +36128,8 @@ CASE "category"
     WHEN 'pet_care'::"public"."service_category" THEN "public"."is_care_pet_catalog_visible"()
     WHEN 'airbnb'::"public"."service_category" THEN "public"."is_airbnb_catalog_visible"()
     WHEN 'quick_tasks'::"public"."service_category" THEN "public"."is_quick_tasks_catalog_visible"()
+    WHEN 'cooks'::"public"."service_category" THEN "public"."is_cooks_drivers_catalog_visible"()
+    WHEN 'drivers'::"public"."service_category" THEN "public"."is_cooks_drivers_catalog_visible"()
     ELSE true
 END);
 
@@ -35455,6 +36161,8 @@ CASE COALESCE("slug", ''::"text")
     WHEN 'pet_care'::"text" THEN "public"."is_care_pet_catalog_visible"()
     WHEN 'airbnb'::"text" THEN "public"."is_airbnb_catalog_visible"()
     WHEN 'quick_tasks'::"text" THEN "public"."is_quick_tasks_catalog_visible"()
+    WHEN 'cooks'::"text" THEN "public"."is_cooks_drivers_catalog_visible"()
+    WHEN 'drivers'::"text" THEN "public"."is_cooks_drivers_catalog_visible"()
     ELSE true
 END);
 
@@ -35466,6 +36174,8 @@ CASE "category"
     WHEN 'pet_care'::"public"."service_category" THEN "public"."is_care_pet_catalog_visible"()
     WHEN 'airbnb'::"public"."service_category" THEN "public"."is_airbnb_catalog_visible"()
     WHEN 'quick_tasks'::"public"."service_category" THEN "public"."is_quick_tasks_catalog_visible"()
+    WHEN 'cooks'::"public"."service_category" THEN "public"."is_cooks_drivers_catalog_visible"()
+    WHEN 'drivers'::"public"."service_category" THEN "public"."is_cooks_drivers_catalog_visible"()
     ELSE true
 END);
 
@@ -35583,6 +36293,33 @@ CREATE POLICY "bookings: insert own" ON "public"."bookings" FOR INSERT TO "authe
 
 
 CREATE POLICY "bookings: update own" ON "public"."bookings" FOR UPDATE TO "authenticated" USING ((("auth"."uid"() = "customer_id") OR ("auth"."uid"() = "cleaner_id") OR "public"."has_role"('admin'::"text"))) WITH CHECK ((("auth"."uid"() = "customer_id") OR ("auth"."uid"() = "cleaner_id") OR "public"."has_role"('admin'::"text")));
+
+
+
+ALTER TABLE "public"."care_request_matches" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "care_request_matches_select_participants" ON "public"."care_request_matches" FOR SELECT TO "authenticated" USING ((("cleaner_id" = "auth"."uid"()) OR (EXISTS ( SELECT 1
+   FROM "public"."care_requests" "r"
+  WHERE (("r"."id" = "care_request_matches"."care_request_id") AND ("r"."customer_id" = "auth"."uid"()))))));
+
+
+
+ALTER TABLE "public"."care_request_offers" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "care_request_offers_select_participants" ON "public"."care_request_offers" FOR SELECT TO "authenticated" USING ((("cleaner_id" = "auth"."uid"()) OR (EXISTS ( SELECT 1
+   FROM "public"."care_requests" "r"
+  WHERE (("r"."id" = "care_request_offers"."care_request_id") AND ("r"."customer_id" = "auth"."uid"()))))));
+
+
+
+ALTER TABLE "public"."care_requests" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "care_requests_select_own" ON "public"."care_requests" FOR SELECT TO "authenticated" USING ((("customer_id" = "auth"."uid"()) OR (EXISTS ( SELECT 1
+   FROM "public"."care_request_matches" "m"
+  WHERE (("m"."care_request_id" = "care_requests"."id") AND ("m"."cleaner_id" = "auth"."uid"()))))));
 
 
 
@@ -39130,6 +39867,13 @@ GRANT ALL ON FUNCTION "public"."assert_care_pet_service_bookable"("p_service_id"
 
 
 
+REVOKE ALL ON FUNCTION "public"."assert_cooks_drivers_service_bookable"("p_service_id" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."assert_cooks_drivers_service_bookable"("p_service_id" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."assert_cooks_drivers_service_bookable"("p_service_id" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."assert_cooks_drivers_service_bookable"("p_service_id" integer) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") TO "anon";
 GRANT ALL ON FUNCTION "public"."assert_quick_tasks_cleaner_eligible"("p_cleaner_id" "uuid", "p_customer_id" "uuid", "p_required_specialty_slugs" "jsonb") TO "authenticated";
@@ -39451,6 +40195,12 @@ REVOKE ALL ON FUNCTION "public"."capture_booking_payment_split_snapshot"("p_book
 GRANT ALL ON FUNCTION "public"."capture_booking_payment_split_snapshot"("p_booking_id" "uuid", "p_amount_minor" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."capture_booking_payment_split_snapshot"("p_booking_id" "uuid", "p_amount_minor" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."capture_booking_payment_split_snapshot"("p_booking_id" "uuid", "p_amount_minor" integer) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."care_request_allows_interview_chat"("p_care_request_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."care_request_allows_interview_chat"("p_care_request_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."care_request_allows_interview_chat"("p_care_request_id" "uuid", "p_customer_id" "uuid", "p_cleaner_id" "uuid") TO "service_role";
 
 
 
@@ -40610,6 +41360,12 @@ REVOKE ALL ON FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "te
 GRANT ALL ON FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."create_co_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."create_direct_request"("p_category" "text", "p_service_slug" "text", "p_frequency" "text", "p_budget_amount_major" numeric, "p_budget_unit" "text", "p_budget_negotiable" boolean, "p_location_label" "text", "p_latitude" double precision, "p_longitude" double precision, "p_timezone_name" "text", "p_notes" "text", "p_details" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."create_direct_request"("p_category" "text", "p_service_slug" "text", "p_frequency" "text", "p_budget_amount_major" numeric, "p_budget_unit" "text", "p_budget_negotiable" boolean, "p_location_label" "text", "p_latitude" double precision, "p_longitude" double precision, "p_timezone_name" "text", "p_notes" "text", "p_details" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_direct_request"("p_category" "text", "p_service_slug" "text", "p_frequency" "text", "p_budget_amount_major" numeric, "p_budget_unit" "text", "p_budget_negotiable" boolean, "p_location_label" "text", "p_latitude" double precision, "p_longitude" double precision, "p_timezone_name" "text", "p_notes" "text", "p_details" "jsonb") TO "service_role";
 
 
 
@@ -43976,6 +44732,12 @@ GRANT ALL ON FUNCTION "public"."get_customer_booking_verification_requirement"("
 
 
 
+REVOKE ALL ON FUNCTION "public"."get_direct_request"("p_care_request_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_direct_request"("p_care_request_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_direct_request"("p_care_request_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."get_latest_paystack_reference_for_booking"("p_booking_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_latest_paystack_reference_for_booking"("p_booking_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."get_latest_paystack_reference_for_booking"("p_booking_id" "uuid") TO "authenticated";
@@ -44025,6 +44787,12 @@ GRANT ALL ON FUNCTION "public"."get_nearby_available_cleaners"("p_latitude" doub
 REVOKE ALL ON FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_or_create_booking_conversation"("p_booking_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."get_or_create_care_request_conversation"("p_care_request_id" "uuid", "p_cleaner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_or_create_care_request_conversation"("p_care_request_id" "uuid", "p_cleaner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_or_create_care_request_conversation"("p_care_request_id" "uuid", "p_cleaner_id" "uuid") TO "service_role";
 
 
 
@@ -46392,6 +47160,20 @@ GRANT ALL ON FUNCTION "public"."is_contained_2d"("public"."geometry", "public"."
 
 
 
+REVOKE ALL ON FUNCTION "public"."is_cooks_drivers_booking_enabled"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_cooks_drivers_booking_enabled"() TO "anon";
+GRANT ALL ON FUNCTION "public"."is_cooks_drivers_booking_enabled"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_cooks_drivers_booking_enabled"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."is_cooks_drivers_catalog_visible"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_cooks_drivers_catalog_visible"() TO "anon";
+GRANT ALL ON FUNCTION "public"."is_cooks_drivers_catalog_visible"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_cooks_drivers_catalog_visible"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."is_definer"("name") TO "postgres";
 GRANT ALL ON FUNCTION "public"."is_definer"("name") TO "anon";
 GRANT ALL ON FUNCTION "public"."is_definer"("name") TO "authenticated";
@@ -47574,6 +48356,12 @@ REVOKE ALL ON FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" 
 GRANT ALL ON FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."list_direct_requests_for_worker"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_direct_requests_for_worker"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_direct_requests_for_worker"() TO "service_role";
 
 
 
@@ -49096,6 +49884,12 @@ GRANT ALL ON FUNCTION "public"."resolve_cleaner_payout_subunit_from_booking"("p_
 
 
 
+REVOKE ALL ON FUNCTION "public"."respond_to_care_request"("p_care_request_id" "uuid", "p_offer_kind" "text", "p_amount_major" numeric, "p_note" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."respond_to_care_request"("p_care_request_id" "uuid", "p_offer_kind" "text", "p_amount_major" numeric, "p_note" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."respond_to_care_request"("p_care_request_id" "uuid", "p_offer_kind" "text", "p_amount_major" numeric, "p_note" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."results_eq"("refcursor", "anyarray") TO "postgres";
 GRANT ALL ON FUNCTION "public"."results_eq"("refcursor", "anyarray") TO "anon";
 GRANT ALL ON FUNCTION "public"."results_eq"("refcursor", "anyarray") TO "authenticated";
@@ -49448,6 +50242,12 @@ GRANT ALL ON FUNCTION "public"."sanitize_cleaner_search_query"("p_search_query" 
 
 
 
+REVOKE ALL ON FUNCTION "public"."save_care_request_matches"("p_care_request_id" "uuid", "p_cleaner_ids" "uuid"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."save_care_request_matches"("p_care_request_id" "uuid", "p_cleaner_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."save_care_request_matches"("p_care_request_id" "uuid", "p_cleaner_ids" "uuid"[]) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."save_property_information"("p_property_id" "uuid", "p_trash_notes" "text", "p_supplies_notes" "text", "p_other_notes" "text", "p_access_notes" "text", "p_wifi_network" "text", "p_wifi_password" "text", "p_parking_notes" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."save_property_information"("p_property_id" "uuid", "p_trash_notes" "text", "p_supplies_notes" "text", "p_other_notes" "text", "p_access_notes" "text", "p_wifi_network" "text", "p_wifi_password" "text", "p_parking_notes" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."save_property_information"("p_property_id" "uuid", "p_trash_notes" "text", "p_supplies_notes" "text", "p_other_notes" "text", "p_access_notes" "text", "p_wifi_network" "text", "p_wifi_password" "text", "p_parking_notes" "text") TO "service_role";
@@ -49634,6 +50434,12 @@ GRANT ALL ON FUNCTION "public"."set_booking_paystack_reference_if_unpaid"("p_boo
 GRANT ALL ON FUNCTION "public"."set_booking_timezone"() TO "anon";
 GRANT ALL ON FUNCTION "public"."set_booking_timezone"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."set_booking_timezone"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."set_care_requests_updated_at"() TO "anon";
+GRANT ALL ON FUNCTION "public"."set_care_requests_updated_at"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_care_requests_updated_at"() TO "service_role";
 
 
 
@@ -53989,6 +54795,24 @@ GRANT ALL ON TABLE "public"."booking_timeline" TO "service_role";
 GRANT ALL ON TABLE "public"."bookings" TO "anon";
 GRANT ALL ON TABLE "public"."bookings" TO "authenticated";
 GRANT ALL ON TABLE "public"."bookings" TO "service_role";
+
+
+
+GRANT SELECT,REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."care_request_matches" TO "anon";
+GRANT SELECT,REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."care_request_matches" TO "authenticated";
+GRANT ALL ON TABLE "public"."care_request_matches" TO "service_role";
+
+
+
+GRANT SELECT,REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."care_request_offers" TO "anon";
+GRANT SELECT,REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."care_request_offers" TO "authenticated";
+GRANT ALL ON TABLE "public"."care_request_offers" TO "service_role";
+
+
+
+GRANT SELECT,REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."care_requests" TO "anon";
+GRANT SELECT,REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."care_requests" TO "authenticated";
+GRANT ALL ON TABLE "public"."care_requests" TO "service_role";
 
 
 

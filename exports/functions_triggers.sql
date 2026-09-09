@@ -8003,6 +8003,40 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.assert_cooks_drivers_service_bookable(p_service_id integer)
+ RETURNS void
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_category public.service_category;
+BEGIN
+  IF p_service_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT st.category
+  INTO v_category
+  FROM public.service_types st
+  WHERE st.id = p_service_id;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF v_category IN (
+    'cooks'::public.service_category,
+    'drivers'::public.service_category
+  )
+  AND NOT public.is_cooks_drivers_booking_enabled() THEN
+    RAISE EXCEPTION 'This service is not available yet'
+      USING ERRCODE = 'P0001';
+  END IF;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.assert_quick_tasks_cleaner_eligible(p_cleaner_id uuid, p_customer_id uuid, p_required_specialty_slugs jsonb)
  RETURNS void
  LANGUAGE plpgsql
@@ -9935,6 +9969,25 @@ BEGIN
     AND customer_id = v_customer_id
     AND payment_split_type IS NULL;
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.care_request_allows_interview_chat(p_care_request_id uuid, p_customer_id uuid, p_cleaner_id uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.care_requests r
+    INNER JOIN public.care_request_matches m
+      ON m.care_request_id = r.id
+     AND m.cleaner_id = p_cleaner_id
+    WHERE r.id = p_care_request_id
+      AND r.customer_id = p_customer_id
+      AND r.status IN ('submitted', 'matching', 'interviewing')
+  );
 $function$
 
 
@@ -14046,6 +14099,7 @@ BEGIN
 
   PERFORM public.assert_care_pet_service_bookable(p_service_id);
   PERFORM public.assert_airbnb_quick_tasks_service_bookable(p_service_id);
+  PERFORM public.assert_cooks_drivers_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -14368,6 +14422,7 @@ BEGIN
 
   PERFORM public.assert_care_pet_service_bookable(p_service_id);
   PERFORM public.assert_airbnb_quick_tasks_service_bookable(p_service_id);
+  PERFORM public.assert_cooks_drivers_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -14709,6 +14764,7 @@ BEGIN
 
   PERFORM public.assert_care_pet_service_bookable(p_service_id);
   PERFORM public.assert_airbnb_quick_tasks_service_bookable(p_service_id);
+  PERFORM public.assert_cooks_drivers_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -16433,6 +16489,7 @@ AS $function$
     'customer_id', p_row.customer_id,
     'cleaner_id', p_row.cleaner_id,
     'booking_id', p_row.booking_id,
+    'care_request_id', p_row.care_request_id,
     'last_message_at', p_row.last_message_at,
     'created_at', p_row.created_at,
     'updated_at', p_row.updated_at
@@ -16530,6 +16587,107 @@ BEGIN
     'invite_id', v_id,
     'expires_at', v_expires
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.create_direct_request(p_category text, p_service_slug text, p_frequency text, p_budget_amount_major numeric, p_budget_unit text, p_budget_negotiable boolean, p_location_label text, p_latitude double precision, p_longitude double precision, p_timezone_name text, p_notes text, p_details jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_id uuid;
+  v_category text := lower(btrim(coalesce(p_category, '')));
+  v_slug text := lower(btrim(coalesce(p_service_slug, '')));
+  v_frequency text := lower(btrim(coalesce(p_frequency, '')));
+  v_unit text := lower(btrim(coalesce(p_budget_unit, '')));
+  v_location text := btrim(coalesce(p_location_label, ''));
+  v_notes text := nullif(btrim(coalesce(p_notes, '')), '');
+  v_amount_minor integer;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF v_category NOT IN ('family_care', 'pet_care', 'driver') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_category');
+  END IF;
+
+  IF v_slug NOT IN (
+    'child_care', 'senior_care', 'pet_sitting', 'dog_walking', 'feeding_checkins',
+    'personal_driver', 'school_run', 'errands_pickup', 'event_driver', 'full_day_driver'
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_service');
+  END IF;
+
+  IF v_frequency NOT IN ('one_time', 'daily', 'weekly', 'monthly', 'custom') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_frequency');
+  END IF;
+
+  IF v_unit NOT IN ('per_job', 'per_visit', 'per_day', 'per_week', 'per_month') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_budget_unit');
+  END IF;
+
+  IF p_budget_amount_major IS NULL OR p_budget_amount_major < 1 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_budget');
+  END IF;
+
+  IF v_location = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_location');
+  END IF;
+
+  v_amount_minor := round(p_budget_amount_major * 100)::integer;
+
+  INSERT INTO public.care_requests (
+    customer_id,
+    care_kind,
+    specialty_slug,
+    category,
+    frequency,
+    recurrence,
+    location_label,
+    latitude,
+    longitude,
+    timezone_name,
+    notes,
+    details,
+    budget_amount_minor,
+    budget_unit,
+    budget_negotiable,
+    live_in_preference,
+    ages_label,
+    recipient_count,
+    duration_hours,
+    status
+  )
+  VALUES (
+    v_uid,
+    v_slug,
+    v_slug,
+    v_category,
+    v_frequency,
+    CASE WHEN v_frequency = 'one_time' THEN 'one_time' ELSE 'recurring' END,
+    v_location,
+    p_latitude,
+    p_longitude,
+    nullif(btrim(coalesce(p_timezone_name, '')), ''),
+    v_notes,
+    coalesce(p_details, '{}'::jsonb),
+    v_amount_minor,
+    v_unit,
+    coalesce(p_budget_negotiable, true),
+    'not_sure',
+    '',
+    1,
+    2,
+    'submitted'
+  )
+  RETURNING id INTO v_id;
+
+  RETURN jsonb_build_object('success', true, 'care_request_id', v_id);
 END;
 $function$
 
@@ -18409,6 +18567,7 @@ AS $function$
 BEGIN
   PERFORM public.assert_care_pet_service_bookable(NEW.service_id);
   PERFORM public.assert_airbnb_quick_tasks_service_bookable(NEW.service_id);
+  PERFORM public.assert_cooks_drivers_service_bookable(NEW.service_id);
   RETURN NEW;
 END;
 $function$
@@ -24779,6 +24938,61 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.get_direct_request(p_care_request_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.care_requests%ROWTYPE;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  SELECT *
+  INTO v_row
+  FROM public.care_requests
+  WHERE id = p_care_request_id;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF v_row.customer_id IS DISTINCT FROM v_uid
+     AND NOT EXISTS (
+       SELECT 1
+       FROM public.care_request_matches m
+       WHERE m.care_request_id = v_row.id
+         AND m.cleaner_id = v_uid
+     ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'request', jsonb_build_object(
+      'id', v_row.id,
+      'customer_id', v_row.customer_id,
+      'category', v_row.category,
+      'specialty_slug', v_row.specialty_slug,
+      'frequency', v_row.frequency,
+      'location_label', v_row.location_label,
+      'notes', v_row.notes,
+      'details', v_row.details,
+      'budget_amount_minor', v_row.budget_amount_minor,
+      'budget_unit', v_row.budget_unit,
+      'budget_negotiable', v_row.budget_negotiable,
+      'status', v_row.status,
+      'created_at', v_row.created_at
+    )
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.get_latest_paystack_reference_for_booking(p_booking_id uuid)
  RETURNS text
  LANGUAGE plpgsql
@@ -25252,6 +25466,102 @@ BEGIN
         RETURN jsonb_build_object('success', false, 'error', 'unavailable');
       END IF;
   END;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'conversation', public.conversation_row_public_json(v_conv)
+  );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_or_create_care_request_conversation(p_care_request_id uuid, p_cleaner_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.care_requests%ROWTYPE;
+  v_conv public.conversations%ROWTYPE;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_care_request_id IS NULL OR p_cleaner_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_ids');
+  END IF;
+
+  SELECT *
+  INTO v_row
+  FROM public.care_requests
+  WHERE id = p_care_request_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF v_uid IS DISTINCT FROM v_row.customer_id
+     AND v_uid IS DISTINCT FROM p_cleaner_id THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+  END IF;
+
+  IF NOT public.care_request_allows_interview_chat(
+    v_row.id,
+    v_row.customer_id,
+    p_cleaner_id
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_matched');
+  END IF;
+
+  SELECT *
+  INTO v_conv
+  FROM public.conversations
+  WHERE care_request_id = v_row.id
+    AND customer_id = v_row.customer_id
+    AND cleaner_id = p_cleaner_id
+  ORDER BY created_at ASC
+  LIMIT 1;
+
+  IF FOUND THEN
+    UPDATE public.care_requests
+    SET status = 'interviewing'
+    WHERE id = v_row.id
+      AND status IN ('submitted', 'matching');
+
+    RETURN jsonb_build_object(
+      'success', true,
+      'conversation', public.conversation_row_public_json(v_conv)
+    );
+  END IF;
+
+  BEGIN
+    INSERT INTO public.conversations (customer_id, cleaner_id, booking_id, care_request_id)
+    VALUES (v_row.customer_id, p_cleaner_id, NULL, v_row.id)
+    RETURNING * INTO v_conv;
+  EXCEPTION
+    WHEN unique_violation THEN
+      SELECT *
+      INTO v_conv
+      FROM public.conversations
+      WHERE care_request_id = v_row.id
+        AND customer_id = v_row.customer_id
+        AND cleaner_id = p_cleaner_id
+      ORDER BY created_at ASC
+      LIMIT 1;
+
+      IF NOT FOUND THEN
+        RETURN jsonb_build_object('success', false, 'error', 'unavailable');
+      END IF;
+  END;
+
+  UPDATE public.care_requests
+  SET status = 'interviewing'
+  WHERE id = v_row.id
+    AND status IN ('submitted', 'matching');
 
   RETURN jsonb_build_object(
     'success', true,
@@ -25758,6 +26068,8 @@ BEGIN
         WHEN 'pet_care' THEN public.is_care_pet_catalog_visible()
         WHEN 'airbnb' THEN public.is_airbnb_catalog_visible()
         WHEN 'quick_tasks' THEN public.is_quick_tasks_catalog_visible()
+        WHEN 'cooks' THEN public.is_cooks_drivers_catalog_visible()
+        WHEN 'drivers' THEN public.is_cooks_drivers_catalog_visible()
         ELSE true
       END
     )
@@ -25990,9 +26302,10 @@ CREATE OR REPLACE FUNCTION public.get_verification_service_catalog()
  SET search_path TO 'public'
 AS $function$
 DECLARE
-  -- Launch flags are global: always read the production channel row.
   v_pet_care_specialization boolean :=
     public.is_app_feature_enabled('PET_CARE_SPECIALIZATION', 'production');
+  v_cooks_drivers_specialization boolean :=
+    public.is_app_feature_enabled('COOKS_DRIVERS_SPECIALIZATION', 'production');
 BEGIN
   RETURN QUERY
   SELECT
@@ -26014,23 +26327,32 @@ BEGIN
    AND COALESCE(st.active, false) = true
    AND COALESCE(NULLIF(btrim(st.specialty_slug), ''), NULL) IS NOT NULL
   WHERE
-    -- Non-care / non-pet categories (cleaning, etc.)
     (
-      COALESCE(sc.slug, '') NOT IN ('caregiving', 'pet_care')
+      COALESCE(sc.slug, '') NOT IN ('caregiving', 'pet_care', 'cooks', 'drivers')
       AND st.category IS DISTINCT FROM 'caregiving'::public.service_category
       AND st.category IS DISTINCT FROM 'pet_care'::public.service_category
+      AND st.category IS DISTINCT FROM 'cooks'::public.service_category
+      AND st.category IS DISTINCT FROM 'drivers'::public.service_category
     )
-    -- Caregiving is always available to providers (matches mobile verification UI).
     OR (
       COALESCE(sc.slug, '') = 'caregiving'
       OR st.category = 'caregiving'::public.service_category
     )
-    -- Pet Care follows PET_CARE_SPECIALIZATION (production channel).
     OR (
       v_pet_care_specialization
       AND (
         COALESCE(sc.slug, '') = 'pet_care'
         OR st.category = 'pet_care'::public.service_category
+      )
+    )
+    OR (
+      v_cooks_drivers_specialization
+      AND (
+        COALESCE(sc.slug, '') IN ('cooks', 'drivers')
+        OR st.category IN (
+          'cooks'::public.service_category,
+          'drivers'::public.service_category
+        )
       )
     )
   ORDER BY sc.id, st.id;
@@ -29917,6 +30239,26 @@ CREATE OR REPLACE FUNCTION public.is_contained_2d(geometry, box2df)
 AS $function$SELECT $2 OPERATOR(public.~) $1;$function$
 
 
+CREATE OR REPLACE FUNCTION public.is_cooks_drivers_booking_enabled()
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT public.is_app_feature_enabled('COOKS_DRIVERS_BOOKING', 'production');
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.is_cooks_drivers_catalog_visible()
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT public.is_app_feature_enabled('COOKS_DRIVERS_BOOK_NOW', 'production');
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.is_definer(name)
  RETURNS text
  LANGUAGE sql
@@ -31879,6 +32221,37 @@ BEGIN
 
   RETURN v_offers;
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.list_direct_requests_for_worker()
+ RETURNS jsonb
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT jsonb_build_object(
+    'success', true,
+    'requests', coalesce((
+      SELECT jsonb_agg(jsonb_build_object(
+        'id', r.id,
+        'specialty_slug', r.specialty_slug,
+        'category', r.category,
+        'frequency', r.frequency,
+        'location_label', r.location_label,
+        'budget_amount_minor', r.budget_amount_minor,
+        'budget_unit', r.budget_unit,
+        'budget_negotiable', r.budget_negotiable,
+        'status', r.status,
+        'created_at', r.created_at
+      ) ORDER BY r.created_at DESC)
+      FROM public.care_requests r
+      INNER JOIN public.care_request_matches m
+        ON m.care_request_id = r.id
+       AND m.cleaner_id = auth.uid()
+      WHERE r.status IN ('submitted', 'matching', 'interviewing')
+    ), '[]'::jsonb)
+  );
 $function$
 
 
@@ -38833,6 +39206,98 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.respond_to_care_request(p_care_request_id uuid, p_offer_kind text, p_amount_major numeric, p_note text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_kind text := lower(btrim(coalesce(p_offer_kind, '')));
+  v_row public.care_requests%ROWTYPE;
+  v_amount_minor integer;
+  v_unit text;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF v_kind NOT IN ('accept', 'counter') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_offer_kind');
+  END IF;
+
+  SELECT *
+  INTO v_row
+  FROM public.care_requests
+  WHERE id = p_care_request_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.care_request_matches m
+    WHERE m.care_request_id = v_row.id
+      AND m.cleaner_id = v_uid
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_matched');
+  END IF;
+
+  IF v_row.status NOT IN ('submitted', 'matching', 'interviewing') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_open');
+  END IF;
+
+  v_unit := coalesce(v_row.budget_unit, 'per_job');
+
+  IF v_kind = 'accept' THEN
+    v_amount_minor := coalesce(v_row.budget_amount_minor, 0);
+    IF v_amount_minor <= 0 THEN
+      RETURN jsonb_build_object('success', false, 'error', 'missing_budget');
+    END IF;
+  ELSE
+    IF p_amount_major IS NULL OR p_amount_major < 1 THEN
+      RETURN jsonb_build_object('success', false, 'error', 'invalid_budget');
+    END IF;
+    v_amount_minor := round(p_amount_major * 100)::integer;
+  END IF;
+
+  INSERT INTO public.care_request_offers (
+    care_request_id,
+    cleaner_id,
+    offer_kind,
+    amount_minor,
+    budget_unit,
+    note
+  )
+  VALUES (
+    v_row.id,
+    v_uid,
+    v_kind,
+    v_amount_minor,
+    v_unit,
+    nullif(btrim(coalesce(p_note, '')), '')
+  )
+  ON CONFLICT (care_request_id, cleaner_id) DO UPDATE
+  SET
+    offer_kind = EXCLUDED.offer_kind,
+    amount_minor = EXCLUDED.amount_minor,
+    budget_unit = EXCLUDED.budget_unit,
+    note = EXCLUDED.note,
+    created_at = timezone('utc', now());
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'offer_kind', v_kind,
+    'amount_minor', v_amount_minor,
+    'budget_unit', v_unit
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.results_eq(refcursor, anyarray)
  RETURNS text
  LANGUAGE sql
@@ -39758,6 +40223,60 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.save_care_request_matches(p_care_request_id uuid, p_cleaner_ids uuid[])
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_ids uuid[] := coalesce(p_cleaner_ids, ARRAY[]::uuid[]);
+  v_cleaner uuid;
+  v_rank integer := 0;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.care_requests r
+    WHERE r.id = p_care_request_id
+      AND r.customer_id = v_uid
+      AND r.status IN ('submitted', 'matching', 'interviewing')
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  DELETE FROM public.care_request_matches
+  WHERE care_request_id = p_care_request_id;
+
+  FOREACH v_cleaner IN ARRAY v_ids
+  LOOP
+    IF v_cleaner IS NULL THEN
+      CONTINUE;
+    END IF;
+    v_rank := v_rank + 1;
+    INSERT INTO public.care_request_matches (care_request_id, cleaner_id, rank)
+    VALUES (p_care_request_id, v_cleaner, v_rank)
+    ON CONFLICT (care_request_id, cleaner_id) DO UPDATE
+    SET rank = EXCLUDED.rank;
+  END LOOP;
+
+  UPDATE public.care_requests
+  SET status = CASE
+    WHEN cardinality(v_ids) > 0 THEN 'matching'
+    ELSE status
+  END
+  WHERE id = p_care_request_id
+    AND customer_id = v_uid;
+
+  RETURN jsonb_build_object('success', true, 'match_count', v_rank);
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.save_property_information(p_property_id uuid, p_trash_notes text DEFAULT NULL::text, p_supplies_notes text DEFAULT NULL::text, p_other_notes text DEFAULT NULL::text, p_access_notes text DEFAULT NULL::text, p_wifi_network text DEFAULT NULL::text, p_wifi_password text DEFAULT NULL::text, p_parking_notes text DEFAULT NULL::text)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -40408,6 +40927,18 @@ BEGIN
     RAISE WARNING 'No timezone found for point %, defaulting to UTC', ST_AsText(NEW.location_coordinates);
   END IF;
 
+  RETURN NEW;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.set_care_requests_updated_at()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  NEW.updated_at := timezone('utc', now());
   RETURN NEW;
 END;
 $function$
@@ -49107,6 +49638,8 @@ CREATE TRIGGER trg_zz_guard_booking_assignment_column_writes BEFORE INSERT OR UP
 CREATE TRIGGER trigger_calculate_booking_period BEFORE INSERT OR UPDATE OF scheduled_date, scheduled_time, duration_hours, timezone ON bookings FOR EACH ROW EXECUTE FUNCTION calculate_booking_period();
 
 CREATE TRIGGER trigger_set_booking_timezone BEFORE INSERT ON bookings FOR EACH ROW EXECUTE FUNCTION set_booking_timezone();
+
+CREATE TRIGGER care_requests_set_updated_at BEFORE UPDATE ON care_requests FOR EACH ROW EXECUTE FUNCTION set_care_requests_updated_at();
 
 CREATE TRIGGER trg_normalize_cleaner_application_email BEFORE INSERT OR UPDATE OF email ON cleaner_applications FOR EACH ROW EXECUTE FUNCTION normalize_cleaner_application_email();
 
