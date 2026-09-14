@@ -13743,6 +13743,140 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.complete_stripe_booking_payment_attempt(p_attempt_id uuid, p_payment_intent_id text, p_client_secret text, p_provider_reference text)
+ RETURNS TABLE(state text, reference text, stripe_payment_intent_id text, stripe_client_secret text, payment_status text)
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_attempt public.payment_attempts%ROWTYPE;
+  v_booking_id uuid;
+  v_customer_id uuid;
+  v_payment_status text;
+  v_booking_reference text;
+  v_payment_intent_id text := NULLIF(btrim(p_payment_intent_id), '');
+  v_client_secret text := NULLIF(btrim(p_client_secret), '');
+  v_provider_reference text := NULLIF(btrim(p_provider_reference), '');
+  v_pause_ms integer;
+BEGIN
+  IF p_attempt_id IS NULL OR v_payment_intent_id IS NULL OR v_client_secret IS NULL THEN
+    RAISE EXCEPTION 'attempt_id, payment_intent_id, and client_secret are required'
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT pa.booking_id
+  INTO v_booking_id
+  FROM public.payment_attempts pa
+  WHERE pa.id = p_attempt_id;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  SELECT b.customer_id, b.payment_status, b.reference
+  INTO v_customer_id, v_payment_status, v_booking_reference
+  FROM public.bookings b
+  WHERE b.id = v_booking_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  v_pause_ms := NULLIF(current_setting('instaclean.payment_attempt_lock_test_pause_ms', true), '')::integer;
+  IF v_pause_ms IS NOT NULL AND v_pause_ms > 0 THEN
+    PERFORM pg_sleep(v_pause_ms / 1000.0);
+  END IF;
+
+  SELECT *
+  INTO v_attempt
+  FROM public.payment_attempts
+  WHERE id = p_attempt_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF auth.uid() IS NOT NULL AND auth.uid() <> v_customer_id THEN
+    RAISE EXCEPTION 'not authorized'
+      USING ERRCODE = '42501';
+  END IF;
+
+  IF v_attempt.provider <> 'stripe' THEN
+    RAISE EXCEPTION 'attempt is not a Stripe checkout'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF v_provider_reference IS NOT NULL
+     AND v_provider_reference <> v_attempt.reference THEN
+    RAISE EXCEPTION 'provider reference does not match reserved reference'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF lower(coalesce(v_payment_status, '')) IN (
+    'paid', 'post_paid', 'refunded', 'partially_refunded'
+  ) THEN
+    IF lower(coalesce(v_payment_status, '')) = 'paid' THEN
+      UPDATE public.payment_attempts pa
+      SET
+        status = 'paid',
+        paid_at = coalesce(pa.paid_at, now()),
+        stripe_payment_intent_id = coalesce(pa.stripe_payment_intent_id, v_payment_intent_id),
+        stripe_client_secret = coalesce(pa.stripe_client_secret, v_client_secret),
+        updated_at = now()
+      WHERE pa.id = p_attempt_id
+        AND pa.status IN ('initializing', 'ready');
+    END IF;
+
+    state := 'settled';
+    reference := v_booking_reference;
+    stripe_payment_intent_id := NULL;
+    stripe_client_secret := NULL;
+    payment_status := v_payment_status;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_attempt.status NOT IN ('initializing', 'ready') THEN
+    state := v_attempt.status;
+    reference := v_attempt.reference;
+    stripe_payment_intent_id := v_attempt.stripe_payment_intent_id;
+    stripe_client_secret := v_attempt.stripe_client_secret;
+    payment_status := v_payment_status;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  UPDATE public.payment_attempts pa
+  SET
+    status = 'ready',
+    stripe_payment_intent_id = v_payment_intent_id,
+    stripe_client_secret = v_client_secret,
+    ready_at = coalesce(pa.ready_at, now()),
+    expires_at = 'infinity'::timestamptz,
+    updated_at = now()
+  WHERE pa.id = p_attempt_id
+  RETURNING * INTO v_attempt;
+
+  UPDATE public.bookings b
+  SET reference = v_attempt.reference, updated_at = now()
+  WHERE b.id = v_attempt.booking_id
+    AND lower(coalesce(b.payment_status, '')) NOT IN (
+      'paid', 'post_paid', 'refunded', 'partially_refunded'
+    );
+
+  state := 'ready';
+  reference := v_attempt.reference;
+  stripe_payment_intent_id := v_attempt.stripe_payment_intent_id;
+  stripe_client_secret := v_attempt.stripe_client_secret;
+  payment_status := v_payment_status;
+  RETURN NEXT;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.complete_subscription_paystack_activation(p_subscription_id uuid, p_customer_id uuid, p_activation_token uuid, p_billing_mode text, p_paystack_authorization_code text, p_paystack_customer_code text, p_paystack_subscription_code text DEFAULT NULL::text, p_paystack_plan_code text DEFAULT NULL::text)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -19674,11 +19808,8 @@ BEGIN
     RETURN false;
   END IF;
 
-  -- The Edge Function prefixes provider HTTP failures with "Paystack NNN:".
-  -- Preserve the reservation when the provider outcome is ambiguous. A 5xx,
-  -- timeout/conflict/rate-limit response, or duplicate-reference response could
-  -- mean the transaction exists even though initialization did not return a URL.
-  v_provider_status_text := substring(coalesce(v_reason, '') from '^Paystack ([0-9]{3}):');
+  -- Preserve the reservation when the provider outcome is ambiguous.
+  v_provider_status_text := substring(coalesce(v_reason, '') from '^(?:Paystack|Stripe) ([0-9]{3}):');
   IF v_provider_status_text IS NOT NULL THEN
     v_provider_status := v_provider_status_text::integer;
     IF v_provider_status >= 500
@@ -39171,8 +39302,8 @@ END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.reserve_booking_payment_attempt(p_booking_id uuid, p_request_fingerprint text, p_amount_minor bigint, p_currency text)
- RETURNS TABLE(attempt_id uuid, created boolean, state text, reference text, authorization_url text, access_code text, payment_status text, expires_at timestamp with time zone, amount_minor bigint, currency text, request_fingerprint text)
+CREATE OR REPLACE FUNCTION public.reserve_booking_payment_attempt(p_booking_id uuid, p_request_fingerprint text, p_amount_minor bigint, p_currency text, p_provider text DEFAULT 'paystack'::text)
+ RETURNS TABLE(attempt_id uuid, created boolean, state text, reference text, authorization_url text, access_code text, payment_status text, expires_at timestamp with time zone, amount_minor bigint, currency text, request_fingerprint text, provider text, stripe_payment_intent_id text, stripe_client_secret text)
  LANGUAGE plpgsql
  SECURITY DEFINER
  SET search_path TO 'public'
@@ -39183,6 +39314,7 @@ DECLARE
   v_booking_reference text;
   v_fingerprint text := NULLIF(btrim(p_request_fingerprint), '');
   v_currency text := upper(NULLIF(btrim(p_currency), ''));
+  v_provider text := lower(NULLIF(btrim(p_provider), ''));
   v_attempt public.payment_attempts%ROWTYPE;
   v_new_attempt_id uuid;
   v_new_reference text;
@@ -39193,6 +39325,10 @@ BEGIN
   END IF;
   IF p_amount_minor IS NULL OR p_amount_minor <= 0 OR v_currency IS NULL THEN
     RAISE EXCEPTION 'amount_minor and currency must be valid'
+      USING ERRCODE = '22023';
+  END IF;
+  IF v_provider IS NULL OR v_provider NOT IN ('paystack', 'stripe') THEN
+    RAISE EXCEPTION 'provider must be paystack or stripe'
       USING ERRCODE = '22023';
   END IF;
 
@@ -39225,6 +39361,9 @@ BEGIN
     amount_minor := NULL;
     currency := NULL;
     request_fingerprint := NULL;
+    provider := NULL;
+    stripe_payment_intent_id := NULL;
+    stripe_client_secret := NULL;
     RETURN NEXT;
     RETURN;
   END IF;
@@ -39239,10 +39378,65 @@ BEGIN
   FOR UPDATE;
 
   IF FOUND THEN
-    IF v_attempt.status = 'initializing' AND v_attempt.expires_at <= now() THEN
+    IF v_attempt.provider IS DISTINCT FROM v_provider THEN
+      UPDATE public.payment_attempts pa
+      SET
+        status = 'superseded',
+        updated_at = now()
+      WHERE pa.id = v_attempt.id
+        AND pa.status IN ('initializing', 'ready');
+
+      UPDATE public.bookings b
+      SET reference = NULL, updated_at = now()
+      WHERE b.id = p_booking_id
+        AND b.reference = v_attempt.reference
+        AND lower(coalesce(b.payment_status, '')) NOT IN (
+          'paid', 'post_paid', 'refunded', 'partially_refunded'
+        );
+    ELSE
+      IF v_attempt.status = 'initializing' AND v_attempt.expires_at <= now() THEN
+        attempt_id := v_attempt.id;
+        created := false;
+        state := 'stale';
+        reference := v_attempt.reference;
+        authorization_url := NULL;
+        access_code := NULL;
+        payment_status := v_payment_status;
+        expires_at := v_attempt.expires_at;
+        amount_minor := v_attempt.amount_minor;
+        currency := v_attempt.currency;
+        request_fingerprint := v_attempt.request_fingerprint;
+        provider := v_attempt.provider;
+        stripe_payment_intent_id := v_attempt.stripe_payment_intent_id;
+        stripe_client_secret := v_attempt.stripe_client_secret;
+        RETURN NEXT;
+        RETURN;
+      END IF;
+
+      IF v_attempt.request_fingerprint = v_fingerprint
+         AND v_attempt.amount_minor = p_amount_minor
+         AND v_attempt.currency = v_currency THEN
+        attempt_id := v_attempt.id;
+        created := false;
+        state := v_attempt.status;
+        reference := v_attempt.reference;
+        authorization_url := v_attempt.authorization_url;
+        access_code := v_attempt.access_code;
+        payment_status := v_payment_status;
+        expires_at := v_attempt.expires_at;
+        amount_minor := v_attempt.amount_minor;
+        currency := v_attempt.currency;
+        request_fingerprint := v_attempt.request_fingerprint;
+        provider := v_attempt.provider;
+        stripe_payment_intent_id := v_attempt.stripe_payment_intent_id;
+        stripe_client_secret := v_attempt.stripe_client_secret;
+        RETURN NEXT;
+        RETURN;
+      END IF;
+
       attempt_id := v_attempt.id;
       created := false;
-      state := 'stale';
+      state := 'conflict';
       reference := v_attempt.reference;
       authorization_url := NULL;
       access_code := NULL;
@@ -39251,41 +39445,12 @@ BEGIN
       amount_minor := v_attempt.amount_minor;
       currency := v_attempt.currency;
       request_fingerprint := v_attempt.request_fingerprint;
+      provider := v_attempt.provider;
+      stripe_payment_intent_id := NULL;
+      stripe_client_secret := NULL;
       RETURN NEXT;
       RETURN;
     END IF;
-
-    IF v_attempt.request_fingerprint = v_fingerprint
-       AND v_attempt.amount_minor = p_amount_minor
-       AND v_attempt.currency = v_currency THEN
-      attempt_id := v_attempt.id;
-      created := false;
-      state := v_attempt.status;
-      reference := v_attempt.reference;
-      authorization_url := v_attempt.authorization_url;
-      access_code := v_attempt.access_code;
-      payment_status := v_payment_status;
-      expires_at := v_attempt.expires_at;
-      amount_minor := v_attempt.amount_minor;
-      currency := v_attempt.currency;
-      request_fingerprint := v_attempt.request_fingerprint;
-      RETURN NEXT;
-      RETURN;
-    END IF;
-
-    attempt_id := v_attempt.id;
-    created := false;
-    state := 'conflict';
-    reference := v_attempt.reference;
-    authorization_url := NULL;
-    access_code := NULL;
-    payment_status := v_payment_status;
-    expires_at := v_attempt.expires_at;
-    amount_minor := v_attempt.amount_minor;
-    currency := v_attempt.currency;
-    request_fingerprint := v_attempt.request_fingerprint;
-    RETURN NEXT;
-    RETURN;
   END IF;
 
   v_new_attempt_id := gen_random_uuid();
@@ -39308,7 +39473,7 @@ BEGIN
   ) VALUES (
     v_new_attempt_id,
     p_booking_id,
-    'paystack',
+    v_provider,
     v_new_reference,
     v_fingerprint,
     'initializing',
@@ -39336,6 +39501,9 @@ BEGIN
   amount_minor := v_attempt.amount_minor;
   currency := v_attempt.currency;
   request_fingerprint := v_attempt.request_fingerprint;
+  provider := v_attempt.provider;
+  stripe_payment_intent_id := NULL;
+  stripe_client_secret := NULL;
   RETURN NEXT;
 END;
 $function$
