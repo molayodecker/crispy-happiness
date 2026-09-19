@@ -8002,13 +8002,14 @@ CREATE OR REPLACE FUNCTION public.assert_cooks_service_bookable(p_service_id int
 AS $function$
 DECLARE
   v_category public.service_category;
+  v_specialty text;
 BEGIN
   IF p_service_id IS NULL THEN
     RETURN;
   END IF;
 
-  SELECT st.category
-  INTO v_category
+  SELECT st.category, st.specialty_slug
+  INTO v_category, v_specialty
   FROM public.service_types st
   WHERE st.id = p_service_id;
 
@@ -8016,8 +8017,11 @@ BEGIN
     RETURN;
   END IF;
 
-  IF v_category = 'cooks'::public.service_category
-     AND NOT public.is_cooks_booking_enabled() THEN
+  IF v_specialty = 'housekeeper' THEN
+    RETURN;
+  END IF;
+
+  IF v_category = 'cooks'::public.service_category THEN
     RAISE EXCEPTION 'This service is not available yet'
       USING ERRCODE = 'P0001';
   END IF;
@@ -16215,6 +16219,170 @@ begin
 
   return next;
 end;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.compute_housekeeper_pricing(p_service_id integer, p_budget_major numeric, p_scheduled_date date, p_frequency text, p_selected_day_count integer DEFAULT NULL::integer, p_visit_length text DEFAULT 'full_day'::text, p_duration_hours numeric DEFAULT NULL::numeric)
+ RETURNS TABLE(pricing_version text, currency text, visit_length text, duration_hours numeric, work_rate_ghs_per_hour numeric, budget_major numeric, billable_days integer, subtotal_major numeric, frequency_discount_bps integer, frequency_discount_major numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, minimum_duration_hours numeric, cleaner_earnings_minor integer)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  c_default_platform_fee_bps constant integer := 1500;
+  v_specialty text;
+  v_service_active boolean;
+  v_frequency text;
+  v_visit text;
+  v_min_visit numeric;
+  v_min_monthly numeric;
+  v_min_budget numeric;
+  v_budget numeric;
+  v_days integer;
+  v_duration numeric;
+  v_payable_major numeric;
+  v_payable_minor integer;
+  v_platform_bps integer;
+  v_platform_fee_major numeric;
+  v_settings_platform_raw numeric;
+  v_cleaner_earnings_minor integer;
+BEGIN
+  IF p_scheduled_date IS NULL THEN
+    RAISE EXCEPTION 'Choose a start date.';
+  END IF;
+
+  SELECT st.specialty_slug, COALESCE(st.active, true)
+  INTO v_specialty, v_service_active
+  FROM public.service_types st
+  WHERE st.id = p_service_id;
+
+  IF NOT FOUND OR v_service_active IS DISTINCT FROM true THEN
+    RAISE EXCEPTION 'Invalid or inactive service';
+  END IF;
+
+  IF v_specialty IS DISTINCT FROM 'housekeeper' THEN
+    RAISE EXCEPTION 'Housekeeper checkout applies to Housekeeper only.';
+  END IF;
+
+  v_frequency := lower(btrim(COALESCE(p_frequency, 'once')));
+  IF v_frequency NOT IN ('once', 'daily', 'weekly', 'monthly', 'custom') THEN
+    RAISE EXCEPTION 'Choose how often you need this housekeeper.';
+  END IF;
+
+  v_visit := lower(btrim(COALESCE(p_visit_length, 'full_day')));
+  IF v_visit NOT IN ('half_day', 'full_day', 'custom', 'live_in') THEN
+    RAISE EXCEPTION 'Choose how long you need the housekeeper.';
+  END IF;
+
+  SELECT bs.value_numeric INTO v_min_visit
+  FROM public.booking_settings bs
+  WHERE bs.key = 'housekeeper_min_visit_major';
+  SELECT bs.value_numeric INTO v_min_monthly
+  FROM public.booking_settings bs
+  WHERE bs.key = 'housekeeper_min_monthly_major';
+
+  v_min_visit := GREATEST(0, COALESCE(v_min_visit, 100));
+  v_min_monthly := GREATEST(0, COALESCE(v_min_monthly, 550));
+  v_min_budget := CASE
+    WHEN v_frequency IN ('weekly', 'monthly', 'custom') THEN v_min_monthly
+    ELSE v_min_visit
+  END;
+
+  IF p_budget_major IS NULL
+    OR p_budget_major <> p_budget_major
+    OR p_budget_major < v_min_budget THEN
+    RAISE EXCEPTION 'Enter a budget of at least GH₵%.', v_min_budget;
+  END IF;
+
+  v_budget := round(p_budget_major::numeric, 2);
+
+  IF v_visit = 'half_day' THEN
+    v_duration := 4;
+  ELSIF v_visit = 'custom'
+    AND p_duration_hours IS NOT NULL
+    AND p_duration_hours = p_duration_hours
+    AND p_duration_hours >= 1
+    AND p_duration_hours <= 24 THEN
+    v_duration := round(p_duration_hours::numeric, 2);
+  ELSE
+    v_duration := 8;
+  END IF;
+
+  IF v_frequency = 'weekly' THEN
+    v_days := GREATEST(1, LEAST(6, COALESCE(NULLIF(p_selected_day_count, 0), 1)));
+  ELSIF v_frequency = 'custom' THEN
+    v_days := GREATEST(1, LEAST(6, COALESCE(NULLIF(p_selected_day_count, 0), 1)));
+  ELSIF v_frequency = 'monthly' THEN
+    v_days := EXTRACT(
+      DAY FROM (date_trunc('month', p_scheduled_date) + INTERVAL '1 month - 1 day')
+    )::integer;
+  ELSE
+    v_days := 1;
+  END IF;
+
+  v_payable_major := v_budget;
+  v_payable_minor := round(v_payable_major * 100)::integer;
+
+  SELECT bs.value_numeric INTO v_settings_platform_raw
+  FROM public.booking_settings bs
+  WHERE bs.key = 'platform_fee_percentage';
+
+  IF v_settings_platform_raw IS NULL OR v_settings_platform_raw < 0 THEN
+    v_platform_bps := c_default_platform_fee_bps;
+  ELSIF v_settings_platform_raw <= 100 THEN
+    v_platform_bps := round(v_settings_platform_raw * 100)::integer;
+  ELSE
+    v_platform_bps := round(v_settings_platform_raw)::integer;
+  END IF;
+  v_platform_bps := GREATEST(0, LEAST(10000, v_platform_bps));
+
+  IF v_platform_bps <= 0 OR v_payable_minor <= 0 THEN
+    v_platform_fee_major := 0;
+  ELSE
+    v_platform_fee_major := (round(v_payable_minor * v_platform_bps / 10000.0) / 100.0)::numeric;
+  END IF;
+
+  v_cleaner_earnings_minor := public.cleaner_earnings_subunit_from_booking(
+    v_payable_minor,
+    v_payable_major,
+    v_platform_fee_major,
+    false,
+    0,
+    v_payable_minor
+  );
+
+  RETURN QUERY
+  SELECT
+    'housekeeper_v1'::text,
+    'GHS'::text,
+    v_visit,
+    v_duration,
+    CASE WHEN v_duration > 0 THEN round((v_budget / v_duration)::numeric, 2) ELSE 0 END,
+    v_budget,
+    v_days,
+    v_payable_major,
+    0,
+    0::numeric,
+    v_payable_major,
+    v_platform_fee_major,
+    0::numeric,
+    v_payable_minor,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    v_payable_minor,
+    v_payable_minor,
+    v_payable_minor,
+    0,
+    false,
+    false,
+    v_duration,
+    v_cleaner_earnings_minor;
+END;
 $function$
 
 
