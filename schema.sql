@@ -162,7 +162,8 @@ CREATE TYPE "public"."notification_type" AS ENUM (
     'cleaner_assignment_broadcast',
     'cleaner_accepted_assignment',
     'booking_rescheduled',
-    'review_request'
+    'review_request',
+    'wallet_credited'
 );
 
 
@@ -19339,6 +19340,8 @@ CREATE OR REPLACE FUNCTION "public"."inbox_notification_android_channel"("p_type
       END
     WHEN 'booking_cancelled' THEN 'booking_cancellations'
     WHEN 'booking_rescheduled' THEN 'booking_updates'
+    WHEN 'review_request' THEN 'booking_updates'
+    WHEN 'wallet_credited' THEN 'booking_updates'
     WHEN 'unassigned_booking_escalated' THEN 'booking_cancellations'
     WHEN 'new_message' THEN 'messages'
     WHEN 'cleaner_en_route' THEN 'cleaner_milestones'
@@ -19351,7 +19354,7 @@ $$;
 ALTER FUNCTION "public"."inbox_notification_android_channel"("p_type" "text", "p_android_notification_channel_version" integer) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."inbox_notification_android_channel"("p_type" "text", "p_android_notification_channel_version" integer) IS 'Android Expo channelId for inbox pushes. Job alerts use _v3 only when device reported channel version >= 3; otherwise _v2.';
+COMMENT ON FUNCTION "public"."inbox_notification_android_channel"("p_type" "text", "p_android_notification_channel_version" integer) IS 'Expo Android channel for inbox-triggered pushes; wallet_credited and review_request use booking_updates. Job alerts use _v3 only when device reported channel version >= 3; otherwise _v2.';
 
 
 
@@ -21097,6 +21100,169 @@ $_$;
 
 
 ALTER FUNCTION "public"."normalize_phone_for_users"("raw_phone" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."notify_cleaner_wallet_credit"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'vault', 'net', 'extensions', 'pg_temp'
+    AS $$
+DECLARE
+  v_user_id uuid;
+  v_currency text;
+  v_amount_label text;
+  v_title text;
+  v_message text;
+  v_notification_id uuid;
+  v_phone text;
+  v_name text;
+  v_base_url text;
+  v_jwt text;
+  v_request_id bigint;
+BEGIN
+  IF lower(coalesce(NEW.type, '')) IS DISTINCT FROM 'credit' THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.withdrawal_request_id IS NOT NULL THEN
+    RETURN NEW;
+  END IF;
+
+  IF coalesce(NEW.amount_subunit, 0) <= 0 OR NEW.wallet_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT w.user_id, w.currency
+  INTO v_user_id, v_currency
+  FROM public.wallets w
+  WHERE w.id = NEW.wallet_id;
+
+  IF v_user_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  v_amount_label := coalesce(nullif(trim(v_currency), ''), 'GHS')
+    || ' '
+    || trim(to_char(NEW.amount_subunit / 100.0, 'FM999,999,990.00'));
+
+  v_title := 'Money added to your wallet';
+  IF NEW.booking_id IS NOT NULL THEN
+    v_message := v_amount_label || ' from a completed job was added to your wallet.';
+  ELSE
+    v_message := v_amount_label || ' was added to your Instaclean wallet.';
+  END IF;
+
+  INSERT INTO public.notifications (
+    user_id,
+    type,
+    title,
+    message,
+    read,
+    dedupe_key,
+    data
+  ) VALUES (
+    v_user_id,
+    'wallet_credited',
+    v_title,
+    v_message,
+    false,
+    'wallet_credit:' || NEW.id::text,
+    jsonb_build_object(
+      'type', 'wallet_credited',
+      'screen', '/(tabs)/wallet',
+      'walletTransactionId', NEW.id,
+      'amountSubunit', NEW.amount_subunit,
+      'currency', coalesce(nullif(trim(v_currency), ''), 'GHS')
+    )
+  )
+  ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL
+  DO NOTHING
+  RETURNING id INTO v_notification_id;
+
+  IF v_notification_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  -- WhatsApp is best-effort. A failure here must not roll back the inbox row.
+  BEGIN
+    SELECT nullif(trim(u.phone), '')
+    INTO v_phone
+    FROM public.users u
+    WHERE u.id = v_user_id;
+
+    IF v_phone IS NULL THEN
+      RETURN NEW;
+    END IF;
+
+    SELECT decrypted_secret
+    INTO v_base_url
+    FROM vault.decrypted_secrets
+    WHERE name = 'notify_new_message_base_url'
+    LIMIT 1;
+
+    SELECT decrypted_secret
+    INTO v_jwt
+    FROM vault.decrypted_secrets
+    WHERE name = 'notify_new_message_service_role_key'
+    LIMIT 1;
+
+    v_base_url := nullif(trim(v_base_url), '');
+    v_jwt := nullif(trim(v_jwt), '');
+
+    IF v_base_url IS NULL OR v_jwt IS NULL THEN
+      RAISE WARNING 'notify_cleaner_wallet_credit: WhatsApp skipped, vault notify secrets missing for user %', v_user_id;
+      RETURN NEW;
+    END IF;
+
+    SELECT coalesce(nullif(trim(p.fullname), ''), nullif(trim(p.firstname), ''), 'there')
+    INTO v_name
+    FROM public.profiles p
+    WHERE p.user_id = v_user_id OR p.id = v_user_id
+    LIMIT 1;
+
+    v_name := coalesce(v_name, 'there');
+
+    SELECT net.http_post(
+      url := rtrim(v_base_url, '/') || '/functions/v1/send-notification',
+      body := jsonb_build_object(
+        'template', 'service_update',
+        'channel', 'whatsapp',
+        'userId', v_user_id,
+        'phone', v_phone,
+        'messageType', 'wallet_credited',
+        'variables', jsonb_build_object(
+          'name', v_name,
+          'message', v_message
+        )
+      ),
+      headers := jsonb_build_object(
+        'Content-Type', 'application/json',
+        'Authorization', 'Bearer ' || v_jwt
+      ),
+      timeout_milliseconds := 30000
+    )
+    INTO v_request_id;
+
+    RAISE LOG 'notify_cleaner_wallet_credit queued WhatsApp request % for user % transaction %',
+      v_request_id, v_user_id, NEW.id;
+  EXCEPTION
+    WHEN OTHERS THEN
+      RAISE WARNING 'notify_cleaner_wallet_credit WhatsApp queue failed for transaction %: %', NEW.id, SQLERRM;
+  END;
+
+  RETURN NEW;
+EXCEPTION
+  WHEN OTHERS THEN
+    RAISE WARNING 'notify_cleaner_wallet_credit failed for transaction %: %', NEW.id, SQLERRM;
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."notify_cleaner_wallet_credit"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."notify_cleaner_wallet_credit"() IS 'In-app notification plus WhatsApp when a non-refund credit is added to a cleaner wallet.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."notify_inbox_notification_push"() RETURNS "trigger"
@@ -36028,6 +36194,10 @@ CREATE OR REPLACE TRIGGER "trg_normalize_cleaner_application_email" BEFORE INSER
 
 
 
+CREATE OR REPLACE TRIGGER "trg_notify_cleaner_wallet_credit" AFTER INSERT ON "public"."wallet_transactions" FOR EACH ROW EXECUTE FUNCTION "public"."notify_cleaner_wallet_credit"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_profiles_fullname" BEFORE INSERT OR UPDATE OF "firstname", "middlename", "lastname" ON "public"."profiles" FOR EACH ROW EXECUTE FUNCTION "public"."fn_sync_profile_fullname"();
 
 
@@ -49957,6 +50127,12 @@ GRANT ALL ON FUNCTION "public"."normalize_payment_split_fraction"("p_value" nume
 GRANT ALL ON FUNCTION "public"."normalize_phone_for_users"("raw_phone" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."normalize_phone_for_users"("raw_phone" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."normalize_phone_for_users"("raw_phone" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."notify_cleaner_wallet_credit"() TO "anon";
+GRANT ALL ON FUNCTION "public"."notify_cleaner_wallet_credit"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."notify_cleaner_wallet_credit"() TO "service_role";
 
 
 
